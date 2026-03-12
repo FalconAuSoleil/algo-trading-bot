@@ -79,6 +79,7 @@ class OrderbookState:
     depth_ask_down: float = 0.0
     mid_up: float = 0.5
     spread_up: float = 1.0
+    spread_down: float = 1.0
     timestamp: float = 0.0
 
     @property
@@ -162,11 +163,6 @@ class PolymarketFeed:
         )
 
     async def _market_discovery_loop(self) -> None:
-        """Discover current and upcoming BTC Up/Down markets.
-
-        Runs every 3 seconds to ensure we catch new markets
-        within seconds of their start time.
-        """
         while self._running:
             try:
                 await self._discover_markets()
@@ -175,27 +171,15 @@ class PolymarketFeed:
             await asyncio.sleep(3)
 
     async def _lifecycle_loop(self) -> None:
-        """Track market transitions: pending → active → expired.
-
-        This loop ensures we react quickly when:
-        - A new market window opens (capture reference price)
-        - A market expires (trigger resolution)
-        """
         while self._running:
             now = time.time()
 
             for cid, market in list(self.active_markets.items()):
-                # Clean up expired markets
                 if market.is_expired:
                     if cid in self.active_markets:
-                        log.info(
-                            "[Polymarket] Market expired: %s",
-                            market.slug,
-                        )
+                        log.info("[Polymarket] Market expired: %s", market.slug)
                         del self.active_markets[cid]
                         self.orderbooks.pop(cid, None)
-
-                # Fetch price to beat once market has started
                 elif (
                     market.reference_price <= 0
                     and now >= market.start_time
@@ -206,17 +190,11 @@ class PolymarketFeed:
                     if ptb > 0:
                         market.reference_price = ptb
                         log.info(
-                            "[Polymarket] Price to beat for "
-                            "%s: $%.2f",
-                            market.slug,
-                            ptb,
+                            "[Polymarket] Price to beat for %s: $%.2f",
+                            market.slug, ptb,
                         )
 
-                # Refresh accepting_orders status near start
-                if (
-                    not market.accepting_orders
-                    and now >= market.start_time - 5
-                ):
+                if not market.accepting_orders and now >= market.start_time - 5:
                     market.accepting_orders = True
 
             if self.on_market_update and self.active_markets:
@@ -225,45 +203,29 @@ class PolymarketFeed:
             await asyncio.sleep(1)
 
     async def _discover_markets(self) -> None:
-        """Find active markets using deterministic slug computation."""
         now = time.time()
         found = 0
 
         for interval in self.intervals:
             aligned = int(now // interval) * interval
-            # Check current window and next 2 windows
             for offset in range(3):
                 window_start = aligned + (offset * interval)
                 slug = compute_slug(interval, window_start)
 
-                # Skip if we already know this market
-                existing = [
-                    m for m in self.active_markets.values()
-                    if m.slug == slug
-                ]
+                existing = [m for m in self.active_markets.values() if m.slug == slug]
                 if existing:
                     continue
 
                 market_info = await self._fetch_market_by_slug(slug)
                 if market_info and not market_info.is_expired:
-                    self.active_markets[market_info.condition_id] = (
-                        market_info
-                    )
+                    self.active_markets[market_info.condition_id] = market_info
                     found += 1
                     log.info(
-                        "[Polymarket] Discovered: %s | "
-                        "accepting=%s | T-%ds",
-                        slug,
-                        market_info.accepting_orders,
-                        int(market_info.time_remaining),
+                        "[Polymarket] Discovered: %s | accepting=%s | T-%ds",
+                        slug, market_info.accepting_orders, int(market_info.time_remaining),
                     )
 
-        # Clean expired
-        expired = [
-            cid
-            for cid, m in self.active_markets.items()
-            if m.is_expired
-        ]
+        expired = [cid for cid, m in self.active_markets.items() if m.is_expired]
         for cid in expired:
             del self.active_markets[cid]
             self.orderbooks.pop(cid, None)
@@ -271,10 +233,7 @@ class PolymarketFeed:
         if found and self.on_market_update:
             await self.on_market_update(self.active_markets)
 
-    async def _fetch_market_by_slug(
-        self, slug: str
-    ) -> Optional[MarketInfo]:
-        """Fetch a single market from Gamma API by slug."""
+    async def _fetch_market_by_slug(self, slug: str) -> Optional[MarketInfo]:
         try:
             async with self._session.get(
                 f"{self.gamma_url}/events",
@@ -298,16 +257,12 @@ class PolymarketFeed:
             if not cid:
                 return None
 
-            # Parse token IDs
             clob_tokens = market.get("clobTokenIds", "")
             if isinstance(clob_tokens, str) and clob_tokens:
                 clob_tokens = json.loads(clob_tokens)
             token_up = clob_tokens[0] if len(clob_tokens) > 0 else ""
-            token_down = (
-                clob_tokens[1] if len(clob_tokens) > 1 else ""
-            )
+            token_down = clob_tokens[1] if len(clob_tokens) > 1 else ""
 
-            # Parse outcome prices
             prices_raw = market.get("outcomePrices", "[]")
             if isinstance(prices_raw, str):
                 prices = json.loads(prices_raw)
@@ -316,16 +271,10 @@ class PolymarketFeed:
             p_up = float(prices[0]) if prices else 0.5
             p_down = float(prices[1]) if len(prices) > 1 else 0.5
 
-            # Parse timestamps — use endDate (full datetime),
-            # NOT endDateIso (just a date string)
             end_ts = self._parse_iso(market.get("endDate", ""))
-            start_ts = self._parse_iso(
-                market.get("eventStartTime", "")
-            )
+            start_ts = self._parse_iso(market.get("eventStartTime", ""))
 
-            # Fallback: compute from slug timestamp
             if end_ts <= 0 or start_ts <= 0:
-                # Slug format: btc-updown-{5m|15m}-{unix_ts}
                 parts = slug.rsplit("-", 1)
                 try:
                     slug_ts = int(parts[-1])
@@ -336,24 +285,13 @@ class PolymarketFeed:
                 except (ValueError, IndexError):
                     pass
 
-            duration = int(end_ts - start_ts) if (
-                end_ts > 0 and start_ts > 0
-            ) else 300
+            duration = int(end_ts - start_ts) if (end_ts > 0 and start_ts > 0) else 300
 
-            # Fetch real Chainlink reference price from
-            # past-results API. Only fetch if market has started
-            # (price to beat is the Chainlink snapshot at start).
             ref_price = 0.0
             if start_ts > 0 and time.time() >= start_ts:
-                ref_price = await self._fetch_price_to_beat(
-                    start_ts, duration
-                )
+                ref_price = await self._fetch_price_to_beat(start_ts, duration)
             if ref_price > 0:
-                log.info(
-                    "[Polymarket] Price to beat for %s: $%.2f",
-                    slug,
-                    ref_price,
-                )
+                log.info("[Polymarket] Price to beat for %s: $%.2f", slug, ref_price)
 
             return MarketInfo(
                 condition_id=cid,
@@ -366,9 +304,7 @@ class PolymarketFeed:
                 duration_seconds=duration,
                 slug=slug,
                 active=market.get("active", False),
-                accepting_orders=market.get(
-                    "acceptingOrders", False
-                ),
+                accepting_orders=market.get("acceptingOrders", False),
                 outcome_prices=(p_up, p_down),
             )
         except (aiohttp.ClientError, json.JSONDecodeError) as e:
@@ -376,19 +312,18 @@ class PolymarketFeed:
             return None
 
     async def _orderbook_poll_loop(self) -> None:
-        """Poll orderbooks for markets approaching expiry."""
+        """Poll orderbooks for all active markets within their betting windows."""
         while self._running:
             for cid, market in list(self.active_markets.items()):
                 if market.is_expired:
                     continue
                 if not market.accepting_orders:
                     continue
-                # Only poll orderbooks for markets < 5 min out
-                # or always if it's a 5-min market
-                if (
-                    market.time_remaining > 300
-                    and market.duration_seconds > 300
-                ):
+                # FIX: poll orderbooks for ALL markets within their
+                # strategy window, not just the last 5 minutes.
+                # For 15m markets, the betting window extends to 850s.
+                max_ob_window = 900 if market.duration_seconds > 300 else 420
+                if market.time_remaining > max_ob_window:
                     continue
                 try:
                     await self._fetch_orderbook(cid, market)
@@ -396,10 +331,7 @@ class PolymarketFeed:
                     log.debug("[Polymarket] OB error: %s", e)
             await asyncio.sleep(2)
 
-    async def _fetch_orderbook(
-        self, cid: str, market: MarketInfo
-    ) -> None:
-        """Fetch orderbooks for Up and Down tokens."""
+    async def _fetch_orderbook(self, cid: str, market: MarketInfo) -> None:
         ob = self.orderbooks.setdefault(cid, OrderbookState())
         ob.timestamp = time.time()
 
@@ -452,6 +384,9 @@ class PolymarketFeed:
                     ob.best_ask_down = best_ask
                     ob.depth_bid_down = depth_bid
                     ob.depth_ask_down = depth_ask
+                    # FIX: compute spread_down properly
+                    if best_bid and best_ask:
+                        ob.spread_down = best_ask - best_bid
 
             except (aiohttp.ClientError, KeyError, ValueError):
                 pass
@@ -461,37 +396,15 @@ class PolymarketFeed:
 
     @staticmethod
     def _parse_iso(iso_str: str) -> float:
-        """Parse ISO timestamp to unix seconds."""
         if not iso_str:
             return 0.0
         try:
-            dt = datetime.fromisoformat(
-                iso_str.replace("Z", "+00:00")
-            )
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
             return dt.timestamp()
         except ValueError:
             return 0.0
 
-    async def _fetch_price_to_beat(
-        self,
-        start_time: float,
-        duration: int,
-    ) -> float:
-        """Fetch the Chainlink reference price from past-results API.
-
-        The API returns historical market results including the exact
-        Chainlink snapshot price at each window boundary. We pass
-        the market's start_time as currentEventStartTime — the API
-        returns completed windows up to that point, and the last
-        closePrice equals the price to beat.
-
-        Args:
-            start_time: Unix timestamp of the market start.
-            duration: Market duration in seconds (300 or 900).
-
-        Returns:
-            The Chainlink reference price, or 0.0 on failure.
-        """
+    async def _fetch_price_to_beat(self, start_time: float, duration: int) -> float:
         variant = VARIANT_MAP.get(duration, "fiveminute")
         start_iso = datetime.fromtimestamp(
             start_time, tz=timezone.utc
@@ -506,10 +419,7 @@ class PolymarketFeed:
                     "assetType": "crypto",
                     "currentEventStartTime": start_iso,
                 },
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "application/json",
-                },
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 if resp.status != 200:
@@ -523,35 +433,13 @@ class PolymarketFeed:
             if not results:
                 return 0.0
 
-            # The last result's closePrice = price to beat
             return float(results[-1]["closePrice"])
 
-        except (
-            aiohttp.ClientError,
-            TimeoutError,
-            KeyError,
-            ValueError,
-            IndexError,
-        ) as e:
-            log.debug(
-                "[Polymarket] Price-to-beat fetch error: %s", e
-            )
+        except (aiohttp.ClientError, TimeoutError, KeyError, ValueError, IndexError) as e:
+            log.debug("[Polymarket] Price-to-beat fetch error: %s", e)
             return 0.0
 
-    async def fetch_market_outcome(
-        self,
-        start_time: float,
-        duration: int,
-    ) -> Optional[str]:
-        """Fetch the actual resolved outcome from past-results API.
-
-        To get the result of market starting at `start_time`, we query
-        with the NEXT market's start time (start_time + duration), so
-        that our market appears in the completed results.
-
-        Returns:
-            "up", "down", or None if not yet available.
-        """
+    async def fetch_market_outcome(self, start_time: float, duration: int) -> Optional[str]:
         next_start = start_time + duration
         variant = VARIANT_MAP.get(duration, "fiveminute")
         next_iso = datetime.fromtimestamp(
@@ -567,10 +455,7 @@ class PolymarketFeed:
                     "assetType": "crypto",
                     "currentEventStartTime": next_iso,
                 },
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "application/json",
-                },
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 if resp.status != 200:
@@ -584,16 +469,13 @@ class PolymarketFeed:
             if not results:
                 return None
 
-            # Verify the last result is actually OUR market
-            # (not a previous window that's still the latest)
             expected_start = datetime.fromtimestamp(
                 start_time, tz=timezone.utc
             ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             last = results[-1]
             if last.get("startTime") != expected_start:
                 log.debug(
-                    "[Polymarket] Outcome not ready: got %s, "
-                    "expected %s",
+                    "[Polymarket] Outcome not ready: got %s, expected %s",
                     last.get("startTime"), expected_start,
                 )
                 return None
@@ -602,13 +484,7 @@ class PolymarketFeed:
                 return outcome
             return None
 
-        except (
-            aiohttp.ClientError,
-            TimeoutError,
-            KeyError,
-            ValueError,
-            IndexError,
-        ):
+        except (aiohttp.ClientError, TimeoutError, KeyError, ValueError, IndexError):
             return None
 
     async def stop(self) -> None:

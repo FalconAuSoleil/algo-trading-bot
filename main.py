@@ -7,7 +7,7 @@ Uses microstructure bayesian strategy for signal generation.
 from __future__ import annotations
 
 import asyncio
-import signal
+import os
 import sys
 import time
 from pathlib import Path
@@ -110,12 +110,15 @@ class Orchestrator:
             asyncio.create_task(self._dashboard_server(), name="dashboard"),
         ]
 
-        loop = asyncio.get_event_loop()
-        for sig_name in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                sig_name,
-                lambda: asyncio.create_task(self.shutdown()),
-            )
+        # FIX: signal handlers only work on Unix, skip on Windows
+        if sys.platform != "win32":
+            import signal
+            loop = asyncio.get_event_loop()
+            for sig_name in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(
+                    sig_name,
+                    lambda: asyncio.create_task(self.shutdown()),
+                )
 
         log.info("[Main] Dashboard at http://localhost:%d", config.dashboard.port)
 
@@ -175,7 +178,7 @@ class Orchestrator:
             try:
                 await self._evaluate_markets()
             except Exception as e:
-                log.error("[Signal] Loop error: %s", e)
+                log.error("[Signal] Loop error: %s", e, exc_info=True)
             await asyncio.sleep(2)
 
     async def _evaluate_markets(self) -> None:
@@ -194,7 +197,6 @@ class Orchestrator:
 
             ob = self._orderbooks.get(cid)
 
-            # Build enriched MarketState with microstructure data
             state = MarketState(
                 market_id=cid,
                 reference_price=market.reference_price,
@@ -209,7 +211,7 @@ class Orchestrator:
                 best_bid_no=ob.best_bid_no if ob else 0.0,
                 best_ask_no=ob.best_ask_no if ob else 0.0,
                 spread_yes=ob.spread_up if ob else 0.01,
-                spread_no=getattr(ob, 'spread_down', ob.spread_up if ob else 0.01) if ob else 0.01,
+                spread_no=ob.spread_down if ob else 0.01,
                 slug=market.slug,
                 start_time=market.start_time,
                 duration_seconds=market.duration_seconds,
@@ -227,7 +229,6 @@ class Orchestrator:
             sig.market_start_time = market.start_time
             sig.market_duration = market.duration_seconds
 
-            # Log
             filters = ",".join(sig.filter_reasons) if sig.filter_reasons else "ALL_PASS"
             log.info(
                 "[Signal] %s T-%ds δ=%.3f%% P=%.2f edge=%.3f → %s [%s] | %s",
@@ -288,6 +289,9 @@ class Orchestrator:
                     "hawkes_intensity": round(sig.micro.hawkes_intensity, 4),
                     "stability_ratio": round(sig.micro.stability_ratio, 3),
                     "stability_ok": sig.micro.stability_ok,
+                    "taker_fee": round(sig.micro.taker_fee, 5),
+                    "source_divergence": round(sig.micro.source_divergence, 6),
+                    "time_decay": round(sig.micro.time_decay_factor, 3),
                 },
             })
 
@@ -298,7 +302,6 @@ class Orchestrator:
                     if full:
                         await dashboard_state.update_trade(full)
                     await dashboard_state.update_portfolio(self.portfolio.get_stats())
-                    # Reset stability after bet placed
                     self.signal_engine.reset_market_stability(market.slug)
 
         await dashboard_state.update_portfolio(self.portfolio.get_stats())
@@ -369,6 +372,11 @@ def main():
         )
 
     orchestrator = Orchestrator()
+
+    # Windows compatibility: use WindowsSelectorEventLoopPolicy
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     asyncio.run(orchestrator.start())
 
 
