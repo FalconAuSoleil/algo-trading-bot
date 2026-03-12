@@ -1,289 +1,126 @@
-# BTC Sniper — Polymarket Binary Options Trading Bot
+# BTC Sniper — Microstructure Bayesian Strategy
 
-Bot de trading automatise pour les marches binaires BTC Up/Down de Polymarket (5 minutes et 15 minutes).
+Bot de trading automatisé pour les marchés **BTC Up/Down 5min et 15min** sur [Polymarket](https://polymarket.com).
 
-## La Strategie : "Last-Minute Endgame"
+## Stratégie
 
-### Principe
+Ce bot utilise une approche **bayésienne microstructure** qui combine 4 signaux indépendants dans l'espace logit pour calculer la probabilité réelle que le BTC finisse au-dessus ou en-dessous du prix de référence ("price to beat") Chainlink.
 
-Polymarket propose des paris binaires : "Le BTC sera-t-il au-dessus de $X dans 5 minutes ?".
-Chaque fenetre a un **price to beat** (prix Chainlink a l'ouverture). A l'expiration :
+### Les 4 composantes
 
-- Si BTC >= price to beat → le token **UP** vaut **$1.00**, DOWN vaut $0.00
-- Si BTC < price to beat → le token **DOWN** vaut **$1.00**, UP vaut $0.00
+#### 1. Chainlink Lag Arbitrage
+Chainlink met à jour son prix on-chain toutes les ~27 secondes sur Polygon. Dans les secondes précédant un update, le prix Binance (temps réel) prédit le prochain prix Chainlink — créant une fenêtre d'edge exploitable.
 
-**Le bot achete le token gagnant dans les 15 a 120 dernieres secondes**, quand le resultat est quasi-certain mais que le prix n'a pas encore converge vers $1.00.
+- Estimation dynamique de la période d'update via moyenne pondérée
+- Edge proportionnel au gap Binance-Chainlink × proximité du prochain update
+- Fenêtre d'edge : 8 secondes avant l'update estimé
 
-### Pourquoi ca marche
+#### 2. Order Flow Imbalance (OFI)
+Basé sur le modèle de **Cont, Kukanov & Stoikov (2014)**. L'asymétrie du carnet d'ordres Polymarket révèle la pression d'achat/vente.
 
-Quand il reste 30 secondes et que le BTC est 0.25% au-dessus du price to beat, la probabilite que ca s'inverse est inferieure a 1%. Pourtant le token UP se trade encore a ~$0.85-$0.95, laissant un **edge de 5 a 15%**.
+- OFI net = différence normalisée entre bids et asks des deux côtés
+- Depth imbalance : ratio de profondeur UP vs DOWN
+- Momentum OFI : taux de changement sur les 10 derniers snapshots
+- Conversion en ajustement logit borné \[-0.8, +0.8\]
 
-### Le modele mathematique
+#### 3. Kyle Lambda — Price Impact Filter
+Modèle de **Kyle (1985)** : le spread révèle l'information privée des market makers.
 
-```
-P_true = 1 - Phi(-|delta| / (sigma * sqrt(T)))
+- λ = spread / (2 × √depth) — mesure l'impact prix
+- Si λ est élevé → market makers incertains → signal peu fiable → pénalité
+- Quality factor ∈ \[0.3, 1.0\] agit comme shrinkage vers 0.5 dans l'espace logit
 
-delta = (BTC_actuel - price_to_beat) / price_to_beat
-sigma = volatilite realisee 1-minute du BTC (rolling 30 min)
-T     = temps restant en minutes
-Phi   = fonction de repartition normale
+#### 4. Hawkes Process — Regime Detection
+Processus auto-excitateur de **Hawkes (1971)** : les mouvements de prix arrivent en clusters.
 
-Edge  = P_true - P_market - fees
-```
+- Intensité conditionnelle : λ(t) = μ + Σ α·m·exp(-β·(t - tᵢ))
+- Détecte les régimes de forte activité (marché en train de pricer une info)
+- Boost de confiance ∈ \[0, 0.3\] qui amplifie le signal existant
 
-Le bot achete uniquement quand `edge > 8%` et que tous les filtres de securite passent.
+### Combinaison bayésienne
 
-### Position sizing
-
-Quarter Kelly avec cap a 5% du capital et 30% de la profondeur du carnet :
-
-```
-size = min(0.25 * Kelly * capital, 0.05 * capital, 0.30 * depth)
-```
-
-### Filtres de protection
-
-| Filtre | Seuil | Description |
-|--------|-------|-------------|
-| Temps | 15s - 120s | Fenetre d'entree optimale |
-| Delta minimum | 0.12% | Eviter les paris a 50/50 |
-| Edge minimum | 8% | Marge suffisante apres fees |
-| Coherence sources | 0.08% | Binance et Chainlink concordent |
-| Profondeur carnet | > $2,000 | Assurer l'execution |
-| Volatilite max | 0.15% | Eviter les regimes extremes |
-| Pertes consecutives | < 3 | Circuit breaker |
-| Drawdown journalier | < 15% | Stop du jour |
-| Positions ouvertes | < 3 | Limiter l'exposition |
-| 1 par marche | Unique | Pas de double position |
-
-### Profil attendu
-
-| Metrique | Conservateur | Optimiste |
-|----------|-------------|-----------|
-| Win rate | 92% | 97% |
-| Profit moyen/trade gagnant | 15% | 25% |
-| Perte par trade perdant | 100% | 100% |
-| Trades/jour | 5 | 20 |
-| Rendement mensuel | 15% | 40% |
-
----
-
-## Installation
-
-### Prerequis
-
-- Python 3.12+
-- Connexion internet stable (WebSocket Binance + API Polymarket)
-
-### Setup
-
-```bash
-# Cloner le repo
-git clone <repo-url>
-cd polymarket-btc-sniper
-
-# Creer l'environnement virtuel
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Installer les dependances
-pip install -r requirements.txt
-```
-
-### Configuration
-
-Copier le fichier d'exemple et editer :
-
-```bash
-cp .env.example .env
-```
-
-Editer `.env` avec vos parametres :
-
-```env
-# Mode de trading : "paper" (simulation) ou "live" (reel)
-TRADING_MODE=paper
-
-# Capital initial en paper trading (USDC)
-PAPER_INITIAL_BALANCE=10000
-
-# Polymarket API (requis pour le mode live uniquement)
-POLYMARKET_API_KEY=
-POLYMARKET_API_SECRET=
-POLYMARKET_API_PASSPHRASE=
-POLYMARKET_WALLET_ADDRESS=
-POLYMARKET_PRIVATE_KEY=
-
-# Parametres de signal (valeurs par defaut recommandees)
-DELTA_MIN=0.0012          # delta minimum (0.12%)
-EDGE_MIN=0.08             # edge minimum (8%)
-TIME_MIN_SECONDS=15       # temps min avant expiration
-TIME_MAX_SECONDS=120      # temps max avant expiration
-VOLATILITY_MAX=0.0015     # volatilite max (0.15%)
-SOURCE_COHERENCE_MAX=0.0008  # divergence max Binance/Chainlink
-
-# Parametres de risque
-KELLY_FRACTION=0.25       # fraction de Kelly (1/4)
-MAX_POSITION_PCT=0.05     # max 5% du capital par trade
-MAX_DAILY_DRAWDOWN=0.15   # stop si -15% du capital
-MAX_CONSECUTIVE_LOSSES=3  # stop apres 3 pertes d'affilee
-MAX_OPEN_POSITIONS=3      # max 3 trades simultanement
-
-# Dashboard
-DASHBOARD_PORT=8080
-DASHBOARD_HOST=0.0.0.0
-
-# Base de donnees
-DB_PATH=data/trades.db
-
-# Logging
-LOG_LEVEL=INFO
-```
-
----
-
-## Lancement
-
-### Paper trading (simulation avec donnees live)
-
-```bash
-source .venv/bin/activate
-python3 main.py
-```
-
-Ou avec des options CLI :
-
-```bash
-# Changer le mode
-python3 main.py --mode paper
-
-# Changer le capital initial
-python3 main.py --balance 5000
-
-# Changer le port du dashboard
-python3 main.py --port 9090
-```
-
-### Live trading (argent reel)
-
-```bash
-# 1. Remplir les credentials Polymarket dans .env
-# 2. Lancer en mode live
-python3 main.py --mode live
-```
-
-**Attention** : Le mode live execute de vrais ordres sur Polymarket avec de l'argent reel.
-
-### Dashboard
-
-Une fois le bot lance, ouvrir dans le navigateur :
+Tous les signaux sont combinés dans l'**espace logit** (log-odds) :
 
 ```
-http://localhost:8080
+logit(P) = logit(prior)           ← delta prix Chainlink + momentum
+         + chainlink_boost        ← lag arbitrage
+         + OFI_adjustment         ← order flow
+         × kyle_quality           ← filtre de fiabilité
+         × (1 + hawkes_boost)     ← amplification régime actif
 ```
 
-Le dashboard affiche en temps reel :
-- Prix BTC (Binance + Chainlink)
-- Signal actuel (delta, P_true, edge, filtres)
-- Portfolio (balance, PnL, win rate)
-- Historique des trades (5m/15m, UP/DOWN, WON/LOST)
-- Courbes d'equity et PnL journalier
-- Statut des feeds (Binance, Chainlink, Polymarket)
+### Filtre de stabilité
 
----
+Un signal n'est validé que si :
+- **Direction ratio ≥ 65%** : au moins 65% des ticks récents pointent dans la même direction
+- **Edge CV ≤ 0.80** : coefficient de variation de l'edge suffisamment faible
+- **Minimum 3 ticks** accumulés dans la fenêtre de 60 secondes
+
+### Sizing (Kelly fractionnel)
+
+- Quarter-Kelly avec cap à 4% de bankroll
+- Réduction ×0.7 en régime calme (Hawkes < 1.5×μ)
+- Bonus de taille si signal très stable (ratio élevé)
 
 ## Architecture
 
 ```
-polymarket-btc-sniper/
-├── main.py                    # Orchestrateur principal
-├── .env                       # Configuration (copier .env.example)
-├── requirements.txt           # Dependances Python
-├── data/
-│   └── trades.db              # Base SQLite (auto-creee)
-├── docs/
-│   └── STRATEGY.md            # Document de strategie detaille
-└── src/
-    ├── config.py              # Gestion de la configuration
-    ├── feeds/
-    │   ├── binance.py         # WebSocket Binance BTC/USDT
-    │   ├── chainlink.py       # Feed prix Chainlink (proxy Binance REST)
-    │   └── polymarket.py      # Discovery marches + orderbook + price to beat
-    ├── engine/
-    │   └── signal.py          # Moteur de signal (P_true, edge, filtres)
-    ├── trading/
-    │   ├── paper.py           # Trading simule
-    │   ├── live.py            # Trading reel (CLOB API)
-    │   └── portfolio.py       # Gestion du portefeuille et PnL
-    ├── dashboard/
-    │   ├── app.py             # API FastAPI + WebSocket
-    │   └── templates/
-    │       └── index.html     # Interface web
-    └── utils/
-        ├── db.py              # Couche SQLite (trades, snapshots, signaux)
-        ├── math_utils.py      # Probabilite, Kelly, volatilite
-        └── logger.py          # Logging configure
+main.py                    ← Orchestrateur principal
+src/
+├── config.py              ← Configuration + hyperparamètres .env
+├── engine/
+│   └── signal.py          ← Signal Engine v2 (4 modules microstructure)
+├── feeds/
+│   ├── binance.py         ← WebSocket BTC/USDT temps réel
+│   ├── chainlink.py       ← RPC Polygon + RTDS + Binance fallback
+│   └── polymarket.py      ← Découverte marchés + orderbook + résolution
+├── trading/
+│   ├── portfolio.py       ← Gestion du portefeuille
+│   ├── paper.py           ← Paper trading (simulation)
+│   └── live.py            ← Live trading (CLOB API)
+├── dashboard/
+│   ├── app.py             ← FastAPI + WebSocket dashboard
+│   └── templates/
+│       └── index.html     ← UI temps réel
+└── utils/
+    ├── logger.py          ← Logging Rich
+    ├── db.py              ← SQLite async
+    └── math_utils.py      ← Fonctions mathématiques
 ```
 
-## Flux du systeme
-
-```
-Binance WebSocket ──→ Prix BTC tick-by-tick ──→ Volatilite rolling (sigma)
-                                                       │
-Chainlink Feed ────→ Prix BTC (poll /3s) ──────────────┤
-                                                       │
-Polymarket Feed ───→ Discovery marches (slug) ─────────┤
-                  ├→ Price to beat (past-results API)   │
-                  └→ Orderbook (CLOB /book)             │
-                                                       ▼
-                                              Signal Engine (/2s)
-                                              ├── delta, sigma, P_true
-                                              ├── edge = P_true - P_market - fee
-                                              ├── 10 filtres de securite
-                                              └── Kelly sizing
-                                                       │
-                                              si edge > 8% et filtres OK
-                                                       ▼
-                                              Paper/Live Trader → Execute
-                                                       │
-                                              Resolution (/3s)
-                                              BTC >= ref → UP gagne
-                                              BTC <  ref → DOWN gagne
-                                                       │
-                                                       ▼
-                                              Portfolio → PnL → Dashboard
-```
-
----
-
-## Commandes utiles
+## Installation
 
 ```bash
-# Voir les logs en temps reel
-tail -f logs/btc_sniper.log
-
-# Reset la base de donnees (repart de zero)
-rm -f data/trades.db
-
-# Lancer avec plus de logs
-LOG_LEVEL=DEBUG python3 main.py
+pip install -r requirements.txt
+cp .env.example .env
+# Ajuster les paramètres dans .env
+python main.py
 ```
 
----
+## Modes
 
-## Phases de deploiement recommandees
+```bash
+# Paper trading (par défaut)
+python main.py --mode paper --balance 10000
 
-### Phase 1 — Observer (1-2 semaines)
-Lancer en paper trading, ne rien toucher. Observer les signaux, le win rate, le comportement du marche. Verifier que le bot detecte bien les opportunites et que les filtres fonctionnent.
+# Live trading (nécessite clés API Polymarket)
+python main.py --mode live
 
-### Phase 2 — Paper trading actif (1-2 semaines)
-Analyser les resultats : win rate > 90% ? edge moyen > 8% ? drawdown acceptable ? Ajuster les parametres si necessaire (`DELTA_MIN`, `EDGE_MIN`, `TIME_MIN_SECONDS`).
+# Dashboard accessible sur http://localhost:8080
+```
 
-### Phase 3 — Live trading (progressif)
-Commencer avec $200-500. Max $50 par trade. Comparer les resultats live vs paper. Scaler progressivement si les resultats sont coherents.
+## Sources de prix
 
----
+1. **Chainlink RPC Polygon** (source principale) : poll `latestRoundData()` toutes les 3s avec rotation sur 3 endpoints
+2. **RTDS Polymarket** (bonus) : stream WebSocket push pour prix inter-ticks
+3. **Binance WebSocket** : prix temps réel pour le momentum et cross-ref
+4. **Binance REST** (fallback) : si RPC et RTDS sont down
 
-## Avertissement
+## Risk Management
 
-Ce bot est un outil experimental. Le trading comporte des risques de perte en capital. Les performances passees (paper ou live) ne garantissent pas les resultats futurs. Utilisez a vos propres risques.
+- **Stop-loss journalier** : -15% de drawdown max
+- **Circuit breaker** : pause après 3 pertes consécutives
+- **Max positions** : 3 simultanées
+- **Kelly fractionnel** : quarter-Kelly avec cap à 4%
+- **Guards liquidité** : $15 minimum de profondeur
+- **Guards payout** : prix marché entre 20¢ et 80¢ (évite longshots et mauvais odds)

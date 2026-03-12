@@ -1,4 +1,7 @@
-"""Configuration management with environment variable support."""
+"""Configuration management with environment variable support.
+
+Includes microstructure strategy hyperparameters.
+"""
 
 from __future__ import annotations
 
@@ -26,10 +29,51 @@ def _env_int(key: str, default: int = 0) -> int:
 
 @dataclass(frozen=True)
 class SignalConfig:
-    delta_min: float = _env_float("DELTA_MIN", 0.0012)
+    # ── Microstructure thresholds ──
     edge_min: float = _env_float("EDGE_MIN", 0.08)
-    time_min_seconds: int = _env_int("TIME_MIN_SECONDS", 15)
-    time_max_seconds: int = _env_int("TIME_MAX_SECONDS", 120)
+    min_true_prob: float = _env_float("MIN_TRUE_PROB", 0.58)
+    max_bet_fraction: float = _env_float("MAX_BET_FRACTION", 0.04)
+    min_market_prob_side: float = _env_float("MIN_MARKET_PROB_SIDE", 0.20)
+    max_market_prob_side: float = _env_float("MAX_MARKET_PROB_SIDE", 0.80)
+    min_market_liquidity: float = _env_float("MIN_MARKET_LIQUIDITY", 15.0)
+
+    # ── Timing ──
+    time_min_5m: float = _env_float("TIME_MIN_5M", 45.0)
+    time_max_5m: float = _env_float("TIME_MAX_5M", 270.0)
+    time_max_5m_accum: float = _env_float("TIME_MAX_5M_ACCUM", 400.0)
+    time_min_15m: float = _env_float("TIME_MIN_15M", 60.0)
+    time_max_15m: float = _env_float("TIME_MAX_15M", 850.0)
+    # Legacy compat
+    time_min_seconds: int = _env_int("TIME_MIN_SECONDS", 45)
+    time_max_seconds: int = _env_int("TIME_MAX_SECONDS", 270)
+
+    # ── Chainlink arb ──
+    chainlink_period: float = _env_float("CHAINLINK_PERIOD", 27.0)
+    chainlink_edge_window: float = _env_float("CHAINLINK_EDGE_WINDOW", 8.0)
+
+    # ── OFI ──
+    ofi_weight: float = _env_float("OFI_WEIGHT", 0.30)
+
+    # ── Kyle ──
+    kyle_spread_penalty: float = _env_float("KYLE_SPREAD_PENALTY", 0.15)
+
+    # ── Hawkes ──
+    hawkes_mu: float = _env_float("HAWKES_MU", 0.1)
+    hawkes_alpha: float = _env_float("HAWKES_ALPHA", 0.8)
+    hawkes_beta: float = _env_float("HAWKES_BETA", 2.0)
+    hawkes_history: int = _env_int("HAWKES_HISTORY", 200)
+
+    # ── Momentum ──
+    momentum_factor: float = _env_float("MOMENTUM_FACTOR", 150.0)
+
+    # ── Stability filter ──
+    stability_window_sec: float = _env_float("STABILITY_WINDOW_SEC", 60.0)
+    stability_min_samples: int = _env_int("STABILITY_MIN_SAMPLES", 3)
+    stability_min_ratio: float = _env_float("STABILITY_MIN_RATIO", 0.65)
+    stability_edge_cv_max: float = _env_float("STABILITY_EDGE_CV_MAX", 0.80)
+
+    # ── Legacy compat ──
+    delta_min: float = _env_float("DELTA_MIN", 0.0012)
     volatility_max: float = _env_float("VOLATILITY_MAX", 0.0015)
     source_coherence_max: float = _env_float("SOURCE_COHERENCE_MAX", 0.0008)
     volatility_window_minutes: int = 30
