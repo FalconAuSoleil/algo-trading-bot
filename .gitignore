@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Data files
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Logs
+*.log
+logs/

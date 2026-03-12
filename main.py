@@ -1,0 +1,468 @@
+"""BTC Sniper — Main orchestrator.
+
+Coordinates all components: feeds, signal engine, trading, and dashboard.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import signal
+import sys
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import uvicorn
+
+# Ensure project root is on path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from src.config import config
+from src.utils.logger import setup_logger
+from src.utils.db import Database
+from src.feeds.binance import BinanceFeed
+from src.feeds.chainlink import ChainlinkFeed
+from src.feeds.polymarket import PolymarketFeed, MarketInfo
+from src.engine.signal import SignalEngine, MarketState, Signal
+from src.trading.portfolio import Portfolio
+from src.trading.paper import PaperTrader
+from src.trading.live import LiveTrader
+from src.dashboard.app import app as dashboard_app, dashboard_state
+
+log = setup_logger("main", config.log_level)
+
+
+class Orchestrator:
+    """Main system coordinator."""
+
+    def __init__(self):
+        self.db = Database(config.db_path)
+
+        # Feeds
+        self.binance_feed = BinanceFeed(
+            url=config.binance.ws_url,
+            on_price=self._on_price,
+        )
+        self.chainlink_feed = ChainlinkFeed(
+            url=config.polymarket.rtds_url,
+            on_price=self._on_price,
+        )
+        self.polymarket_feed = PolymarketFeed(
+            gamma_url=config.polymarket.gamma_url,
+            clob_url=config.polymarket.clob_url,
+            clob_ws_url=config.polymarket.clob_ws_url,
+            on_market_update=self._on_market_update,
+            on_orderbook_update=self._on_orderbook_update,
+        )
+
+        # Signal engine
+        self.signal_engine = SignalEngine(config.signal)
+
+        # Portfolio + Trader
+        self.portfolio = Portfolio(
+            initial_balance=config.paper_initial_balance,
+            mode=config.trading_mode,
+        )
+        if config.is_paper:
+            self.trader = PaperTrader(self.portfolio, self.db)
+        else:
+            self.trader = LiveTrader(
+                self.portfolio, self.db, config.polymarket
+            )
+
+        # State
+        self._btc_binance: float = 0.0
+        self._btc_chainlink: float = 0.0
+        self._active_markets: dict[str, MarketInfo] = {}
+        self._orderbooks: dict = {}
+        self._last_signal_time: float = 0.0
+        self._running = False
+        self._snapshot_interval = 60  # seconds
+
+    async def start(self) -> None:
+        """Start all components."""
+        log.info("=" * 60)
+        log.info("  BTC SNIPER — Polymarket Trading System")
+        log.info("  Mode: %s", config.trading_mode.upper())
+        log.info(
+            "  Capital: $%.2f", config.paper_initial_balance
+        )
+        log.info("=" * 60)
+
+        # Ensure data directory exists
+        Path("data").mkdir(exist_ok=True)
+
+        # Initialize database
+        await self.db.connect()
+
+        # Restore portfolio from historical trades
+        db_state = await self.db.load_portfolio_state(
+            config.trading_mode
+        )
+        self.portfolio.restore_from_db(db_state)
+
+        dashboard_state.set_db(self.db)
+        await dashboard_state.refresh_from_db()
+
+        # Push restored portfolio stats to dashboard immediately
+        await dashboard_state.update_portfolio(
+            self.portfolio.get_stats()
+        )
+
+        # Initialize live trader if needed
+        if config.is_live and hasattr(self.trader, "start"):
+            await self.trader.start()
+
+        self._running = True
+
+        # Start all components concurrently
+        tasks = [
+            asyncio.create_task(
+                self.binance_feed.start(), name="binance_feed"
+            ),
+            asyncio.create_task(
+                self.chainlink_feed.start(), name="chainlink_feed"
+            ),
+            asyncio.create_task(
+                self.polymarket_feed.start(), name="polymarket_feed"
+            ),
+            asyncio.create_task(
+                self._signal_loop(), name="signal_loop"
+            ),
+            asyncio.create_task(
+                self._resolution_loop(), name="resolution_loop"
+            ),
+            asyncio.create_task(
+                self._snapshot_loop(), name="snapshot_loop"
+            ),
+            asyncio.create_task(
+                self._dashboard_server(), name="dashboard"
+            ),
+        ]
+
+        # Handle shutdown
+        loop = asyncio.get_event_loop()
+        for sig_name in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                sig_name,
+                lambda: asyncio.create_task(self.shutdown()),
+            )
+
+        log.info(
+            "[Main] Dashboard at http://localhost:%d",
+            config.dashboard.port,
+        )
+
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown."""
+        if not self._running:
+            return
+        self._running = False
+        log.info("[Main] Shutting down...")
+
+        await self.binance_feed.stop()
+        await self.chainlink_feed.stop()
+        await self.polymarket_feed.stop()
+
+        if config.is_live and hasattr(self.trader, "stop"):
+            await self.trader.stop()
+
+        # Final snapshot
+        await self._save_snapshot()
+        await self.db.close()
+
+        log.info("[Main] Shutdown complete")
+        # Cancel remaining tasks
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task():
+                task.cancel()
+
+    # ==================== Price callbacks ====================
+
+    async def _on_price(
+        self, source: str, price: float, timestamp: float
+    ) -> None:
+        """Handle incoming price ticks from all feeds."""
+        if source == "binance":
+            self._btc_binance = price
+            self.signal_engine.update_price(price, timestamp)
+            await dashboard_state.update_feeds({
+                "binance": True,
+                "chainlink": self._btc_chainlink > 0,
+                "polymarket": len(self._active_markets) > 0,
+            })
+        elif source == "chainlink":
+            self._btc_chainlink = price
+            await dashboard_state.update_feeds({
+                "binance": self._btc_binance > 0,
+                "chainlink": True,
+                "polymarket": len(self._active_markets) > 0,
+            })
+        elif source == "rtds_binance":
+            # Secondary Binance feed from RTDS — use as cross ref
+            if self._btc_binance == 0:
+                self._btc_binance = price
+
+    async def _on_market_update(
+        self, markets: dict[str, MarketInfo]
+    ) -> None:
+        """Handle market discovery updates."""
+        self._active_markets = markets
+        await dashboard_state.update_feeds({
+            "binance": self._btc_binance > 0,
+            "chainlink": self._btc_chainlink > 0,
+            "polymarket": len(markets) > 0,
+        })
+
+    async def _on_orderbook_update(
+        self, cid: str, ob
+    ) -> None:
+        """Handle orderbook state updates."""
+        self._orderbooks[cid] = ob
+
+    # ==================== Core loops ====================
+
+    async def _signal_loop(self) -> None:
+        """Evaluate signals every 2 seconds."""
+        while self._running:
+            try:
+                await self._evaluate_markets()
+            except Exception as e:
+                log.error("[Signal] Loop error: %s", e)
+            await asyncio.sleep(2)
+
+    async def _evaluate_markets(self) -> None:
+        """Evaluate all active markets for trade signals."""
+        if not self._active_markets:
+            return
+        if self._btc_chainlink <= 0:
+            return
+
+        consecutive_losses = await self.db.get_consecutive_losses(
+            config.trading_mode
+        )
+
+        for cid, market in self._active_markets.items():
+            if market.is_expired:
+                continue
+
+            # Skip markets without a reference price
+            # (price to beat is fetched from past-results API
+            # during discovery)
+            if market.reference_price <= 0:
+                continue
+
+            # Build market state
+            ob = self._orderbooks.get(cid)
+            state = MarketState(
+                market_id=cid,
+                reference_price=market.reference_price,
+                end_time=market.end_time,
+                btc_chainlink=self._btc_chainlink,
+                btc_binance=self._btc_binance,
+                p_market_yes=ob.mid_yes if ob else 0.5,
+                depth_yes=(
+                    ob.depth_ask_yes if ob else 0
+                ),
+                depth_no=(
+                    ob.depth_ask_no if ob else 0
+                ),
+                best_ask_yes=ob.best_ask_yes if ob else 0.0,
+                best_ask_no=ob.best_ask_no if ob else 0.0,
+            )
+
+            # Evaluate signal
+            sig = self.signal_engine.evaluate(
+                state=state,
+                capital=self.portfolio.balance,
+                consecutive_losses=consecutive_losses,
+                daily_pnl_pct=self.portfolio.daily_pnl_pct,
+                open_positions=self.portfolio.open_position_count,
+                has_position_on_market=self.portfolio
+                .has_position_on_market(cid),
+            )
+            sig.slug = market.slug
+            sig.market_start_time = market.start_time
+            sig.market_duration = market.duration_seconds
+
+            # Log signal evaluation (compact)
+            filters = (
+                ",".join(sig.filter_reasons)
+                if sig.filter_reasons else "ALL_PASS"
+            )
+            log.info(
+                "[Signal] %s T-%ds δ=%.3f%% "
+                "P=%.2f edge=%.3f → %s [%s]",
+                market.slug[-14:],
+                int(sig.time_remaining_sec),
+                sig.delta_chainlink * 100,
+                sig.p_true,
+                sig.edge,
+                sig.action,
+                filters,
+            )
+
+            # Log signal to database
+            await self.db.insert_signal({
+                "timestamp": sig.timestamp,
+                "market_id": sig.market_id,
+                "btc_binance": sig.btc_binance,
+                "btc_chainlink": sig.btc_chainlink,
+                "reference_price": sig.reference_price,
+                "delta_chainlink": sig.delta_chainlink,
+                "delta_binance": sig.delta_binance,
+                "sigma": sig.sigma,
+                "time_remaining_sec": sig.time_remaining_sec,
+                "p_true": sig.p_true,
+                "p_market": sig.p_market,
+                "edge": sig.edge,
+                "filters_passed": 1 if sig.filters_passed else 0,
+                "filter_details": ",".join(sig.filter_reasons),
+                "action": sig.action,
+            })
+
+            # Update dashboard
+            await dashboard_state.update_signal({
+                "market_id": sig.market_id,
+                "slug": sig.slug,
+                "action": sig.action,
+                "side": sig.side,
+                "btc_chainlink": sig.btc_chainlink,
+                "btc_binance": sig.btc_binance,
+                "reference_price": sig.reference_price,
+                "delta_chainlink": sig.delta_chainlink,
+                "delta_binance": sig.delta_binance,
+                "sigma": sig.sigma,
+                "time_remaining_sec": sig.time_remaining_sec,
+                "p_true": sig.p_true,
+                "p_market": sig.p_market,
+                "edge": sig.edge,
+                "taker_fee": sig.taker_fee,
+                "size_usd": sig.size_usd,
+                "entry_price": sig.entry_price,
+                "filters_passed": sig.filters_passed,
+                "filter_reasons": sig.filter_reasons,
+            })
+
+            # Execute trade if signal is actionable
+            if sig.action == "BUY":
+                trade_id = await self.trader.execute(sig)
+                if trade_id:
+                    full = await self.db.get_trade(trade_id)
+                    if full:
+                        await dashboard_state.update_trade(full)
+                    await dashboard_state.update_portfolio(
+                        self.portfolio.get_stats()
+                    )
+
+        # Always push portfolio update
+        await dashboard_state.update_portfolio(
+            self.portfolio.get_stats()
+        )
+
+    async def _resolution_loop(self) -> None:
+        """Check for position resolutions every 3 seconds."""
+        while self._running:
+            try:
+                if self.trader.pending_count > 0:
+                    resolved = await self.trader.check_resolutions(
+                        self._btc_chainlink,
+                        fetch_outcome=self.polymarket_feed
+                        .fetch_market_outcome,
+                    )
+                    for r in resolved:
+                        # Fetch full trade row for dashboard
+                        full = await self.db.get_trade(
+                            r["trade_id"]
+                        )
+                        if full:
+                            await dashboard_state.update_trade(full)
+                        else:
+                            await dashboard_state.update_trade(r)
+                        await dashboard_state.update_portfolio(
+                            self.portfolio.get_stats()
+                        )
+            except Exception as e:
+                log.error("[Resolution] Loop error: %s", e)
+            await asyncio.sleep(3)
+
+    async def _snapshot_loop(self) -> None:
+        """Save portfolio snapshots periodically."""
+        while self._running:
+            await asyncio.sleep(self._snapshot_interval)
+            await self._save_snapshot()
+
+    async def _save_snapshot(self) -> None:
+        try:
+            await self.db.insert_snapshot(
+                balance=self.portfolio.balance,
+                open_positions=self.portfolio.open_position_count,
+                daily_pnl=self.portfolio.daily_pnl,
+                total_pnl=self.portfolio.total_pnl,
+                mode=config.trading_mode,
+            )
+        except Exception as e:
+            log.error("[Snapshot] Error: %s", e)
+
+    async def _dashboard_server(self) -> None:
+        """Run the FastAPI dashboard server."""
+        server_config = uvicorn.Config(
+            dashboard_app,
+            host=config.dashboard.host,
+            port=config.dashboard.port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(server_config)
+        await server.serve()
+
+
+def main():
+    """Entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="BTC Sniper — Polymarket Trading System"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["paper", "live", "collect"],
+        default=None,
+        help="Trading mode (overrides .env)",
+    )
+    parser.add_argument(
+        "--balance",
+        type=float,
+        default=None,
+        help="Initial paper balance (overrides .env)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Dashboard port (overrides .env)",
+    )
+    args = parser.parse_args()
+
+    # Apply CLI overrides
+    if args.mode:
+        config.trading_mode = args.mode
+    if args.balance:
+        config.paper_initial_balance = args.balance
+    if args.port:
+        config.dashboard = config.dashboard.__class__(
+            host=config.dashboard.host,
+            port=args.port,
+        )
+
+    orchestrator = Orchestrator()
+    asyncio.run(orchestrator.start())
+
+
+if __name__ == "__main__":
+    main()
