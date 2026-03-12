@@ -189,7 +189,11 @@ class Orchestrator:
 
         consecutive_losses = await self.db.get_consecutive_losses(config.trading_mode)
 
-        for cid, market in self._active_markets.items():
+        # Snapshot the dict to avoid RuntimeError if lifecycle_loop
+        # adds/removes markets while we iterate
+        markets_snapshot = list(self._active_markets.items())
+
+        for cid, market in markets_snapshot:
             if market.is_expired:
                 continue
             if market.reference_price <= 0:
