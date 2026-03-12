@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import sys
 from pathlib import Path
@@ -39,25 +40,33 @@ def setup_logger(
         rich_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         logger.addHandler(rich_handler)
     else:
-        # Fallback for environments without Rich
-        handler = logging.StreamHandler(sys.stdout)
+        # Force UTF-8 on Windows to avoid cp1252 UnicodeEncodeError
+        if sys.platform == "win32":
+            stream = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+        else:
+            stream = sys.stdout
+        handler = logging.StreamHandler(stream)
         handler.setFormatter(
             logging.Formatter(
-                fmt="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+                fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
                 datefmt="%H:%M:%S",
             )
         )
         logger.addHandler(handler)
 
-    # File handler — create data dir if needed
+    # File handler with UTF-8 encoding
     try:
         log_dir = Path("data")
         log_dir.mkdir(exist_ok=True)
-        file_handler = logging.FileHandler(log_dir / "sniper.log")
+        file_handler = logging.FileHandler(
+            log_dir / "sniper.log", encoding="utf-8"
+        )
         file_handler.setFormatter(logging.Formatter(_FILE_FORMAT))
         logger.addHandler(file_handler)
     except (OSError, PermissionError):
-        pass  # Skip file logging if data dir can't be created
+        pass
 
     logger.propagate = False
     return logger

@@ -1,4 +1,4 @@
-"""BTC Sniper — Main orchestrator.
+"""BTC Sniper - Main orchestrator.
 
 Coordinates all components: feeds, signal engine, trading, and dashboard.
 Uses microstructure bayesian strategy for signal generation.
@@ -54,7 +54,7 @@ class Orchestrator:
             on_orderbook_update=self._on_orderbook_update,
         )
 
-        # Signal engine — microstructure bayesian
+        # Signal engine - microstructure bayesian
         self.signal_engine = SignalEngine(config.signal)
 
         # Portfolio + Trader
@@ -79,7 +79,7 @@ class Orchestrator:
 
     async def start(self) -> None:
         log.info("=" * 60)
-        log.info("  BTC SNIPER — Microstructure Bayesian Strategy")
+        log.info("  BTC SNIPER - Microstructure Bayesian Strategy")
         log.info("  Mode: %s", config.trading_mode.upper())
         log.info("  Capital: $%.2f", config.paper_initial_balance)
         log.info("  Components: Chainlink Arb + OFI + Kyle + Hawkes")
@@ -110,7 +110,7 @@ class Orchestrator:
             asyncio.create_task(self._dashboard_server(), name="dashboard"),
         ]
 
-        # FIX: signal handlers only work on Unix, skip on Windows
+        # Signal handlers only work on Unix, skip on Windows
         if sys.platform != "win32":
             import signal
             loop = asyncio.get_event_loop()
@@ -231,7 +231,7 @@ class Orchestrator:
 
             filters = ",".join(sig.filter_reasons) if sig.filter_reasons else "ALL_PASS"
             log.info(
-                "[Signal] %s T-%ds δ=%.3f%% P=%.2f edge=%.3f → %s [%s] | %s",
+                "[Signal] %s T-%ds d=%.3f%% P=%.2f edge=%.3f -> %s [%s] | %s",
                 market.slug[-14:],
                 int(sig.time_remaining_sec),
                 sig.delta_chainlink * 100,
@@ -356,7 +356,7 @@ class Orchestrator:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="BTC Sniper — Microstructure Bayesian Strategy")
+    parser = argparse.ArgumentParser(description="BTC Sniper - Microstructure Bayesian Strategy")
     parser.add_argument("--mode", choices=["paper", "live", "collect"], default=None)
     parser.add_argument("--balance", type=float, default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -373,7 +373,7 @@ def main():
 
     orchestrator = Orchestrator()
 
-    # Windows compatibility: use WindowsSelectorEventLoopPolicy
+    # Windows compatibility
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
