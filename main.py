@@ -42,8 +42,9 @@ class Orchestrator:
             url=config.binance.ws_url,
             on_price=self._on_price,
         )
+        # Direct on-chain Chainlink oracle (no RTDS WebSocket)
+        # This reads the EXACT same contract Polymarket uses to resolve
         self.chainlink_feed = ChainlinkFeed(
-            url=config.polymarket.rtds_url,
             on_price=self._on_price,
         )
         self.polymarket_feed = PolymarketFeed(
@@ -82,7 +83,8 @@ class Orchestrator:
         log.info("  BTC SNIPER - Microstructure Bayesian Strategy")
         log.info("  Mode: %s", config.trading_mode.upper())
         log.info("  Capital: $%.2f", config.paper_initial_balance)
-        log.info("  Components: Chainlink Arb + OFI + Kyle + Hawkes")
+        log.info("  Chainlink: DIRECT on-chain oracle (Polygon)")
+        log.info("  Resolution: Polymarket API only (no BTC fallback)")
         log.info("=" * 60)
 
         Path("data").mkdir(exist_ok=True)
@@ -150,7 +152,7 @@ class Orchestrator:
         if source == "binance":
             self._btc_binance = price
             self.signal_engine.update_price(price, timestamp)
-        elif source in ("chainlink", "chainlink_rtds", "chainlink_binance_fallback"):
+        elif source in ("chainlink", "chainlink_binance_fallback"):
             self._btc_chainlink = price
             self.signal_engine.update_chainlink_price(price, timestamp)
 
@@ -189,8 +191,7 @@ class Orchestrator:
 
         consecutive_losses = await self.db.get_consecutive_losses(config.trading_mode)
 
-        # Snapshot the dict to avoid RuntimeError if lifecycle_loop
-        # adds/removes markets while we iterate
+        # Snapshot to avoid RuntimeError: dictionary changed size
         markets_snapshot = list(self._active_markets.items())
 
         for cid, market in markets_snapshot:

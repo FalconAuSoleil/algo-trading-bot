@@ -1,4 +1,4 @@
-"""Paper trading engine — simulates trades against live data."""
+"""Paper trading engine - simulates trades against live data."""
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ log = setup_logger("trading.paper")
 
 # Wait this many seconds after expiry before first API check.
 RESOLUTION_DELAY = 30
-# Only fall back to BTC price if API hasn't responded after this.
-FALLBACK_TIMEOUT = 120
 
 
 class PaperTrader:
@@ -24,6 +22,10 @@ class PaperTrader:
     Simulates fills against the live orderbook snapshot. Positions
     are resolved when the market expires based on the actual Polymarket
     outcome fetched from the past-results API.
+
+    IMPORTANT: No BTC price fallback. Only the official Polymarket
+    API result is used for resolution. This ensures our PnL tracking
+    matches what would actually happen on-chain.
     """
 
     def __init__(self, portfolio: Portfolio, db: Database):
@@ -43,18 +45,13 @@ class PaperTrader:
         if signal.size_usd < 1.0:
             return None
 
-        # Simulate fill at the signal's entry price
-        # In paper mode we assume we get filled at the ask
         entry_price = signal.entry_price
         if entry_price <= 0 or entry_price >= 1.0:
-            log.warning(
-                "[Paper] Invalid entry price: %.4f", entry_price
-            )
+            log.warning("[Paper] Invalid entry price: %.4f", entry_price)
             return None
 
         shares = signal.size_usd / entry_price
 
-        # Record trade in database
         record = TradeRecord(
             market_id=signal.market_id,
             slug=signal.slug,
@@ -71,7 +68,6 @@ class PaperTrader:
         )
         trade_id = await self.db.insert_trade(record)
 
-        # Create position
         pos = Position(
             trade_id=trade_id,
             market_id=signal.market_id,
@@ -87,12 +83,9 @@ class PaperTrader:
         )
 
         if not self.portfolio.open_position(pos):
-            await self.db.resolve_trade(
-                trade_id, "cancelled", 0.0
-            )
+            await self.db.resolve_trade(trade_id, "cancelled", 0.0)
             return None
 
-        # Schedule resolution with market timing info
         self._pending_resolutions[trade_id] = {
             "market_id": signal.market_id,
             "side": signal.side,
@@ -126,14 +119,9 @@ class PaperTrader:
     ) -> list[dict]:
         """Check if any pending positions should be resolved.
 
-        Uses the real Polymarket outcome when available via
-        fetch_outcome callback. Falls back to BTC price comparison
-        if the API doesn't return a result yet.
-
-        Args:
-            btc_chainlink_price: Latest BTC price (fallback).
-            fetch_outcome: Async callable(start_time, duration)
-                returning "up", "down", or None.
+        Uses ONLY the real Polymarket API outcome. Retries
+        indefinitely until the API returns "up" or "down".
+        No BTC price fallback - only the official result counts.
         """
         now = time.time()
         resolved = []
@@ -145,15 +133,7 @@ class PaperTrader:
             if now < info["end_time"] + RESOLUTION_DELAY:
                 continue
 
-            ref = info["reference_price"]
             side = info["side"]
-
-            if ref <= 0:
-                log.warning(
-                    "[Paper] No reference price for trade %d",
-                    trade_id,
-                )
-                continue
 
             # Try to get the real outcome from Polymarket API
             real_outcome = None
@@ -164,36 +144,30 @@ class PaperTrader:
                         info.get("duration", 300),
                     )
                 except Exception as e:
-                    log.debug(
-                        "[Paper] Outcome fetch error: %s", e
-                    )
+                    log.debug("[Paper] Outcome fetch error: %s", e)
 
-            if real_outcome in ("up", "down"):
-                # Use the real Polymarket resolution
-                if side == "YES":
-                    won = real_outcome == "up"
-                else:
-                    won = real_outcome == "down"
-                log.info(
-                    "[Paper] Resolved trade %d via API: "
-                    "outcome=%s, side=%s, won=%s",
-                    trade_id, real_outcome, side, won,
-                )
+            if real_outcome not in ("up", "down"):
+                # API not ready yet - retry next cycle
+                # Log periodically so we know it's still waiting
+                wait_s = int(now - info["end_time"])
+                if wait_s % 30 < 4:
+                    log.info(
+                        "[Paper] Waiting for API result on "
+                        "trade %d (%ds since expiry)",
+                        trade_id, wait_s,
+                    )
+                continue
+
+            # Use the real Polymarket resolution
+            if side == "YES":
+                won = real_outcome == "up"
             else:
-                # Fallback: use current BTC price (less reliable)
-                # Keep retrying API until FALLBACK_TIMEOUT
-                if now < info["end_time"] + FALLBACK_TIMEOUT:
-                    continue  # keep waiting for API
-                btc_above = btc_chainlink_price >= ref
-                if side == "YES":
-                    won = btc_above
-                else:
-                    won = not btc_above
-                log.warning(
-                    "[Paper] Resolved trade %d via BTC price "
-                    "FALLBACK: btc=$%.2f, ref=$%.2f, won=%s",
-                    trade_id, btc_chainlink_price, ref, won,
-                )
+                won = real_outcome == "down"
+            log.info(
+                "[Paper] Resolved trade %d via API: "
+                "outcome=%s, side=%s, won=%s",
+                trade_id, real_outcome, side, won,
+            )
 
             outcome, pnl = self.portfolio.close_position(
                 trade_id, won
@@ -207,7 +181,7 @@ class PaperTrader:
                 "pnl": pnl,
                 "side": side,
                 "btc_price": btc_chainlink_price,
-                "ref_price": ref,
+                "ref_price": info["reference_price"],
             })
 
         return resolved
