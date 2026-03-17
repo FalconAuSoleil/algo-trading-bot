@@ -20,13 +20,15 @@ def _envi(key, default=0): return int(os.getenv(key, str(default)))
 class SignalConfig:
     # Edge: P(ours) - entry_price - fee must exceed this
     edge_min: float = _envf("EDGE_MIN", 0.06)
+    # Maximum believable edge - anything above this is model error
+    edge_max: float = _envf("EDGE_MAX", 0.15)
     # Our prob must be at least this to bet
     min_true_prob: float = _envf("MIN_TRUE_PROB", 0.56)
     # Max Kelly fraction of bankroll per bet
-    max_bet_fraction: float = _envf("MAX_BET_FRACTION", 0.025)
-    # Entry price must be between these (avoid longshots and overpaying)
-    min_market_prob_side: float = _envf("MIN_MARKET_PROB_SIDE", 0.30)
-    max_market_prob_side: float = _envf("MAX_MARKET_PROB_SIDE", 0.75)
+    max_bet_fraction: float = _envf("MAX_BET_FRACTION", 0.02)
+    # Entry price must be between these
+    min_market_prob_side: float = _envf("MIN_MARKET_PROB_SIDE", 0.35)
+    max_market_prob_side: float = _envf("MAX_MARKET_PROB_SIDE", 0.70)
     # Min orderbook depth
     min_market_liquidity: float = _envf("MIN_MARKET_LIQUIDITY", 15.0)
 
@@ -44,7 +46,7 @@ class SignalConfig:
     chainlink_edge_window: float = _envf("CHAINLINK_EDGE_WINDOW", 8.0)
 
     # OFI
-    ofi_weight: float = _envf("OFI_WEIGHT", 0.25)
+    ofi_weight: float = _envf("OFI_WEIGHT", 0.20)
 
     # Kyle
     kyle_spread_penalty: float = _envf("KYLE_SPREAD_PENALTY", 0.15)
@@ -55,14 +57,14 @@ class SignalConfig:
     hawkes_beta: float = _envf("HAWKES_BETA", 2.0)
     hawkes_history: int = _envi("HAWKES_HISTORY", 200)
 
-    # Momentum
-    momentum_factor: float = _envf("MOMENTUM_FACTOR", 120.0)
+    # Momentum - REDUCED to avoid overconfidence on small deltas
+    momentum_factor: float = _envf("MOMENTUM_FACTOR", 80.0)
 
     # Stability
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
-    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 4)
-    stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.70)
-    stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.70)
+    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 5)
+    stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.75)
+    stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.60)
 
     # Legacy
     delta_min: float = _envf("DELTA_MIN", 0.0012)
@@ -76,11 +78,11 @@ class SignalConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     kelly_fraction: float = _envf("KELLY_FRACTION", 0.25)
-    max_position_pct: float = _envf("MAX_POSITION_PCT", 0.06)
-    max_daily_drawdown: float = _envf("MAX_DAILY_DRAWDOWN", 0.08)
-    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 4)
+    max_position_pct: float = _envf("MAX_POSITION_PCT", 0.05)
+    max_daily_drawdown: float = _envf("MAX_DAILY_DRAWDOWN", 0.06)
+    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 3)
     max_open_positions: int = _envi("MAX_OPEN_POSITIONS", 2)
-    max_daily_risk: float = _envf("MAX_DAILY_RISK", 0.15)
+    max_daily_risk: float = _envf("MAX_DAILY_RISK", 0.12)
 
 
 @dataclass(frozen=True)
