@@ -4,28 +4,13 @@
 4 components combined into a bayesian score:
 
 1. CHAINLINK LAG ARBITRAGE
-   Chainlink updates every ~20-40s on Polygon.
-   In the seconds before/after an update, we know the
-   resolution price with near-certainty.
-   -> Maximum edge detection window
+2. ORDER FLOW IMBALANCE (OFI) - Cont, Kukanov & Stoikov (2014)
+3. KYLE LAMBDA - PRICE IMPACT - Kyle (1985)
+4. HAWKES PROCESS - EVENT CLUSTERING - Hawkes (1971)
 
-2. ORDER FLOW IMBALANCE (OFI)
-   Based on Cont, Kukanov & Stoikov (2014) model.
-   Asymmetric orderbook reveals smart money positioning.
-   -> Short-term price movement predictor
-
-3. KYLE LAMBDA - PRICE IMPACT
-   Kyle (1985) model: order price impact reveals private info.
-   Wide spread + low depth = uncertain MMs = unreliable signal.
-   -> Signal reliability filter
-
-4. HAWKES PROCESS - EVENT CLUSTERING
-   Price moves cluster (Hawkes, 1971). Self-exciting intensity:
-   lambda(t) = mu + Sum alpha*exp(-beta*(t - ti))
-   -> Detects high-activity regimes = more reliable edge
-
-Final combination: bayesian score in logit space
-   P(UP | data) = f(chainlink_edge, OFI, kyle_filter, hawkes_intensity)
+All signals composed in logit space, then converted to probability.
+Edge is ALWAYS positive when we bet (= our advantage on the side we chose).
+P(true) is ALWAYS the probability of the side we bet on.
 """
 
 from __future__ import annotations
@@ -47,7 +32,6 @@ log = setup_logger("engine.signal")
 # ---------------------------------------------------------
 
 def sigmoid(x: float) -> float:
-    """Numerically stable sigmoid."""
     if x >= 0:
         return 1.0 / (1.0 + math.exp(-min(x, 500)))
     e = math.exp(max(x, -500))
@@ -59,22 +43,15 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 def logit(p: float) -> float:
-    """Logit = log(p / (1-p)). Inverse of sigmoid."""
     p = clamp(p, 1e-6, 1 - 1e-6)
     return math.log(p / (1.0 - p))
 
 
 def shrink_logit(logit_val: float, factor: float) -> float:
-    """Shrink logit toward zero by factor in [0, 1].
-
-    factor=1.0 -> no change, factor=0.3 -> pulls toward 0.5.
-    Correctly handles both positive and negative logits.
-    """
     return logit_val * clamp(factor, 0.0, 1.0)
 
 
 def calc_taker_fee(p_market: float, fee_rate: float = 0.25) -> float:
-    """Polymarket dynamic taker fee: fee_rate * (p * (1-p))^2."""
     if p_market <= 0 or p_market >= 1:
         return 0.0
     return fee_rate * (p_market * (1.0 - p_market)) ** 2
@@ -86,7 +63,6 @@ def calc_taker_fee(p_market: float, fee_rate: float = 0.25) -> float:
 
 @dataclass
 class MarketState:
-    """Current state of a BTC binary market."""
     market_id: str = ""
     reference_price: float = 0.0
     end_time: float = 0.0
@@ -108,7 +84,6 @@ class MarketState:
 
 @dataclass
 class MicrostructureState:
-    """Full microstructure state for debug/dashboard."""
     chainlink_lag_seconds: float = 0.0
     chainlink_edge_boost: float = 0.0
     ofi_raw: float = 0.0
@@ -131,15 +106,16 @@ class MicrostructureState:
 
 @dataclass
 class Signal:
-    """Output of the signal engine."""
     timestamp: float = 0.0
     market_id: str = ""
     delta_chainlink: float = 0.0
     delta_binance: float = 0.0
     sigma: float = 0.0
     time_remaining_sec: float = 0.0
+    # p_true = probability of the SIDE WE BET ON (always > 0.5 if we bet)
     p_true: float = 0.5
     p_market: float = 0.5
+    # edge = ALWAYS POSITIVE when we bet (our advantage on our side)
     edge: float = 0.0
     taker_fee: float = 0.0
     kelly_pct: float = 0.0
@@ -165,8 +141,6 @@ class Signal:
 # ---------------------------------------------------------
 
 class ChainlinkArbModule:
-    """Exploits the ~27s Chainlink update lag on Polygon."""
-
     def __init__(self, cfg: SignalConfig):
         self._last_chainlink_ts: float = 0.0
         self._last_chainlink_price: float = 0.0
@@ -204,8 +178,6 @@ class ChainlinkArbModule:
 # ---------------------------------------------------------
 
 class OFIModule:
-    """Order Flow Imbalance - Cont, Kukanov & Stoikov (2014)."""
-
     def __init__(self, cfg: SignalConfig):
         self._ofi_history: deque = deque(maxlen=30)
         self._ofi_weight: float = cfg.ofi_weight
@@ -237,8 +209,6 @@ class OFIModule:
 # ---------------------------------------------------------
 
 class KyleModule:
-    """Kyle (1985) price impact model - signal reliability filter."""
-
     def __init__(self, cfg: SignalConfig):
         self._spread_history: deque = deque(maxlen=50)
         self._depth_history: deque = deque(maxlen=50)
@@ -272,8 +242,6 @@ class KyleModule:
 # ---------------------------------------------------------
 
 class HawkesModule:
-    """Hawkes (1971) self-exciting process - regime detection."""
-
     def __init__(self, cfg: SignalConfig):
         self._events: deque = deque(maxlen=cfg.hawkes_history)
         self._last_mid: float = 0.5
@@ -315,8 +283,6 @@ class HawkesModule:
 # ---------------------------------------------------------
 
 class StabilityFilter:
-    """Directional stability filter - avoids betting on noise."""
-
     def __init__(self, cfg: SignalConfig):
         self._history: dict[str, deque] = {}
         self._window_sec: float = cfg.stability_window_sec
@@ -330,8 +296,7 @@ class StabilityFilter:
         return self._history[market_slug]
 
     def record(self, market_slug: str, side: str, edge: float, ts: float) -> None:
-        buf = self._get_buffer(market_slug)
-        buf.append((ts, side, abs(edge)))
+        self._get_buffer(market_slug).append((ts, side, abs(edge)))
 
     def evaluate(self, market_slug: str, current_side: str) -> tuple[bool, float, float, int]:
         buf = self._get_buffer(market_slug)
@@ -353,8 +318,7 @@ class StabilityFilter:
         if mean_edge < 1e-6:
             return False, direction_ratio, 999.0, n
         variance = sum((e - mean_edge) ** 2 for e in edges) / len(edges)
-        std_edge = math.sqrt(variance)
-        edge_cv = std_edge / mean_edge
+        edge_cv = math.sqrt(variance) / mean_edge
         is_stable = (direction_ratio >= self._min_ratio and edge_cv <= self._edge_cv_max)
         return is_stable, direction_ratio, edge_cv, n
 
@@ -369,13 +333,11 @@ class StabilityFilter:
 class SignalEngine:
     """Microstructure bayesian signal engine.
 
-    Pipeline (all in logit space for proper bayesian composition):
-      1. Prior from delta prix + short momentum
-      2. + Chainlink lag arbitrage boost (additive logit)
-      3. + OFI signal (additive logit)
-      4. x (1 + Hawkes boost) amplify raw signal
-      5. x Kyle quality shrinkage (toward 0.5 if uncertain)
-      6. -> sigmoid -> final prob -> edge (net of fees) -> decision
+    CRITICAL CONVENTIONS:
+    - sig.side = "YES" or "NO" = the side we bet on
+    - sig.p_true = probability of OUR SIDE winning (always > 0.5 if we bet)
+    - sig.edge = POSITIVE number = our advantage on our side (net of fees)
+    - sig.p_market = market price of OUR SIDE
     """
 
     def __init__(self, cfg: SignalConfig):
@@ -405,9 +367,7 @@ class SignalEngine:
         recent = [(ts, p) for ts, p in self._price_history if ts >= cutoff]
         if len(recent) < 2:
             return 0.0
-        first_p = recent[0][1]
-        last_p = recent[-1][1]
-        delta = (last_p - first_p) / first_p
+        delta = (recent[-1][1] - recent[0][1]) / recent[0][1]
         return clamp(delta / 0.002, -1.0, 1.0)
 
     def evaluate(
@@ -439,7 +399,7 @@ class SignalEngine:
         if state.btc_binance > 0:
             sig.delta_binance = (state.btc_binance - state.reference_price) / state.reference_price
 
-        # Source coherence check
+        # Source coherence
         if state.btc_binance > 0 and state.btc_chainlink > 0:
             source_div = abs(state.btc_binance - state.btc_chainlink) / state.btc_chainlink
             micro.source_divergence = source_div
@@ -460,7 +420,6 @@ class SignalEngine:
             sig.filter_reasons.append(f"too_late:{sig.time_remaining_sec:.0f}s")
             sig.status = f"TOO_LATE ({sig.time_remaining_sec:.0f}s)"
             return sig
-
         if sig.time_remaining_sec > max_tr_accum:
             sig.filter_reasons.append(f"too_early:{sig.time_remaining_sec:.0f}s")
             sig.status = f"TOO_EARLY ({sig.time_remaining_sec:.0f}s)"
@@ -478,7 +437,11 @@ class SignalEngine:
         micro.time_decay_factor = time_decay_factor
         effective_edge_min = cfg.edge_min * time_decay_factor
 
-        # Step 1: Prior from delta prix
+        # ============================================================
+        # BAYESIAN PIPELINE (logit space)
+        # ============================================================
+
+        # Step 1: Prior from price delta
         price_delta = sig.delta_chainlink
         momentum = self._short_momentum(15.0)
         z_prior = cfg.momentum_factor * price_delta + 0.2 * momentum
@@ -505,7 +468,7 @@ class SignalEngine:
         micro.ofi_signal = ofi_logit_adj
         logit_score += ofi_logit_adj
 
-        # Step 4: Hawkes amplification (before Kyle shrinkage)
+        # Step 4: Hawkes amplification
         hawkes_boost, hawkes_intensity = self.hawkes.regime_boost()
         micro.hawkes_intensity = hawkes_intensity
         micro.hawkes_boost = hawkes_boost
@@ -520,79 +483,89 @@ class SignalEngine:
         micro.kyle_penalty = kyle_quality
         logit_score = shrink_logit(logit_score, kyle_quality)
 
-        # Final prob
+        # ============================================================
+        # DECISION: determine side, edge, and whether to bet
+        # ============================================================
+
         final_prob_up = sigmoid(logit_score)
         final_prob_down = 1.0 - final_prob_up
         micro.final_prob_up = final_prob_up
-        sig.p_true = final_prob_up
 
         market_prob_up = state.p_market_yes
         market_prob_down = 1.0 - market_prob_up
-        sig.p_market = market_prob_up
 
-        # Edge NET OF FEES
-        if final_prob_up >= 0.5:
-            raw_edge_up = final_prob_up - market_prob_up
-            fee_up = calc_taker_fee(market_prob_up, cfg.fee_rate)
-            net_edge_up = raw_edge_up - fee_up
-            sig.taker_fee = fee_up
-            sig.edge = net_edge_up
+        # Determine which side has edge
+        # For YES: edge = prob_up - market_prob_up - fee
+        # For NO:  edge = prob_down - market_prob_down - fee
+        fee_yes = calc_taker_fee(market_prob_up, cfg.fee_rate)
+        fee_no = calc_taker_fee(market_prob_down, cfg.fee_rate)
+        edge_yes = final_prob_up - market_prob_up - fee_yes
+        edge_no = final_prob_down - market_prob_down - fee_no
+
+        # Pick the side with higher edge (if any)
+        if edge_yes >= edge_no and edge_yes >= effective_edge_min:
+            candidate_side = "YES"
+            edge_abs = edge_yes
+            prob_our_side = final_prob_up
+            market_p_our_side = market_prob_up
+            fee_our_side = fee_yes
+        elif edge_no > edge_yes and edge_no >= effective_edge_min:
+            candidate_side = "NO"
+            edge_abs = edge_no
+            prob_our_side = final_prob_down
+            market_p_our_side = market_prob_down
+            fee_our_side = fee_no
         else:
-            raw_edge_down = final_prob_down - market_prob_down
-            fee_down = calc_taker_fee(market_prob_down, cfg.fee_rate)
-            net_edge_down = raw_edge_down - fee_down
-            sig.taker_fee = fee_down
-            sig.edge = -net_edge_down
+            candidate_side = ""
+            edge_abs = max(edge_yes, edge_no)
+            prob_our_side = 0.5
+            market_p_our_side = 0.5
+            fee_our_side = 0.0
 
-        micro.taker_fee = sig.taker_fee
+        # SET OUTPUT VALUES - always relative to our chosen side
+        sig.p_true = prob_our_side       # prob of OUR side
+        sig.p_market = market_p_our_side  # market price of OUR side
+        sig.edge = edge_abs               # ALWAYS positive when we bet
+        sig.taker_fee = fee_our_side
+        micro.taker_fee = fee_our_side
+
+        # Conviction filter: our side must have > 58% probability
+        if candidate_side and prob_our_side < cfg.min_true_prob:
+            candidate_side = ""
+            sig.filter_reasons.append(f"low_conviction:{prob_our_side*100:.0f}%")
+
+        # Payout ratio filter
+        if candidate_side:
+            if market_p_our_side < cfg.min_market_prob_side:
+                candidate_side = ""
+                sig.filter_reasons.append(f"longshot:{market_p_our_side*100:.0f}c")
+            elif market_p_our_side > cfg.max_market_prob_side:
+                candidate_side = ""
+                sig.filter_reasons.append(f"bad_odds:{market_p_our_side*100:.0f}c")
 
         # Liquidity guard
         min_depth = min(state.depth_yes or 0.0, state.depth_no or 0.0)
-        if min_depth < cfg.min_market_liquidity:
+        if candidate_side and min_depth < cfg.min_market_liquidity:
             sig.filter_reasons.append(f"no_liquidity:{min_depth:.0f}")
             sig.status = f"NO_LIQUIDITY (${min_depth:.0f})"
             price_side = "YES" if price_delta > 0 else "NO"
             self.stability.record(market_slug, price_side, abs(price_delta) * 100, now)
-            return sig
-
-        # Determine candidate side
-        net_edge_abs = abs(sig.edge)
-        if sig.edge >= effective_edge_min:
-            candidate_side = "YES"
-            edge_abs = sig.edge
-        elif -sig.edge >= effective_edge_min:
-            candidate_side = "NO"
-            edge_abs = -sig.edge
-        else:
             candidate_side = ""
-            edge_abs = net_edge_abs
-
-        if candidate_side == "YES" and final_prob_up < cfg.min_true_prob:
-            candidate_side = ""
-            sig.filter_reasons.append(f"low_conviction:{final_prob_up*100:.0f}%")
-        elif candidate_side == "NO" and final_prob_down < cfg.min_true_prob:
-            candidate_side = ""
-            sig.filter_reasons.append(f"low_conviction:{final_prob_down*100:.0f}%")
-
-        if candidate_side:
-            mp_side = market_prob_up if candidate_side == "YES" else market_prob_down
-            if mp_side < cfg.min_market_prob_side:
-                candidate_side = ""
-                sig.filter_reasons.append(f"longshot:{mp_side*100:.0f}c")
-            elif mp_side > cfg.max_market_prob_side:
-                candidate_side = ""
-                sig.filter_reasons.append(f"bad_odds:{mp_side*100:.0f}c")
 
         sig.side = candidate_side
-        sig.entry_price = state.best_ask_yes if candidate_side == "YES" else state.best_ask_no if candidate_side == "NO" else 0.0
+        sig.entry_price = (
+            state.best_ask_yes if candidate_side == "YES"
+            else state.best_ask_no if candidate_side == "NO"
+            else 0.0
+        )
 
         # Stability Filter
         if candidate_side:
             self.stability.record(market_slug, candidate_side, edge_abs, now)
-        stability_ok, direction_ratio, edge_cv, n_ticks = self.stability.evaluate(
-            market_slug, candidate_side
-        ) if candidate_side else (False, 0.0, 999.0, 0)
-
+        stability_ok, direction_ratio, edge_cv, n_ticks = (
+            self.stability.evaluate(market_slug, candidate_side)
+            if candidate_side else (False, 0.0, 999.0, 0)
+        )
         micro.stability_ratio = direction_ratio
         micro.stability_edge_cv = edge_cv
         micro.stability_ok = stability_ok
@@ -612,33 +585,33 @@ class SignalEngine:
             reasons.append(f"daily_loss:{daily_pnl_pct:.2%}")
         if open_positions >= risk.max_open_positions:
             reasons.append(f"max_positions:{open_positions}")
-
         sig.filter_reasons.extend(reasons)
 
         if reasons or not should_bet:
             sig.filters_passed = False
             if candidate_side and not stability_ok:
-                if n_ticks < self.cfg.stability_min_samples:
-                    sig.status = f"STABILIZING ({n_ticks}/{self.cfg.stability_min_samples})"
+                if n_ticks < cfg.stability_min_samples:
+                    sig.status = f"STABILIZING ({n_ticks}/{cfg.stability_min_samples})"
                 else:
                     sig.status = f"UNSTABLE ({direction_ratio*100:.0f}% {candidate_side})"
             elif not candidate_side:
                 sig.status = "WATCHING"
             return sig
 
-        # Kelly sizing (net of fees)
-        prob_win = final_prob_up if sig.side == "YES" else final_prob_down
-        market_p = market_prob_up if sig.side == "YES" else market_prob_down
-        entry_p = sig.entry_price if sig.entry_price > 0 else market_p
-        fee = calc_taker_fee(entry_p, cfg.fee_rate)
+        # ============================================================
+        # KELLY SIZING
+        # ============================================================
 
+        entry_p = sig.entry_price if sig.entry_price > 0 else market_p_our_side
+        fee = calc_taker_fee(entry_p, cfg.fee_rate)
         c_eff = entry_p + fee
         if c_eff >= 1.0 or c_eff <= 0:
             sig.filter_reasons.append("cost_exceeds_payout")
             sig.filters_passed = False
             return sig
 
-        kelly_full = (prob_win - c_eff) / (1.0 - c_eff)
+        # Kelly for binary: f* = (p - c) / (1 - c)
+        kelly_full = (prob_our_side - c_eff) / (1.0 - c_eff)
         if kelly_full <= 0:
             sig.filter_reasons.append(f"negative_kelly:{kelly_full:.4f}")
             sig.filters_passed = False
@@ -646,9 +619,11 @@ class SignalEngine:
 
         fraction = clamp(kelly_full * 0.25, 0.0, cfg.max_bet_fraction)
 
+        # Reduce in quiet regimes
         if hawkes_intensity < cfg.hawkes_mu * 1.5:
             fraction *= 0.7
 
+        # Stability bonus
         stability_bonus = clamp((direction_ratio - cfg.stability_min_ratio) * 2.0, 0.0, 0.3)
         fraction *= (1.0 + stability_bonus)
         fraction = clamp(fraction, 0.0, cfg.max_bet_fraction)
@@ -656,9 +631,16 @@ class SignalEngine:
         sig.size_usd = round(capital * fraction, 2)
         sig.kelly_pct = fraction
 
+        # Hard cap: never bet more than max_bet_fraction of capital
+        max_size = capital * cfg.max_bet_fraction
+        sig.size_usd = min(sig.size_usd, max_size)
+
+        # Depth limit: max 30% of visible depth in USD
         depth = state.depth_yes if sig.side == "YES" else state.depth_no
-        max_depth_size = depth * 0.3 if depth > 0 else sig.size_usd
-        sig.size_usd = min(sig.size_usd, max_depth_size)
+        if depth > 0:
+            # depth is in USD (price * size), cap at 30%
+            max_depth_usd = depth * 0.3
+            sig.size_usd = min(sig.size_usd, max_depth_usd)
 
         if sig.size_usd < 1.0:
             sig.filter_reasons.append("size_too_small")
@@ -666,23 +648,27 @@ class SignalEngine:
             return sig
 
         # Confidence
-        confidence_score = (edge_abs * 0.4 + kyle_quality * 0.2 +
-                           hawkes_boost * 0.2 + (direction_ratio if stability_ok else 0.0) * 0.2)
-        sig.confidence = "HIGH" if confidence_score >= 0.12 else "MEDIUM" if confidence_score >= 0.07 else "LOW"
+        confidence_score = (
+            edge_abs * 0.4 + kyle_quality * 0.2 +
+            hawkes_boost * 0.2 + (direction_ratio if stability_ok else 0.0) * 0.2
+        )
+        sig.confidence = (
+            "HIGH" if confidence_score >= 0.12
+            else "MEDIUM" if confidence_score >= 0.07
+            else "LOW"
+        )
 
         sig.action = "BUY"
         sig.status = "BETTING"
         sig.filters_passed = True
 
         log.info(
-            "[Micro] %s | side=%s edge=%+.1f%% (net) fee=%.3f%% | "
-            "base=%.0f%% -> final=%.0f%% | "
-            "CL=%+.2f OFI=%+.2f Kyle=%.2f Hawkes=%.2f | "
-            "stab=%.0f%% CV=%.2f (%dt) | $%.2f",
-            market_slug[-20:], sig.side, sig.edge * 100, sig.taker_fee * 100,
-            prob_prior * 100, final_prob_up * 100,
-            chainlink_boost, ofi_raw, kyle_quality, hawkes_intensity,
-            direction_ratio * 100, edge_cv, n_ticks, sig.size_usd,
+            "[BET] %s %s | edge=+%.1f%% | P_true=%.0f%% P_mkt=%.0f%% | "
+            "$%.2f | T-%ds | CL=%+.2f OFI=%+.2f Kyle=%.2f | %s",
+            sig.side, market_slug[-16:],
+            sig.edge * 100, sig.p_true * 100, sig.p_market * 100,
+            sig.size_usd, int(sig.time_remaining_sec),
+            chainlink_boost, ofi_raw, kyle_quality, sig.confidence,
         )
 
         return sig
