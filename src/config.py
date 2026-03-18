@@ -18,21 +18,23 @@ def _envi(key, default=0): return int(os.getenv(key, str(default)))
 
 @dataclass(frozen=True)
 class SignalConfig:
-    # Edge: P(ours) - entry_price - fee must exceed this
+    # ── Edge filters ─────────────────────────────────────────────────────────
+    # P(ours) - entry_price - fee must exceed this to place a bet
     edge_min: float = _envf("EDGE_MIN", 0.06)
-    # Maximum believable edge - anything above this is model error
+    # Maximum believable edge — anything above is likely model error
     edge_max: float = _envf("EDGE_MAX", 0.15)
-    # Our prob must be at least this to bet
+    # Our probability must be at least this to bet
     min_true_prob: float = _envf("MIN_TRUE_PROB", 0.56)
-    # Max Kelly fraction of bankroll per bet
-    max_bet_fraction: float = _envf("MAX_BET_FRACTION", 0.02)
-    # Entry price must be between these
+    # Max Kelly fraction of bankroll per single bet
+    # Raised from 0.02 → 0.04 to allow larger bets on HIGH-confidence signals
+    max_bet_fraction: float = _envf("MAX_BET_FRACTION", 0.04)
+    # Entry price must be between these (avoid longshots and near-certainties)
     min_market_prob_side: float = _envf("MIN_MARKET_PROB_SIDE", 0.35)
     max_market_prob_side: float = _envf("MAX_MARKET_PROB_SIDE", 0.70)
-    # Min orderbook depth
+    # Min combined orderbook depth (USD) for acceptable liquidity
     min_market_liquidity: float = _envf("MIN_MARKET_LIQUIDITY", 15.0)
 
-    # Timing
+    # ── Timing windows ───────────────────────────────────────────────────────
     time_min_5m: float = _envf("TIME_MIN_5M", 45.0)
     time_max_5m: float = _envf("TIME_MAX_5M", 240.0)
     time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 350.0)
@@ -41,35 +43,52 @@ class SignalConfig:
     time_min_seconds: int = _envi("TIME_MIN_SECONDS", 45)
     time_max_seconds: int = _envi("TIME_MAX_SECONDS", 240)
 
-    # Chainlink arb
+    # ── Chainlink arb ────────────────────────────────────────────────────────
     chainlink_period: float = _envf("CHAINLINK_PERIOD", 27.0)
     chainlink_edge_window: float = _envf("CHAINLINK_EDGE_WINDOW", 8.0)
 
-    # OFI
+    # ── OFI (Order Flow Imbalance) ───────────────────────────────────────────
     ofi_weight: float = _envf("OFI_WEIGHT", 0.20)
 
-    # Kyle
+    # ── Kyle lambda (market impact) ──────────────────────────────────────────
     kyle_spread_penalty: float = _envf("KYLE_SPREAD_PENALTY", 0.15)
 
-    # Hawkes
+    # ── Hawkes process (microstructure activity) ─────────────────────────────
     hawkes_mu: float = _envf("HAWKES_MU", 0.1)
     hawkes_alpha: float = _envf("HAWKES_ALPHA", 0.8)
     hawkes_beta: float = _envf("HAWKES_BETA", 2.0)
     hawkes_history: int = _envi("HAWKES_HISTORY", 200)
 
-    # Momentum - REDUCED to avoid overconfidence on small deltas
+    # ── Momentum ─────────────────────────────────────────────────────────────
+    # Bayesian momentum scaling factor for Chainlink delta
     momentum_factor: float = _envf("MOMENTUM_FACTOR", 80.0)
+    # PriceMomentum strategy: minimum fractional BTC price change required
+    # over BOTH 60s and 120s windows to trigger a momentum bet.
+    # 0.0008 = 0.08% move on BTC (~$32 on a $40k BTC)
+    momentum_min_threshold: float = _envf("MOMENTUM_MIN_THRESHOLD", 0.0008)
 
-    # Stability
+    # ── Mean Reversion strategy ───────────────────────────────────────────────
+    # |delta| must exceed this to activate the MeanReversion contrarian bet.
+    # 0.0020 = 0.20% — BTC has moved significantly from reference price
+    mean_reversion_delta_threshold: float = _envf("MEAN_REV_DELTA_THRESHOLD", 0.0020)
+
+    # ── Stability filter ─────────────────────────────────────────────────────
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
-    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 5)
+    # Reduced from 5 → 3 to allow faster signal confirmation in short windows
+    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 3)
     stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.75)
     stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.60)
 
-    # Legacy
+    # ── Source coherence ─────────────────────────────────────────────────────
+    # Max fractional divergence between Binance and Chainlink before skipping.
+    # FIXED: raised from 0.0008 → 0.003 (0.08% → 0.30%).
+    # The original value was too aggressive: on a $40k BTC a mere $32 gap
+    # would abort the signal even when both sources agree on direction.
+    source_coherence_max: float = _envf("SOURCE_COHERENCE_MAX", 0.003)
+
+    # ── Fee model ────────────────────────────────────────────────────────────
     delta_min: float = _envf("DELTA_MIN", 0.0012)
     volatility_max: float = _envf("VOLATILITY_MAX", 0.0015)
-    source_coherence_max: float = _envf("SOURCE_COHERENCE_MAX", 0.0008)
     volatility_window_minutes: int = 30
     fee_rate: float = 0.25
     fee_exponent: int = 2
@@ -80,7 +99,8 @@ class RiskConfig:
     kelly_fraction: float = _envf("KELLY_FRACTION", 0.25)
     max_position_pct: float = _envf("MAX_POSITION_PCT", 0.05)
     max_daily_drawdown: float = _envf("MAX_DAILY_DRAWDOWN", 0.06)
-    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 3)
+    # Raised from 3 → 4: give strategies more breathing room before stopping
+    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 4)
     max_open_positions: int = _envi("MAX_OPEN_POSITIONS", 2)
     max_daily_risk: float = _envf("MAX_DAILY_RISK", 0.12)
 
