@@ -93,12 +93,15 @@ class PaperTrader:
             "reference_price": signal.reference_price,
             "start_time": signal.market_start_time,
             "duration": signal.market_duration,
+            # Stored here as a crash-safe fallback.
+            # main.py's _strategy_by_trade is the primary source.
+            "strategy_used": signal.strategy_used,
         }
 
         log.info(
             "[Paper] EXECUTED %s %s | $%.2f @ $%.4f | "
             "edge=%.1f%% | P_true=%.1f%% | T=%.0fs | "
-            "delta=%.4f%%",
+            "delta=%.4f%% | strategy=%s",
             signal.side,
             signal.market_id[:16],
             signal.size_usd,
@@ -107,6 +110,7 @@ class PaperTrader:
             signal.p_true * 100,
             signal.time_remaining_sec,
             signal.delta_chainlink * 100,
+            signal.strategy_used,
         )
         return trade_id
 
@@ -165,8 +169,9 @@ class PaperTrader:
                 won = real_outcome == "down"
             log.info(
                 "[Paper] Resolved trade %d via API: "
-                "outcome=%s, side=%s, won=%s",
+                "outcome=%s, side=%s, won=%s, strategy=%s",
                 trade_id, real_outcome, side, won,
+                info.get("strategy_used", "chainlink_arb"),
             )
 
             outcome, pnl = self.portfolio.close_position(
@@ -182,6 +187,9 @@ class PaperTrader:
                 "side": side,
                 "btc_price": btc_chainlink_price,
                 "ref_price": info["reference_price"],
+                # Consistent with live.py — enables accurate feedback
+                # to PerformanceTracker even after crash/restart
+                "strategy_used": info.get("strategy_used", "chainlink_arb"),
             })
 
         return resolved
