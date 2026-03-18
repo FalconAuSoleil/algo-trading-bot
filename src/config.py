@@ -63,6 +63,12 @@ class SignalConfig:
     # ── Mean Reversion ───────────────────────────────────────────────────────
     mean_reversion_delta_threshold: float = _envf("MEAN_REV_DELTA_THRESHOLD", 0.0020)
 
+    # ── Diffusion model (v3.2) ────────────────────────────────────────────────
+    # Hard absolute floor on |delta| regardless of realized volatility.
+    # 0.10% = ~$74 on a $74k BTC. Any smaller and 30s of random walk can
+    # wipe the edge before close. Override via DELTA_MIN_ABS env var.
+    delta_min_abs: float = _envf("DELTA_MIN_ABS", 0.0010)
+
     # ── Stability filter ─────────────────────────────────────────────────────
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
     stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 3)
