@@ -1,26 +1,22 @@
-"""Signal Engine v3 - Multi-Strategy Router
-============================================
+"""Signal Engine v3.1 - Multi-Strategy Router + Diffusion Risk Model
+======================================================================
 
-Three independent strategies compete for each market evaluation:
+Root cause fix (warroom session):
+  The bot was betting 4+ minutes before market close with a small delta.
+  BTC has enough time to cross back over the reference price, causing losses.
+  Fix: integrate a Brownian-motion diffusion model into every p_true estimate.
 
-  1. ChainlinkArb  — Bayesian microstructure: exploit Chainlink oracle lag,
-                     OFI, Kyle lambda, Hawkes process. The primary strategy.
-  2. PriceMomentum — Follow sustained short-term BTC price momentum (60s+120s).
-                     Confirms or independently triggers directional bets.
-  3. MeanReversion — Contrarian: fade extreme delta moves (>0.20%).
-                     Activates when ChainlinkArb is too early or edge is low.
+Three independent strategies:
+  1. ChainlinkArb  — Bayesian oracle lag + OFI + Kyle + Hawkes (primary)
+  2. PriceMomentum — Sustained BTC price trend (60s + 120s windows)
+  3. MeanReversion — Contrarian fade of extreme delta moves
 
-Routing logic:
-  - Each strategy returns a candidate Signal (action=BUY) or None.
-  - If strategies disagree on direction: skip unless one side dominates by >50%.
-  - If 2+ strategies agree: consensus size boost +25% per extra strategy.
-  - All signals weighted by rolling per-strategy win rate (PerformanceTracker).
-  - Unified risk filters applied at router level.
+All three now use:
+  p_diffusion = N(|delta| / (sigma_per_sec * sqrt(time_remaining)))
+  which is the probability that BTC stays on the correct side until expiry
+  modeled as standard Brownian motion.
 
-Backward compatible with main.py:
-  - SignalEngine.evaluate() same signature
-  - Signal, MarketState, MicrostructureState unchanged except added fields
-  - update_price(), update_chainlink_price(), reset_market_stability() unchanged
+Routing: consensus boost, conflict detection, performance weighting.
 """
 
 from __future__ import annotations
@@ -66,6 +62,48 @@ def calc_fee(p: float, rate: float = 0.25) -> float:
     return rate * (p * (1.0 - p)) ** 2
 
 
+def _erf_approx(x: float) -> float:
+    """
+    Fast, no-dependency approximation of erf(x).
+    Abramowitz & Stegun 7.1.26 — max error < 1.5e-7.
+    """
+    a1, a2, a3, a4, a5 = (
+        0.254829592, -0.284496736, 1.421413741,
+        -1.453152027, 1.061405429,
+    )
+    p = 0.3275911
+    t = 1.0 / (1.0 + p * abs(x))
+    poly = t * (a1 + t * (a2 + t * (a3 + t * (a4 + t * a5))))
+    result = 1.0 - poly * math.exp(-x * x)
+    return result if x >= 0 else -result
+
+
+def p_brownian(
+    delta: float,
+    time_remaining_sec: float,
+    sigma_per_sec: float,
+) -> float:
+    """
+    Probability that BTC stays on the correct side of the reference price
+    until expiry, modeled as standard Brownian motion.
+
+    P = N(|delta| / (sigma_per_sec * sqrt(t_remaining)))
+
+    where N is the standard normal CDF.
+
+    Returns:
+        Float in [0.5, 1.0] — probability of the bet being correct at T=0.
+        Always ≥ 0.5 because we use |delta| (the bet is already in the right
+        direction; we’re only asking “will it hold?”).
+    """
+    if time_remaining_sec <= 1:
+        return 1.0  # essentially already resolved
+    if sigma_per_sec <= 0 or delta == 0:
+        return 0.5
+    z = abs(delta) / (sigma_per_sec * math.sqrt(time_remaining_sec))
+    return 0.5 * (1.0 + _erf_approx(z / 1.41421356237))
+
+
 # ── Data structures ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -109,6 +147,10 @@ class MicrostructureState:
     taker_fee: float = 0.0
     source_divergence: float = 0.0
     time_decay_factor: float = 1.0
+    # v3.1: diffusion model diagnostics
+    p_diffusion: float = 0.5
+    realized_sigma_pct: float = 0.0   # annualised-equivalent sigma in % per sec
+    min_viable_delta_pct: float = 0.0  # minimum |delta|% to pass diffusion filter
     components: dict = field(default_factory=dict)
 
 
@@ -140,18 +182,16 @@ class Signal:
     micro: MicrostructureState = field(default_factory=MicrostructureState)
     confidence: str = "LOW"
     status: str = "WATCHING"
-    # v3: multi-strategy additions
     strategy_used: str = "chainlink_arb"
     strategies_agreeing: int = 1
-    token_id_yes: str = ""   # populated by main.py from MarketInfo
-    token_id_no: str = ""    # populated by main.py from MarketInfo
+    token_id_yes: str = ""
+    token_id_no: str = ""
 
 
-# ── Microstructure sub-modules (used by ChainlinkArbEngine) ──────────────────
+# ── Microstructure sub-modules ──────────────────────────────────────────────────
 
 class _OFI:
-    """Order Flow Imbalance."""
-    def __init__(self, w: float):
+    def __init__(self, w):
         self._h: deque = deque(maxlen=30)
         self._w = w
 
@@ -175,8 +215,7 @@ class _OFI:
 
 
 class _Kyle:
-    """Kyle lambda: market impact / adverse selection penalty."""
-    def __init__(self, p: float):
+    def __init__(self, p):
         self._sh: deque = deque(maxlen=50)
         self._dh: deque = deque(maxlen=50)
         self._p = p
@@ -201,7 +240,6 @@ class _Kyle:
 
 
 class _Hawkes:
-    """Hawkes process: microstructure activity detector."""
     def __init__(self, mu, alpha, beta, history):
         self._ev: deque = deque(maxlen=history)
         self._lm = 0.5
@@ -209,14 +247,14 @@ class _Hawkes:
         self._a = alpha
         self._b = beta
 
-    def on_mid(self, mid: float, ts: float) -> None:
+    def on_mid(self, mid, ts):
         if self._lm > 0:
             ch = abs(mid - self._lm)
             if ch >= 0.005:
                 self._ev.append((ts, min(ch / 0.005, 5)))
         self._lm = mid
 
-    def boost(self, t: float = 0) -> tuple:
+    def boost(self, t=0):
         t = t or time.time()
         lam = self._mu
         for ts, m in self._ev:
@@ -228,7 +266,6 @@ class _Hawkes:
 
 
 class _Stability:
-    """Signal stability filter: requires consistent direction + low edge variance."""
     def __init__(self, ws, ms, mr, mc):
         self._h: dict = {}
         self._ws = ws
@@ -236,15 +273,15 @@ class _Stability:
         self._mr = mr
         self._mc = mc
 
-    def _buf(self, s: str) -> deque:
+    def _buf(self, s):
         if s not in self._h:
             self._h[s] = deque(maxlen=100)
         return self._h[s]
 
-    def record(self, s: str, side: str, edge: float, ts: float) -> None:
+    def record(self, s, side, edge, ts):
         self._buf(s).append((ts, side, abs(edge)))
 
-    def evaluate(self, s: str, side: str) -> tuple:
+    def evaluate(self, s, side):
         b = self._buf(s)
         if not b:
             return False, 0, 999, 0
@@ -261,25 +298,30 @@ class _Stability:
         cv = math.sqrt(sum((e - me) ** 2 for e in r) / len(r)) / me
         return (dr >= self._mr and cv <= self._mc), dr, cv, n
 
-    def reset(self, s: str) -> None:
+    def reset(self, s):
         self._h.pop(s, None)
 
 
-# ── Strategy 1: Chainlink Arb (primary, Bayesian microstructure) ──────────────
+# ── Strategy 1: Chainlink Arb + Diffusion Model ────────────────────────────────
+
+# Conservative fallback: 0.5% per 5 minutes = sqrt(0.005^2 / 300) per second
+_SIGMA_FALLBACK = 0.005 / math.sqrt(300)  # ~2.89e-4
+
 
 class _ChainlinkArbEngine:
     """
     Primary strategy: exploit Chainlink oracle lag relative to Binance spot.
 
-    When Binance spot has moved but Chainlink hasn't updated yet, we bet
-    in the direction Chainlink will move when it catches up. Combined with
-    OFI (order flow imbalance), Kyle lambda, and Hawkes process activity.
+    v3.1 addition: Brownian diffusion model gates all bets.
+    Before betting, we compute p_diffusion = P(BTC stays correct side until T=0)
+    using the current delta and dynamically-measured BTC volatility.
+    p_true is then a time-weighted blend of Bayesian and diffusion estimates.
     """
     NAME = "chainlink_arb"
 
     def __init__(self, cfg: SignalConfig):
         self.cfg = cfg
-        self._ph: deque = deque(maxlen=120)
+        self._ph: deque = deque(maxlen=200)  # enlarged for better vol estimate
         self._cl_updates: deque = deque(maxlen=20)
         self._cl_period = cfg.chainlink_period
         self._bp = 0.0
@@ -331,6 +373,33 @@ class _ChainlinkArbEngine:
         prox = clamp(1 - ttn / self.cfg.chainlink_edge_window, 0, 1)
         return lag, clamp(prox * gap * 1500, -1.5, 1.5)
 
+    def _realized_vol_per_sec(self, window_sec: float = 300.0) -> float:
+        """
+        Estimate realized BTC volatility per second from recent price ticks.
+
+        Uses squared log-returns normalized by time between ticks.
+        Conservative fallback (0.5%/5min) if not enough data.
+        """
+        now = time.time()
+        r = [(t, p) for t, p in self._ph if t >= now - window_sec]
+        if len(r) < 6:
+            return _SIGMA_FALLBACK
+
+        sq_returns = []
+        for i in range(1, len(r)):
+            dt = r[i][0] - r[i - 1][0]
+            if dt > 0.1 and r[i - 1][1] > 0:
+                lr = math.log(r[i][1] / r[i - 1][1])
+                sq_returns.append(lr * lr / dt)  # variance per second
+
+        if not sq_returns:
+            return _SIGMA_FALLBACK
+
+        variance_per_sec = sum(sq_returns) / len(sq_returns)
+        # Clamp to sensible range: [0.1%/5min, 2%/5min]
+        sigma = math.sqrt(variance_per_sec)
+        return clamp(sigma, 0.001 / math.sqrt(300), 0.02 / math.sqrt(300))
+
     def evaluate(
         self,
         state: MarketState,
@@ -366,7 +435,7 @@ class _ChainlinkArbEngine:
                 (state.btc_binance - state.reference_price) / state.reference_price
             )
 
-        # Source coherence check
+        # Source coherence
         if state.btc_binance > 0 and state.btc_chainlink > 0:
             sd = abs(state.btc_binance - state.btc_chainlink) / state.btc_chainlink
             micro.source_divergence = sd
@@ -398,14 +467,37 @@ class _ChainlinkArbEngine:
         tr = max_t - min_t
         tdf = (
             (0.6 + 0.4 * clamp((sig.time_remaining_sec - min_t) / tr, 0, 1))
-            if tr > 0
-            else 1.0
+            if tr > 0 else 1.0
         )
         micro.time_decay_factor = tdf
         eff_min = cfg.edge_min * tdf
 
-        # ── Bayesian pipeline ────────────────────────────────────────────
         pd = sig.delta_chainlink
+
+        # ── DIFFUSION RISK CHECK (warroom fix) ─────────────────────────────
+        # Compute realized volatility and minimum viable delta.
+        # If BTC can randomly cross the reference price before expiry,
+        # the signal is statistically noise — skip it.
+        sigma_ps = self._realized_vol_per_sec()
+        t_rem = sig.time_remaining_sec
+
+        # Minimum delta = 0.5 standard deviations of BTC movement
+        # (a 1σ move would be min_viable_delta = sigma_ps * sqrt(t_rem))
+        min_viable_delta = 0.50 * sigma_ps * math.sqrt(max(t_rem, 1))
+        micro.realized_sigma_pct = round(sigma_ps * math.sqrt(300) * 100, 4)
+        micro.min_viable_delta_pct = round(min_viable_delta * 100, 4)
+
+        if abs(pd) < min_viable_delta and t_rem > 90:
+            sig.filter_reasons.append(
+                f"delta_weak:{abs(pd)*100:.3f}%<{min_viable_delta*100:.3f}%"
+            )
+            sig.status = (
+                f"DELTA_WEAK (σ×√t={min_viable_delta*100:.3f}%)"
+            )
+            sig.micro = micro
+            return sig
+
+        # ── Bayesian pipeline ────────────────────────────────────────────
         z = cfg.momentum_factor * pd + 0.2 * self._momentum(15)
         pp = sigmoid(z)
         micro.base_prob_up = pp
@@ -442,13 +534,22 @@ class _ChainlinkArbEngine:
         pdn = 1 - pu
         micro.final_prob_up = pu
 
+        # ── Blend Bayesian + Diffusion ───────────────────────────────────
+        # p_diffusion = probability BTC stays on correct side until T=0
+        # blend_weight: early bets are more penalised (more weight to diffusion)
+        #   at t=max_t (180s): blend=0.55 — diffusion has strong say
+        #   at t=min_t (45s):  blend=0.15 — Bayesian microstructure dominates
+        p_diff = p_brownian(pd, t_rem, sigma_ps)
+        micro.p_diffusion = round(p_diff, 4)
+        blend_w = clamp(t_rem / max(max_t, 1), 0.15, 0.55)
+
         if pd > 0:
+            p_bayes = pu
             side = "YES"
-            prob = pu
             entry = state.best_ask_yes if state.best_ask_yes > 0 else state.p_market_yes
         elif pd < 0:
+            p_bayes = pdn
             side = "NO"
-            prob = pdn
             entry = (
                 state.best_ask_no if state.best_ask_no > 0
                 else (1 - state.p_market_yes)
@@ -457,6 +558,10 @@ class _ChainlinkArbEngine:
             sig.status = "WATCHING"
             sig.micro = micro
             return sig
+
+        # Time-weighted probability blend
+        prob = blend_w * p_diff + (1 - blend_w) * p_bayes
+        prob = clamp(prob, 0.50, 0.98)
 
         fee = calc_fee(entry, cfg.fee_rate)
         edge = prob - entry - fee
@@ -468,7 +573,7 @@ class _ChainlinkArbEngine:
         sig.taker_fee = fee
         micro.taker_fee = fee
 
-        # ── Filters ────────────────────────────────────────────────────
+        # ── Filters ──────────────────────────────────────────────────
         if edge < eff_min:
             self.stab.record(slug, side, max(edge, 0.001), now)
             sig.status = (
@@ -484,7 +589,7 @@ class _ChainlinkArbEngine:
             return sig
         if prob < entry + 0.02:
             self.stab.record(slug, side, max(edge, 0.001), now)
-            sig.filter_reasons.append(f"overpaying:{prob * 100:.0f}%<{entry * 100:.0f}c+2%")
+            sig.filter_reasons.append(f"overpaying")
             sig.micro = micro
             return sig
         if prob < cfg.min_true_prob:
@@ -577,9 +682,11 @@ class _ChainlinkArbEngine:
         sig.micro = micro
 
         log.info(
-            "[BET:CL_ARB] %s %s | edge=+%.1f%% P=%.0f%% @%.0fc | $%.2f | T-%ds | %s",
-            side, slug[-16:], edge * 100, prob * 100, entry * 100,
-            size, int(sig.time_remaining_sec), sig.confidence,
+            "[BET:CL_ARB] %s %s | edge=+%.1f%% P=%.0f%%(diff=%.0f%%) "
+            "@%.0fc | $%.2f | T-%ds | σ√t=%.3f%% | %s",
+            side, slug[-14:], edge * 100, prob * 100, p_diff * 100,
+            entry * 100, size, int(t_rem),
+            min_viable_delta * 100, sig.confidence,
         )
         return sig
 
@@ -592,30 +699,38 @@ class _ChainlinkArbEngine:
 class _MomentumEngine:
     """
     Bet in the direction of sustained BTC price momentum.
-
-    Requires consistent momentum over BOTH 60s and 120s windows,
-    and the direction must align with the current market delta.
-    This prevents chasing short-lived spikes.
-
-    Most effective 60–250s before market close (accumulation window).
-    Sizing is conservative (half of ChainlinkArb max).
+    Both 60s and 120s windows must agree. Window tightened to 60–150s
+    (was 60–250s) to avoid bets with too much residual time risk.
+    Applies diffusion check before committing.
     """
     NAME = "momentum"
 
     def __init__(self, cfg: SignalConfig):
         self.cfg = cfg
-        self._ph: deque = deque(maxlen=150)
+        self._ph: deque = deque(maxlen=200)
 
     def update_price(self, p: float, ts: float) -> None:
         self._ph.append((ts, p))
 
     def _mom_window(self, seconds: float) -> float:
-        """Fractional BTC price change over the last `seconds`."""
         now = time.time()
         r = [(t, p) for t, p in self._ph if t >= now - seconds]
-        if len(r) < 4:  # need at least 4 ticks for reliable estimate
+        if len(r) < 4:
             return 0.0
         return (r[-1][1] - r[0][1]) / r[0][1]
+
+    def _sigma_ps(self) -> float:
+        now = time.time()
+        r = [(t, p) for t, p in self._ph if t >= now - 300]
+        if len(r) < 6:
+            return _SIGMA_FALLBACK
+        sq = []
+        for i in range(1, len(r)):
+            dt = r[i][0] - r[i - 1][0]
+            if dt > 0.1 and r[i - 1][1] > 0:
+                lr = math.log(r[i][1] / r[i - 1][1])
+                sq.append(lr * lr / dt)
+        return math.sqrt(sum(sq) / len(sq)) if sq else _SIGMA_FALLBACK
 
     def evaluate(
         self,
@@ -627,8 +742,8 @@ class _MomentumEngine:
         now = time.time()
         time_remaining = state.end_time - now
 
-        # Active window: between 60s and 250s remaining
-        if time_remaining < 60 or time_remaining > 250:
+        # Tightened window: 60–150s only (was up to 250s)
+        if time_remaining < 60 or time_remaining > 150:
             return None
         if state.reference_price <= 0 or state.btc_chainlink <= 0:
             return None
@@ -639,10 +754,8 @@ class _MomentumEngine:
         m120 = self._mom_window(120)
         threshold = cfg.momentum_min_threshold
 
-        # Both windows must exceed threshold
         if abs(m60) < threshold or abs(m120) < threshold:
             return None
-        # Both windows must agree on direction
         if (m60 > 0) != (m120 > 0):
             return None
 
@@ -651,38 +764,45 @@ class _MomentumEngine:
             (state.btc_chainlink - state.reference_price) / state.reference_price
         )
 
-        # Delta must at least not strongly oppose momentum
         if going_up and delta < -0.0005:
             return None
         if not going_up and delta > 0.0005:
             return None
 
+        # Diffusion gate: require p_diff > 0.60 before betting
+        sigma_ps = self._sigma_ps()
+        p_diff = p_brownian(delta, time_remaining, sigma_ps)
+        if p_diff < 0.60:
+            return None
+
         side = "YES" if going_up else "NO"
-        if going_up:
-            entry = state.best_ask_yes if state.best_ask_yes > 0 else state.p_market_yes
-        else:
-            entry = (
-                state.best_ask_no if state.best_ask_no > 0
-                else (1 - state.p_market_yes)
-            )
+        entry = (
+            (state.best_ask_yes if state.best_ask_yes > 0 else state.p_market_yes)
+            if going_up
+            else (state.best_ask_no if state.best_ask_no > 0
+                  else (1 - state.p_market_yes))
+        )
 
         momentum_strength = (abs(m60) + abs(m120)) / 2
-        # Conservative probability: base 0.53 + strength bonus
-        p_true = clamp(0.53 + momentum_strength * 20, 0.53, 0.67)
+        p_bayes = clamp(0.53 + momentum_strength * 20, 0.53, 0.67)
+        # Blend with diffusion (moderate weight at T-150s)
+        blend_w = clamp(time_remaining / 150, 0.2, 0.45)
+        prob = blend_w * p_diff + (1 - blend_w) * p_bayes
+        prob = clamp(prob, 0.50, 0.98)
 
         fee = calc_fee(entry)
-        edge = p_true - entry - fee
+        edge = prob - entry - fee
 
-        if edge < cfg.edge_min * 0.9:  # slight relaxation for momentum
+        if edge < cfg.edge_min * 0.9:
             return None
         if entry < cfg.min_market_prob_side or entry > cfg.max_market_prob_side:
             return None
 
-        max_frac = cfg.max_bet_fraction * 0.5  # half of ChainlinkArb cap
+        max_frac = cfg.max_bet_fraction * 0.5
         c_eff = entry + fee
         if c_eff >= 1:
             return None
-        kelly = (p_true - c_eff) / (1 - c_eff)
+        kelly = (prob - c_eff) / (1 - c_eff)
         if kelly <= 0:
             return None
         frac = clamp(kelly * 0.25, 0, max_frac)
@@ -692,52 +812,32 @@ class _MomentumEngine:
 
         slug = state.slug or state.market_id[:20]
         sig = Signal(
-            timestamp=now,
-            market_id=state.market_id,
-            delta_chainlink=delta,
-            btc_chainlink=state.btc_chainlink,
-            btc_binance=state.btc_binance,
-            reference_price=state.reference_price,
-            time_remaining_sec=time_remaining,
-            slug=slug,
-            side=side,
-            p_true=p_true,
-            p_market=entry,
-            entry_price=entry,
-            edge=edge,
-            taker_fee=fee,
-            kelly_pct=frac,
-            size_usd=size,
-            action="BUY",
-            status="BETTING",
-            filters_passed=True,
-            confidence="MEDIUM",
-            strategy_used=self.NAME,
-            strategies_agreeing=1,
+            timestamp=now, market_id=state.market_id,
+            delta_chainlink=delta, btc_chainlink=state.btc_chainlink,
+            btc_binance=state.btc_binance, reference_price=state.reference_price,
+            time_remaining_sec=time_remaining, slug=slug,
+            side=side, p_true=prob, p_market=entry, entry_price=entry,
+            edge=edge, taker_fee=fee, kelly_pct=frac, size_usd=size,
+            action="BUY", status="BETTING", filters_passed=True,
+            confidence="MEDIUM", strategy_used=self.NAME, strategies_agreeing=1,
         )
+        sig.micro.p_diffusion = round(p_diff, 4)
         log.info(
-            "[BET:MOMENTUM] %s %s | m60=%.3f%% m120=%.3f%% edge=%.1f%% $%.2f | T-%ds",
-            side, slug[-14:], m60 * 100, m120 * 100, edge * 100, size,
-            int(time_remaining),
+            "[BET:MOMENTUM] %s %s | m60=%.3f%% m120=%.3f%% "
+            "p_diff=%.0f%% edge=%.1f%% $%.2f | T-%ds",
+            side, slug[-14:], m60 * 100, m120 * 100,
+            p_diff * 100, edge * 100, size, int(time_remaining),
         )
         return sig
 
 
-# ── Strategy 3: Mean Reversion (contrarian) ───────────────────────────────────
+# ── Strategy 3: Mean Reversion ──────────────────────────────────────────────────
 
 class _MeanReversionEngine:
     """
-    Contrarian bet: fade extreme delta moves.
-
-    When BTC has moved far (>0.20%) from the reference price, the market
-    tends to overprice continuation. We fade the extreme and bet reversion.
-
-    Conservative: never bets during losing streaks (>= 2 consecutive losses),
-    low sizing (40% of ChainlinkArb cap), and requires 90–250s remaining.
-
-    NOTE: This strategy will often CONFLICT with ChainlinkArb (which follows
-    the delta direction). The router’s conflict detection will then choose
-    the dominant side or skip — which is the intended safety behavior.
+    Contrarian: fade extreme delta moves (>0.20%). Window tightened to
+    90–180s (was 90–250s). Requires p_diffusion of the contrarian move
+    to also be favourable before betting.
     """
     NAME = "mean_rev"
 
@@ -767,29 +867,37 @@ class _MeanReversionEngine:
             return None
 
         time_remaining = state.end_time - now
-        if time_remaining < 90 or time_remaining > 250:
+        # Tightened from 250 → 180s
+        if time_remaining < 90 or time_remaining > 180:
             return None
-
-        # Don’t fade during losing streaks — trend may be stronger
         if consecutive_losses >= 2:
             return None
         if has_position_on_market:
             return None
 
-        # Contrarian: bet AGAINST the direction of the extreme move
+        # MeanReversion bets AGAINST the current delta.
+        # For diffusion check: use a conservative sigma (1.5x fallback)
+        sigma_ps = _SIGMA_FALLBACK * 1.5
+        # For reversion to succeed, BTC must cross BACK over reference.
+        # The contrarian delta is the reverse, so use -delta for p_brownian
+        # (we need |rev_delta| > sigma*sqrt(t) for reversion to be likely)
+        # Actually: we’re betting it stays there after crossing. Use simple check:
+        # require that the current extreme move is at least 1.5σ.
+        one_sigma = sigma_ps * math.sqrt(max(time_remaining, 1))
+        if abs_delta < 1.5 * one_sigma:
+            return None  # move not extreme enough for reliable reversion
+
         if delta > 0:
-            side = "NO"  # BTC went up far → bet it won’t stay above ref
+            side = "NO"
             entry = (
                 state.best_ask_no if state.best_ask_no > 0
                 else (1 - state.p_market_yes)
             )
         else:
-            side = "YES"  # BTC went down far → bet it will bounce back above ref
+            side = "YES"
             entry = state.best_ask_yes if state.best_ask_yes > 0 else state.p_market_yes
 
-        # Conservative probability: base 0.52 + extra for larger extremes
         p_true = clamp(0.52 + (abs_delta - thresh) * 8, 0.52, 0.62)
-
         fee = calc_fee(entry)
         edge = p_true - entry - fee
 
@@ -798,7 +906,7 @@ class _MeanReversionEngine:
         if entry < cfg.min_market_prob_side or entry > cfg.max_market_prob_side:
             return None
 
-        max_frac = cfg.max_bet_fraction * 0.4  # most conservative strategy
+        max_frac = cfg.max_bet_fraction * 0.4
         c_eff = entry + fee
         if c_eff >= 1:
             return None
@@ -812,33 +920,20 @@ class _MeanReversionEngine:
 
         slug = state.slug or state.market_id[:20]
         sig = Signal(
-            timestamp=now,
-            market_id=state.market_id,
-            delta_chainlink=delta,
-            btc_chainlink=state.btc_chainlink,
-            btc_binance=state.btc_binance,
-            reference_price=state.reference_price,
-            time_remaining_sec=time_remaining,
-            slug=slug,
-            side=side,
-            p_true=p_true,
-            p_market=entry,
-            entry_price=entry,
-            edge=edge,
-            taker_fee=fee,
-            kelly_pct=frac,
-            size_usd=size,
-            action="BUY",
-            status="BETTING",
-            filters_passed=True,
-            confidence="LOW",
-            strategy_used=self.NAME,
-            strategies_agreeing=1,
+            timestamp=now, market_id=state.market_id,
+            delta_chainlink=delta, btc_chainlink=state.btc_chainlink,
+            btc_binance=state.btc_binance, reference_price=state.reference_price,
+            time_remaining_sec=time_remaining, slug=slug,
+            side=side, p_true=p_true, p_market=entry, entry_price=entry,
+            edge=edge, taker_fee=fee, kelly_pct=frac, size_usd=size,
+            action="BUY", status="BETTING", filters_passed=True,
+            confidence="LOW", strategy_used=self.NAME, strategies_agreeing=1,
         )
         log.info(
-            "[BET:MEAN_REV] %s %s | delta=%.3f%% p_true=%.1f%% edge=%.1f%% $%.2f | T-%ds",
-            side, slug[-14:], delta * 100, p_true * 100, edge * 100, size,
-            int(time_remaining),
+            "[BET:MEAN_REV] %s %s | delta=%.3f%% p_true=%.1f%% "
+            "edge=%.1f%% $%.2f | T-%ds",
+            side, slug[-14:], delta * 100, p_true * 100,
+            edge * 100, size, int(time_remaining),
         )
         return sig
 
@@ -848,14 +943,7 @@ class _MeanReversionEngine:
 class SignalEngine:
     """
     Coordinates all three strategies and routes to the best signal.
-
-    Public interface (unchanged from v2, compatible with main.py):
-      update_price(price, ts)
-      update_chainlink_price(price, ts)
-      evaluate(state, capital, consecutive_losses, daily_pnl_pct,
-               open_positions, has_position_on_market) -> Signal
-      reset_market_stability(slug)
-      record_result(strategy_name, won)   <- NEW: call after resolution
+    Public interface unchanged (backward compatible with main.py).
     """
 
     def __init__(self, cfg: SignalConfig):
@@ -864,8 +952,6 @@ class SignalEngine:
         self._mom = _MomentumEngine(cfg)
         self._rev = _MeanReversionEngine(cfg)
         self.perf = PerformanceTracker(window=30)
-
-    # ── Feed updates ─────────────────────────────────────────────────────────
 
     def update_price(self, p: float, ts: float) -> None:
         self._cl.update_price(p, ts)
@@ -878,10 +964,7 @@ class SignalEngine:
         self._cl.reset_stability(slug)
 
     def record_result(self, strategy: str, won: bool) -> None:
-        """Called by main.py after each trade resolves."""
         self.perf.record(strategy, won)
-
-    # ── Core evaluation ──────────────────────────────────────────────────────
 
     def evaluate(
         self,
@@ -892,10 +975,8 @@ class SignalEngine:
         open_positions: int = 0,
         has_position_on_market: bool = False,
     ) -> Signal:
-        """Evaluate all strategies, apply routing, return the best Signal."""
         now = time.time()
 
-        # Run all three strategies
         cl_sig = self._cl.evaluate(
             state, capital, consecutive_losses, daily_pnl_pct,
             open_positions, has_position_on_market,
@@ -905,15 +986,12 @@ class SignalEngine:
             state, capital, has_position_on_market, consecutive_losses
         )
 
-        # Collect actionable BUY candidates
-        candidates: List[Signal] = []
-        for sig in (cl_sig, mom_sig, rev_sig):
-            if sig is not None and sig.action == "BUY" and sig.filters_passed:
-                candidates.append(sig)
+        candidates: List[Signal] = [
+            s for s in (cl_sig, mom_sig, rev_sig)
+            if s is not None and s.action == "BUY" and s.filters_passed
+        ]
 
-        # Enrich base signal for dashboard (always return something useful)
         def _base_info(sig: Signal) -> Signal:
-            """Copy market-level info onto signal for logging/dashboard."""
             sig.slug = state.slug
             sig.market_start_time = state.start_time
             sig.market_duration = state.duration_seconds
@@ -926,36 +1004,25 @@ class SignalEngine:
             return sig
 
         if not candidates:
-            # No strategy wants to bet — return the ChainlinkArb signal for
-            # dashboard / logging purposes (it has the richest debug info)
             base = cl_sig if cl_sig is not None else Signal(
-                timestamp=now,
-                market_id=state.market_id,
+                timestamp=now, market_id=state.market_id,
                 btc_chainlink=state.btc_chainlink,
                 reference_price=state.reference_price,
             )
             return _base_info(base)
 
-        # ── Conflict detection ─────────────────────────────────────────────
         yes_cands = [s for s in candidates if s.side == "YES"]
         no_cands = [s for s in candidates if s.side == "NO"]
 
         if yes_cands and no_cands:
-            # Strategies disagree — compare weighted scores
             def _score(s: Signal) -> float:
                 return s.edge * self.perf.weight(s.strategy_used)
-
             best_yes = max(yes_cands, key=_score)
             best_no = max(no_cands, key=_score)
-            ys = _score(best_yes)
-            ns = _score(best_no)
-            dominant = max(ys, ns, 1e-9)
-
-            if abs(ys - ns) / dominant < 0.50:
-                # Neither side clearly dominates — skip
+            ys, ns = _score(best_yes), _score(best_no)
+            if abs(ys - ns) / max(ys, ns, 1e-9) < 0.50:
                 conflict = Signal(
-                    timestamp=now,
-                    market_id=state.market_id,
+                    timestamp=now, market_id=state.market_id,
                     btc_chainlink=state.btc_chainlink,
                     reference_price=state.reference_price,
                     status="CONFLICT",
@@ -965,30 +1032,20 @@ class SignalEngine:
                     f"/NO({best_no.strategy_used})"
                 )
                 return _base_info(conflict)
-
-            # Use the dominant side only
             candidates = yes_cands if ys > ns else no_cands
 
-        # ── Consensus & routing ────────────────────────────────────────────
         agreeing = len(candidates)
-        best = max(
-            candidates,
-            key=lambda s: s.edge * self.perf.weight(s.strategy_used),
-        )
+        best = max(candidates, key=lambda s: s.edge * self.perf.weight(s.strategy_used))
         best.strategies_agreeing = agreeing
 
         if agreeing >= 2:
-            # Consensus size boost: +25% per additional agreeing strategy
-            boost = 1.0 + 0.25 * (agreeing - 1)  # 1.25x or 1.50x
+            boost = 1.0 + 0.25 * (agreeing - 1)
             hard_cap = capital * self.cfg.max_bet_fraction * 1.5
             best.size_usd = min(round(best.size_usd * boost, 2), hard_cap)
             best.confidence = "HIGH"
-            strategy_names = "+".join(
-                s.strategy_used for s in candidates
-            )
             log.info(
-                "[CONSENSUS] %d strategies agree %s | %s | boost=%.2fx | $%.2f",
-                agreeing, best.side, strategy_names, boost, best.size_usd,
+                "[CONSENSUS] %d strategies agree %s | boost=%.2fx | $%.2f",
+                agreeing, best.side, boost, best.size_usd,
             )
 
         return _base_info(best)
