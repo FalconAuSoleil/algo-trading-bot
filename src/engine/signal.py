@@ -1,7 +1,24 @@
-"""Signal Engine v3.1 - Multi-Strategy Router + Diffusion Risk Model
+"""Signal Engine v3.2 - Multi-Strategy Router + Diffusion Risk Model
 ======================================================================
 
-Root cause fix (warroom session):
+v3.2 fixes (post warroom — small-delta crash):
+  A trade with delta=0.039% at T-177s passed the v3.1 filters by 0.001%
+  margin and lost when BTC crashed $91 in 177 seconds. Three fixes applied:
+
+  1. Sigma floor raised to _SIGMA_FALLBACK:
+     _realized_vol_per_sec() now returns at least the conservative fallback.
+     A quiet-market period can no longer drive sigma 5× below baseline,
+     which was shrinking min_viable_delta and creating false confidence.
+
+  2. min_viable_delta multiplier: 0.50σ√t → 1.0σ√t:
+     Delta must exceed one full standard deviation of residual BTC movement
+     to be considered actionable. 0.5σ was too permissive.
+
+  3. Hard absolute delta floor (config.delta_min_abs, default 0.10%):
+     Model-independent guard. Never bet when |delta| < 0.10% ($74 at $74k).
+     Catches any scenario where vol model underestimates future volatility.
+
+v3.1 fixes (warroom session):
   The bot was betting 4+ minutes before market close with a small delta.
   BTC has enough time to cross back over the reference price, causing losses.
   Fix: integrate a Brownian-motion diffusion model into every p_true estimate.
@@ -94,7 +111,7 @@ def p_brownian(
     Returns:
         Float in [0.5, 1.0] — probability of the bet being correct at T=0.
         Always ≥ 0.5 because we use |delta| (the bet is already in the right
-        direction; we’re only asking “will it hold?”).
+        direction; we're only asking "will it hold?").
     """
     if time_remaining_sec <= 1:
         return 1.0  # essentially already resolved
@@ -307,6 +324,10 @@ class _Stability:
 # Conservative fallback: 0.5% per 5 minutes = sqrt(0.005^2 / 300) per second
 _SIGMA_FALLBACK = 0.005 / math.sqrt(300)  # ~2.89e-4
 
+# v3.2: sigma floor = fallback (never go below conservative baseline)
+# This prevents quiet-market periods from artificially shrinking min_viable_delta.
+_SIGMA_FLOOR = _SIGMA_FALLBACK
+
 
 class _ChainlinkArbEngine:
     """
@@ -316,6 +337,8 @@ class _ChainlinkArbEngine:
     Before betting, we compute p_diffusion = P(BTC stays correct side until T=0)
     using the current delta and dynamically-measured BTC volatility.
     p_true is then a time-weighted blend of Bayesian and diffusion estimates.
+
+    v3.2 addition: sigma floor + raised min_viable_delta multiplier + abs delta floor.
     """
     NAME = "chainlink_arb"
 
@@ -378,7 +401,11 @@ class _ChainlinkArbEngine:
         Estimate realized BTC volatility per second from recent price ticks.
 
         Uses squared log-returns normalized by time between ticks.
-        Conservative fallback (0.5%/5min) if not enough data.
+
+        v3.2: lower clamp is now _SIGMA_FALLBACK (was 5x lower at 0.001/sqrt300).
+        A quiet market period can no longer produce a sigma estimate below our
+        conservative baseline — which would cause min_viable_delta to shrink
+        and allow bets on tiny deltas with false confidence.
         """
         now = time.time()
         r = [(t, p) for t, p in self._ph if t >= now - window_sec]
@@ -396,9 +423,10 @@ class _ChainlinkArbEngine:
             return _SIGMA_FALLBACK
 
         variance_per_sec = sum(sq_returns) / len(sq_returns)
-        # Clamp to sensible range: [0.1%/5min, 2%/5min]
         sigma = math.sqrt(variance_per_sec)
-        return clamp(sigma, 0.001 / math.sqrt(300), 0.02 / math.sqrt(300))
+        # v3.2: floor = _SIGMA_FALLBACK (was 0.001/sqrt300, 5x too low)
+        # Ceiling = 2%/5min (very volatile)
+        return clamp(sigma, _SIGMA_FLOOR, 0.02 / math.sqrt(300))
 
     def evaluate(
         self,
@@ -474,16 +502,16 @@ class _ChainlinkArbEngine:
 
         pd = sig.delta_chainlink
 
-        # ── DIFFUSION RISK CHECK (warroom fix) ─────────────────────────────
-        # Compute realized volatility and minimum viable delta.
-        # If BTC can randomly cross the reference price before expiry,
-        # the signal is statistically noise — skip it.
+        # ── DIFFUSION RISK CHECK (v3.1/v3.2) ──────────────────────────────
+        # Gate 1: sigma-relative floor (1.0σ√t, raised from 0.5σ√t in v3.2)
         sigma_ps = self._realized_vol_per_sec()
         t_rem = sig.time_remaining_sec
 
-        # Minimum delta = 0.5 standard deviations of BTC movement
-        # (a 1σ move would be min_viable_delta = sigma_ps * sqrt(t_rem))
-        min_viable_delta = 0.50 * sigma_ps * math.sqrt(max(t_rem, 1))
+        # v3.2: multiplier raised 0.50 → 1.0.
+        # Delta must exceed one full standard deviation of BTC residual movement.
+        # At 0.5σ the filter was too permissive: BTC only needed a half-sigma
+        # move against us to invalidate the bet.
+        min_viable_delta = 1.0 * sigma_ps * math.sqrt(max(t_rem, 1))
         micro.realized_sigma_pct = round(sigma_ps * math.sqrt(300) * 100, 4)
         micro.min_viable_delta_pct = round(min_viable_delta * 100, 4)
 
@@ -494,6 +522,19 @@ class _ChainlinkArbEngine:
             sig.status = (
                 f"DELTA_WEAK (σ×√t={min_viable_delta*100:.3f}%)"
             )
+            sig.micro = micro
+            return sig
+
+        # Gate 2: v3.2 — hard absolute floor on delta.
+        # Completely model-independent: never bet when BTC gap is trivially small
+        # regardless of what the vol estimator thinks.
+        # Default 0.10% = $74 on a $74k BTC. Override via DELTA_MIN_ABS env var.
+        delta_abs_floor = getattr(cfg, "delta_min_abs", 0.0010)
+        if abs(pd) < delta_abs_floor and t_rem > 60:
+            sig.filter_reasons.append(
+                f"delta_abs:{abs(pd)*100:.3f}%<{delta_abs_floor*100:.3f}%"
+            )
+            sig.status = f"DELTA_ABS_FLOOR ({abs(pd)*100:.3f}%)"
             sig.micro = micro
             return sig
 
@@ -683,10 +724,10 @@ class _ChainlinkArbEngine:
 
         log.info(
             "[BET:CL_ARB] %s %s | edge=+%.1f%% P=%.0f%%(diff=%.0f%%) "
-            "@%.0fc | $%.2f | T-%ds | σ√t=%.3f%% | %s",
+            "@%.0fc | $%.2f | T-%ds | σ√t=%.3f%% | abs_Δ=%.3f%% | %s",
             side, slug[-14:], edge * 100, prob * 100, p_diff * 100,
             entry * 100, size, int(t_rem),
-            min_viable_delta * 100, sig.confidence,
+            min_viable_delta * 100, abs(pd) * 100, sig.confidence,
         )
         return sig
 
@@ -730,7 +771,9 @@ class _MomentumEngine:
             if dt > 0.1 and r[i - 1][1] > 0:
                 lr = math.log(r[i][1] / r[i - 1][1])
                 sq.append(lr * lr / dt)
-        return math.sqrt(sum(sq) / len(sq)) if sq else _SIGMA_FALLBACK
+        raw = math.sqrt(sum(sq) / len(sq)) if sq else _SIGMA_FALLBACK
+        # v3.2: apply same floor as ChainlinkArbEngine
+        return max(raw, _SIGMA_FLOOR)
 
     def evaluate(
         self,
@@ -773,6 +816,11 @@ class _MomentumEngine:
         sigma_ps = self._sigma_ps()
         p_diff = p_brownian(delta, time_remaining, sigma_ps)
         if p_diff < 0.60:
+            return None
+
+        # v3.2: also apply absolute delta floor to momentum strategy
+        delta_abs_floor = getattr(cfg, "delta_min_abs", 0.0010)
+        if abs(delta) < delta_abs_floor:
             return None
 
         side = "YES" if going_up else "NO"
@@ -878,11 +926,7 @@ class _MeanReversionEngine:
         # MeanReversion bets AGAINST the current delta.
         # For diffusion check: use a conservative sigma (1.5x fallback)
         sigma_ps = _SIGMA_FALLBACK * 1.5
-        # For reversion to succeed, BTC must cross BACK over reference.
-        # The contrarian delta is the reverse, so use -delta for p_brownian
-        # (we need |rev_delta| > sigma*sqrt(t) for reversion to be likely)
-        # Actually: we’re betting it stays there after crossing. Use simple check:
-        # require that the current extreme move is at least 1.5σ.
+        # require that the current extreme move is at least 1.5σ
         one_sigma = sigma_ps * math.sqrt(max(time_remaining, 1))
         if abs_delta < 1.5 * one_sigma:
             return None  # move not extreme enough for reliable reversion
