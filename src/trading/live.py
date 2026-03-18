@@ -1,11 +1,25 @@
-"""Live trading engine — executes real orders on Polymarket CLOB."""
+"""Live trading engine — executes real orders on Polymarket CLOB.
+
+Uses py-clob-client for proper EIP-712 / HMAC order signing.
+Requires POLYMARKET_PRIVATE_KEY and POLYMARKET_WALLET_ADDRESS in .env.
+
+Trade flow:
+  1. Receive Signal with action="BUY" and filters_passed=True
+  2. Determine correct outcome token_id from signal.token_id_yes / token_id_no
+  3. Create a signed FOK order via ClobClient.create_order()
+  4. Submit to CLOB; track as pending resolution
+  5. Resolve after market close via Polymarket past-results API
+
+BUGFIX (v3): previous version used conditionId as tokenID in the order
+payload, which is wrong. The CLOB needs the YES or NO *outcome* token ID.
+These are now carried on the Signal object and populated by main.py.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Callable, Optional
-
-import aiohttp
 
 from src.config import PolymarketConfig
 from src.engine.signal import Signal
@@ -15,12 +29,29 @@ from src.utils.logger import setup_logger
 
 log = setup_logger("trading.live")
 
+# py-clob-client is required for live trading.
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.constants import POLYGON
+    _HAS_CLOB = True
+except ImportError:
+    _HAS_CLOB = False
+    log.warning(
+        "[Live] py-clob-client not installed. "
+        "Run: pip install py-clob-client>=0.6"
+    )
+
+# BUY side constant (avoids importing the enum in the order payload)
+_BUY = "BUY"
+
 
 class LiveTrader:
-    """Executes real trades on Polymarket via the CLOB API.
+    """
+    Executes real trades on Polymarket via the CLOB API.
 
     Uses FOK (Fill-or-Kill) orders for immediate execution.
-    Requires valid API credentials and a funded Polygon wallet.
+    Requires valid Polygon wallet private key and USDC balance.
     """
 
     def __init__(
@@ -32,58 +63,109 @@ class LiveTrader:
         self.portfolio = portfolio
         self.db = db
         self.cfg = poly_cfg
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._client: Optional[object] = None
         self._pending_resolutions: dict[int, dict] = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def start(self) -> None:
-        """Initialize HTTP session for CLOB API."""
-        self._session = aiohttp.ClientSession(
-            headers=self._build_headers()
-        )
-        log.info("[Live] Trader initialized")
+        """Initialise the CLOB client and derive/set API credentials."""
+        self._loop = asyncio.get_event_loop()
+
+        if not _HAS_CLOB:
+            log.error(
+                "[Live] Cannot start: py-clob-client not installed."
+            )
+            return
+
+        if not self.cfg.private_key:
+            log.error(
+                "[Live] Cannot start: POLYMARKET_PRIVATE_KEY not set in .env"
+            )
+            return
+
+        if not self.cfg.wallet_address:
+            log.error(
+                "[Live] Cannot start: POLYMARKET_WALLET_ADDRESS not set in .env"
+            )
+            return
+
+        try:
+            # Run synchronous ClobClient init in executor to avoid blocking
+            def _init_client():
+                client = ClobClient(
+                    host=self.cfg.clob_url,
+                    chain_id=POLYGON,
+                    key=self.cfg.private_key,
+                    signature_type=2,       # POLY_GNOSIS_SAFE
+                    funder=self.cfg.wallet_address,
+                )
+                # Use pre-configured API key if available, else derive it
+                if self.cfg.api_key and self.cfg.api_secret and self.cfg.api_passphrase:
+                    from py_clob_client.clob_types import ApiCreds
+                    creds = ApiCreds(
+                        api_key=self.cfg.api_key,
+                        api_secret=self.cfg.api_secret,
+                        api_passphrase=self.cfg.api_passphrase,
+                    )
+                else:
+                    creds = client.derive_api_creds()
+                    log.info(
+                        "[Live] Derived API creds from private key "
+                        "(no explicit creds in .env)"
+                    )
+                client.set_api_creds(creds)
+                return client
+
+            self._client = await self._loop.run_in_executor(None, _init_client)
+            log.info(
+                "[Live] ClobClient ready | wallet=%s",
+                self.cfg.wallet_address[:10] + "...",
+            )
+        except Exception as exc:
+            log.error("[Live] ClobClient init failed: %s", exc)
+            self._client = None
 
     async def stop(self) -> None:
-        if self._session:
-            await self._session.close()
-
-    def _build_headers(self) -> dict:
-        """Build authentication headers for CLOB API.
-
-        Note: Full Polymarket CLOB auth requires EIP-712 signing
-        and HMAC-SHA256. This is a simplified placeholder.
-        For production, use the official py-clob-client SDK.
-        """
-        return {
-            "Content-Type": "application/json",
-            "POLY-ADDRESS": self.cfg.wallet_address,
-            "POLY-API-KEY": self.cfg.api_key,
-            "POLY-PASSPHRASE": self.cfg.api_passphrase,
-        }
+        self._client = None
+        log.info("[Live] Trader stopped")
 
     async def execute(self, signal: Signal) -> Optional[int]:
-        """Execute a live trade based on signal.
+        """
+        Execute a live trade based on signal.
 
         Returns:
-            trade_id if executed, None if skipped.
+            trade_id if order was filled, None if skipped or rejected.
         """
         if signal.action != "BUY" or not signal.filters_passed:
             return None
-
         if signal.size_usd < 1.0:
             return None
+        if self._client is None:
+            log.error("[Live] Client not initialized — check credentials")
+            return None
 
-        if not self.cfg.api_key or not self.cfg.private_key:
+        # Determine the correct outcome token ID
+        if signal.side == "YES":
+            token_id = signal.token_id_yes
+        else:
+            token_id = signal.token_id_no
+
+        if not token_id:
             log.error(
-                "[Live] Cannot execute: missing API credentials"
+                "[Live] Missing token_id for side=%s market=%s. "
+                "Ensure main.py populates sig.token_id_yes/no from MarketInfo.",
+                signal.side, signal.market_id[:16],
             )
             return None
 
-        # Determine token ID and price
         entry_price = signal.entry_price
         if entry_price <= 0 or entry_price >= 1.0:
+            log.error("[Live] Invalid entry price: %.4f", entry_price)
             return None
 
-        # Record trade (pending) in database
+        shares = round(signal.size_usd / entry_price, 2)
+
+        # Record as pending in DB before submitting (idempotent crash safety)
         record = TradeRecord(
             market_id=signal.market_id,
             slug=signal.slug,
@@ -100,118 +182,99 @@ class LiveTrader:
         )
         trade_id = await self.db.insert_trade(record)
 
-        # Build FOK order
-        shares = signal.size_usd / entry_price
-        order_payload = {
-            "tokenID": signal.market_id,
-            "price": str(round(entry_price, 4)),
-            "size": str(round(shares, 2)),
-            "side": "BUY",
-            "type": "FOK",
-            "feeRateBps": "0",
-        }
-
+        # Submit signed FOK order in thread executor
         try:
             log.info(
-                "[Live] Sending FOK order: %s %s $%.2f @ %.4f",
-                signal.side,
-                signal.market_id[:16],
-                signal.size_usd,
-                entry_price,
+                "[Live] Submitting FOK | %s %s | shares=%.2f @ %.4f | $%.2f",
+                signal.side, signal.market_id[:16], shares,
+                entry_price, signal.size_usd,
             )
 
-            async with self._session.post(
-                f"{self.cfg.clob_url}/order",
-                json=order_payload,
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                result = await resp.json()
+            def _place_order():
+                from py_clob_client.clob_types import OrderArgs, OrderType
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=round(entry_price, 4),
+                    size=shares,
+                    side=_BUY,
+                )
+                signed = self._client.create_order(order_args)
+                return self._client.post_order(signed, OrderType.FOK)
 
-                if resp.status == 200 and result.get("success"):
-                    log.info(
-                        "[Live] Order FILLED: %s", result
-                    )
-                    # Update with actual fill price if available
-                    fill_price = float(
-                        result.get("price", entry_price)
-                    )
-                    actual_shares = signal.size_usd / fill_price
+            resp = await self._loop.run_in_executor(None, _place_order)
 
-                    pos = Position(
-                        trade_id=trade_id,
-                        market_id=signal.market_id,
-                        side=signal.side,
-                        entry_price=fill_price,
-                        size_usd=signal.size_usd,
-                        shares=actual_shares,
-                        entry_time=time.time(),
-                        market_end_time=(
-                            time.time()
-                            + signal.time_remaining_sec
-                        ),
-                        delta_at_entry=signal.delta_chainlink,
-                        p_true_at_entry=signal.p_true,
-                        edge_at_entry=signal.edge,
-                    )
+            if resp and resp.get("success"):
+                fill_price = float(resp.get("price", entry_price))
+                actual_shares = signal.size_usd / fill_price
 
-                    if not self.portfolio.open_position(pos):
-                        await self.db.resolve_trade(
-                            trade_id, "cancelled", 0.0
-                        )
-                        return None
+                log.info(
+                    "[Live] FILLED | trade_id=%d | fill=%.4f | shares=%.2f",
+                    trade_id, fill_price, actual_shares,
+                )
 
-                    self._pending_resolutions[trade_id] = {
-                        "market_id": signal.market_id,
-                        "side": signal.side,
-                        "end_time": pos.market_end_time,
-                        "reference_price": signal.reference_price,
-                        "start_time": signal.market_start_time,
-                        "duration": signal.market_duration,
-                    }
-                    return trade_id
-                else:
-                    log.warning(
-                        "[Live] Order REJECTED: %s (status=%d)",
-                        result,
-                        resp.status,
-                    )
-                    await self.db.resolve_trade(
-                        trade_id, "rejected", 0.0
-                    )
+                pos = Position(
+                    trade_id=trade_id,
+                    market_id=signal.market_id,
+                    side=signal.side,
+                    entry_price=fill_price,
+                    size_usd=signal.size_usd,
+                    shares=actual_shares,
+                    entry_time=time.time(),
+                    market_end_time=time.time() + signal.time_remaining_sec,
+                    delta_at_entry=signal.delta_chainlink,
+                    p_true_at_entry=signal.p_true,
+                    edge_at_entry=signal.edge,
+                )
+
+                if not self.portfolio.open_position(pos):
+                    await self.db.resolve_trade(trade_id, "cancelled", 0.0)
                     return None
 
-        except Exception as e:
-            log.error("[Live] Order execution error: %s", e)
-            await self.db.resolve_trade(
-                trade_id, "error", 0.0
-            )
+                self._pending_resolutions[trade_id] = {
+                    "market_id": signal.market_id,
+                    "side": signal.side,
+                    "end_time": pos.market_end_time,
+                    "reference_price": signal.reference_price,
+                    "start_time": signal.market_start_time,
+                    "duration": signal.market_duration,
+                    "strategy_used": signal.strategy_used,
+                }
+                return trade_id
+
+            else:
+                err = resp.get("errorMsg", str(resp)) if resp else "no response"
+                log.warning(
+                    "[Live] Order REJECTED | trade_id=%d | %s",
+                    trade_id, err,
+                )
+                await self.db.resolve_trade(trade_id, "rejected", 0.0)
+                return None
+
+        except Exception as exc:
+            log.error("[Live] Order execution error: %s", exc, exc_info=True)
+            await self.db.resolve_trade(trade_id, "error", 0.0)
             return None
 
     async def check_resolutions(
         self,
         btc_chainlink_price: float,
-        fetch_outcome: Optional[
-            Callable[[float, int], object]
-        ] = None,
+        fetch_outcome: Optional[Callable] = None,
     ) -> list[dict]:
-        """Check if any pending positions should be resolved.
+        """
+        Check if pending positions have resolved.
 
-        Uses the real Polymarket outcome when available via
-        fetch_outcome callback. Falls back to BTC price comparison.
+        Prefers the real Polymarket API outcome; falls back to BTC
+        price comparison 30s after expiry if API is still pending.
         """
         now = time.time()
         resolved = []
 
-        for trade_id, info in list(
-            self._pending_resolutions.items()
-        ):
-            # Wait 10s after expiry for API to settle
+        for trade_id, info in list(self._pending_resolutions.items()):
             if now < info["end_time"] + 10:
-                continue
+                continue  # too early
 
             ref = info["reference_price"]
             side = info["side"]
-
             if ref <= 0:
                 continue
 
@@ -227,35 +290,26 @@ class LiveTrader:
                     pass
 
             if real_outcome in ("up", "down"):
-                if side == "YES":
-                    won = real_outcome == "up"
-                else:
-                    won = real_outcome == "down"
+                won = (real_outcome == "up") if side == "YES" else (real_outcome == "down")
                 log.info(
-                    "[Live] Resolved trade %d via API: "
-                    "outcome=%s, side=%s, won=%s",
+                    "[Live] Resolved trade %d via API | outcome=%s side=%s won=%s",
                     trade_id, real_outcome, side, won,
                 )
             else:
                 if now < info["end_time"] + 30:
-                    continue
+                    continue  # wait a bit longer for API
                 btc_above = btc_chainlink_price >= ref
-                if side == "YES":
-                    won = btc_above
-                else:
-                    won = not btc_above
+                won = btc_above if side == "YES" else not btc_above
                 log.warning(
-                    "[Live] Resolved trade %d via BTC price "
-                    "FALLBACK: btc=$%.2f, ref=$%.2f, won=%s",
-                    trade_id, btc_chainlink_price, ref, won,
+                    "[Live] Resolved trade %d via BTC FALLBACK | "
+                    "btc=$%.2f ref=$%.2f side=%s won=%s",
+                    trade_id, btc_chainlink_price, ref, side, won,
                 )
 
-            outcome, pnl = self.portfolio.close_position(
-                trade_id, won
-            )
+            outcome, pnl = self.portfolio.close_position(trade_id, won)
             await self.db.resolve_trade(trade_id, outcome, pnl)
-
             del self._pending_resolutions[trade_id]
+
             resolved.append({
                 "trade_id": trade_id,
                 "outcome": outcome,
@@ -263,6 +317,7 @@ class LiveTrader:
                 "side": side,
                 "btc_price": btc_chainlink_price,
                 "ref_price": ref,
+                "strategy_used": info.get("strategy_used", "chainlink_arb"),
             })
 
         return resolved

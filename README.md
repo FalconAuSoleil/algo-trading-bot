@@ -1,126 +1,134 @@
-# BTC Sniper — Microstructure Bayesian Strategy
+# BTC Sniper v3 — Multi-Strategy Polymarket Bot
 
-Bot de trading automatisé pour les marchés **BTC Up/Down 5min et 15min** sur [Polymarket](https://polymarket.com).
+A high-frequency algorithmic trading bot for Polymarket BTC Up/Down binary markets (5-minute and 15-minute windows).
 
-## Stratégie
+---
 
-Ce bot utilise une approche **bayésienne microstructure** qui combine 4 signaux indépendants dans l'espace logit pour calculer la probabilité réelle que le BTC finisse au-dessus ou en-dessous du prix de référence ("price to beat") Chainlink.
-
-### Les 4 composantes
-
-#### 1. Chainlink Lag Arbitrage
-Chainlink met à jour son prix on-chain toutes les ~27 secondes sur Polygon. Dans les secondes précédant un update, le prix Binance (temps réel) prédit le prochain prix Chainlink — créant une fenêtre d'edge exploitable.
-
-- Estimation dynamique de la période d'update via moyenne pondérée
-- Edge proportionnel au gap Binance-Chainlink × proximité du prochain update
-- Fenêtre d'edge : 8 secondes avant l'update estimé
-
-#### 2. Order Flow Imbalance (OFI)
-Basé sur le modèle de **Cont, Kukanov & Stoikov (2014)**. L'asymétrie du carnet d'ordres Polymarket révèle la pression d'achat/vente.
-
-- OFI net = différence normalisée entre bids et asks des deux côtés
-- Depth imbalance : ratio de profondeur UP vs DOWN
-- Momentum OFI : taux de changement sur les 10 derniers snapshots
-- Conversion en ajustement logit borné \[-0.8, +0.8\]
-
-#### 3. Kyle Lambda — Price Impact Filter
-Modèle de **Kyle (1985)** : le spread révèle l'information privée des market makers.
-
-- λ = spread / (2 × √depth) — mesure l'impact prix
-- Si λ est élevé → market makers incertains → signal peu fiable → pénalité
-- Quality factor ∈ \[0.3, 1.0\] agit comme shrinkage vers 0.5 dans l'espace logit
-
-#### 4. Hawkes Process — Regime Detection
-Processus auto-excitateur de **Hawkes (1971)** : les mouvements de prix arrivent en clusters.
-
-- Intensité conditionnelle : λ(t) = μ + Σ α·m·exp(-β·(t - tᵢ))
-- Détecte les régimes de forte activité (marché en train de pricer une info)
-- Boost de confiance ∈ \[0, 0.3\] qui amplifie le signal existant
-
-### Combinaison bayésienne
-
-Tous les signaux sont combinés dans l'**espace logit** (log-odds) :
+## Architecture overview
 
 ```
-logit(P) = logit(prior)           ← delta prix Chainlink + momentum
-         + chainlink_boost        ← lag arbitrage
-         + OFI_adjustment         ← order flow
-         × kyle_quality           ← filtre de fiabilité
-         × (1 + hawkes_boost)     ← amplification régime actif
+Binance WebSocket  →  BinanceFeed
+Chainlink (Polygon) →  ChainlinkFeed      →  SignalEngine (Multi-Strategy)
+Polymarket CLOB    →  PolymarketFeed                  ↓
+                                          StrategyRouter
+                                    ┌─────┴─────────────┐
+                              ChainlinkArb  Momentum  MeanReversion
+                                    └─────┬─────────────┘
+                                          ↓
+                              PaperTrader / LiveTrader
+                                          ↓
+                              Portfolio → SQLite DB → Dashboard
 ```
 
-### Filtre de stabilité
+---
 
-Un signal n'est validé que si :
-- **Direction ratio ≥ 65%** : au moins 65% des ticks récents pointent dans la même direction
-- **Edge CV ≤ 0.80** : coefficient de variation de l'edge suffisamment faible
-- **Minimum 3 ticks** accumulés dans la fenêtre de 60 secondes
+## Strategies
 
-### Sizing (Kelly fractionnel)
+### 1. ChainlinkArb (primary)
+Exploits the lag between Chainlink on-chain oracle updates (~27s) and real-time Binance price. When Binance has moved but Chainlink hasn’t updated yet, we bet in the direction Chainlink will move. Enhanced by:
+- **OFI** (Order Flow Imbalance): detects directional pressure in the orderbook
+- **Kyle λ**: penalises high-spread / low-liquidity markets
+- **Hawkes process**: boosts signal during microstructure activity bursts
+- **Stability filter**: only bet when signal has been consistent for ≥3 ticks
 
-- Quarter-Kelly avec cap à 4% de bankroll
-- Réduction ×0.7 en régime calme (Hawkes < 1.5×μ)
-- Bonus de taille si signal très stable (ratio élevé)
+### 2. PriceMomentum (secondary)
+Bets in the direction of sustained BTC price momentum. Requires consistent momentum over both 60s and 120s windows AND alignment with the current market delta. Conservative sizing (half of ChainlinkArb cap).
 
-## Architecture
+### 3. MeanReversion (contrarian)
+Fades extreme delta moves (>0.20%). When BTC has moved far from the reference price, the market tends to overprice continuation. Contrarian bet with conservative sizing. Deactivates during losing streaks (≥2 consecutive losses).
 
-```
-main.py                    ← Orchestrateur principal
-src/
-├── config.py              ← Configuration + hyperparamètres .env
-├── engine/
-│   └── signal.py          ← Signal Engine v2 (4 modules microstructure)
-├── feeds/
-│   ├── binance.py         ← WebSocket BTC/USDT temps réel
-│   ├── chainlink.py       ← RPC Polygon + RTDS + Binance fallback
-│   └── polymarket.py      ← Découverte marchés + orderbook + résolution
-├── trading/
-│   ├── portfolio.py       ← Gestion du portefeuille
-│   ├── paper.py           ← Paper trading (simulation)
-│   └── live.py            ← Live trading (CLOB API)
-├── dashboard/
-│   ├── app.py             ← FastAPI + WebSocket dashboard
-│   └── templates/
-│       └── index.html     ← UI temps réel
-└── utils/
-    ├── logger.py          ← Logging Rich
-    ├── db.py              ← SQLite async
-    └── math_utils.py      ← Fonctions mathématiques
-```
+### Consensus routing
+When 2 or more strategies agree on the same direction, the bet receives a **+25% size boost per additional strategy** (capped at 1.5x). Conflicting signals are skipped unless one side has a >50% better weighted score.
 
-## Installation
+### Performance weighting
+Each strategy tracks its rolling win rate (last 30 trades). The router weights each signal by `0.5 + win_rate`, so strategies that are working get more influence.
 
+---
+
+## Setup
+
+### 1. Install dependencies
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
-# Ajuster les paramètres dans .env
-python main.py
 ```
 
-## Modes
-
+### 2. Configure environment
 ```bash
-# Paper trading (par défaut)
-python main.py --mode paper --balance 10000
-
-# Live trading (nécessite clés API Polymarket)
-python main.py --mode live
-
-# Dashboard accessible sur http://localhost:8080
+cp .env.example .env
+# Edit .env with your credentials
 ```
 
-## Sources de prix
+**Required for live trading:**
+```env
+POLYMARKET_PRIVATE_KEY=0x...     # Polygon wallet private key
+POLYMARKET_WALLET_ADDRESS=0x...  # Polygon wallet address
 
-1. **Chainlink RPC Polygon** (source principale) : poll `latestRoundData()` toutes les 3s avec rotation sur 3 endpoints
-2. **RTDS Polymarket** (bonus) : stream WebSocket push pour prix inter-ticks
-3. **Binance WebSocket** : prix temps réel pour le momentum et cross-ref
-4. **Binance REST** (fallback) : si RPC et RTDS sont down
+# Optional: pre-configured API credentials (else derived from private key)
+POLYMARKET_API_KEY=...
+POLYMARKET_API_SECRET=...
+POLYMARKET_API_PASSPHRASE=...
+```
 
-## Risk Management
+### 3. Run in paper mode (default)
+```bash
+python main.py
+python main.py --mode paper --balance 100
+```
 
-- **Stop-loss journalier** : -15% de drawdown max
-- **Circuit breaker** : pause après 3 pertes consécutives
-- **Max positions** : 3 simultanées
-- **Kelly fractionnel** : quarter-Kelly avec cap à 4%
-- **Guards liquidité** : $15 minimum de profondeur
-- **Guards payout** : prix marché entre 20¢ et 80¢ (évite longshots et mauvais odds)
+### 4. Run in live mode
+```bash
+python main.py --mode live
+```
+
+### 5. Open dashboard
+Visit `http://localhost:8080` after starting.
+
+---
+
+## Key parameters (`.env`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `EDGE_MIN` | `0.06` | Minimum edge (P_true − entry − fee) to place a bet |
+| `MAX_BET_FRACTION` | `0.04` | Max Kelly fraction per bet (4% of bankroll) |
+| `SOURCE_COHERENCE_MAX` | `0.003` | Max Binance–Chainlink divergence before skipping (0.3%) |
+| `STABILITY_MIN_SAMPLES` | `3` | Min ticks of consistent signal before betting |
+| `MAX_CONSECUTIVE_LOSSES` | `4` | Circuit breaker: pause after N losses in a row |
+| `MOMENTUM_MIN_THRESHOLD` | `0.0008` | Min BTC move (0.08%) to activate Momentum strategy |
+| `MEAN_REV_DELTA_THRESHOLD` | `0.002` | Min delta (0.20%) to activate MeanReversion strategy |
+
+---
+
+## Files
+
+```
+main.py                      Orchestrator
+src/
+  config.py                  All configuration
+  feeds/
+    binance.py               BTC real-time price (WebSocket)
+    chainlink.py             On-chain Chainlink oracle (Polygon)
+    polymarket.py            Market discovery + orderbook polling
+  engine/
+    signal.py                Multi-strategy engine + router
+    performance.py           Per-strategy rolling win rate
+    trend.py                 Market outcome ring buffer
+  trading/
+    portfolio.py             Capital + position tracking
+    paper.py                 Paper trading (simulation)
+    live.py                  Live trading (py-clob-client)
+  utils/
+    db.py                    SQLite persistence
+    logger.py                Logging setup
+  dashboard/
+    app.py                   FastAPI dashboard
+```
+
+---
+
+## Bug fixes in v3
+
+- **`live.py` token ID**: was sending `conditionId` as the CLOB `tokenID`, which caused all orders to be rejected. Now uses the correct YES/NO outcome token IDs from `MarketInfo`.
+- **`live.py` auth**: incomplete header-based auth replaced with proper `py-clob-client` EIP-712 signing.
+- **`source_coherence_max`**: raised from `0.0008` to `0.003`. The previous value (0.08%) was triggering on any minor Binance–Chainlink discrepancy during volatile periods, silently killing most signals.
+- **`stability_min_samples`**: reduced from `5` to `3` to allow faster signal confirmation within the short betting windows.

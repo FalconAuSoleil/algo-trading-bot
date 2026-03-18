@@ -1,7 +1,7 @@
-"""BTC Sniper - Main orchestrator.
+"""BTC Sniper v3 - Multi-Strategy Orchestrator.
 
-Coordinates all components: feeds, signal engine, trading, and dashboard.
-Uses microstructure bayesian strategy for signal generation.
+Coordinates all components: feeds, multi-strategy signal engine,
+trading, trend tracking, and dashboard.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from src.feeds.binance import BinanceFeed
 from src.feeds.chainlink import ChainlinkFeed
 from src.feeds.polymarket import PolymarketFeed, MarketInfo
 from src.engine.signal import SignalEngine, MarketState, Signal
+from src.engine.trend import market_trend          # module-level singleton
 from src.trading.portfolio import Portfolio
 from src.trading.paper import PaperTrader
 from src.trading.live import LiveTrader
@@ -42,8 +43,6 @@ class Orchestrator:
             url=config.binance.ws_url,
             on_price=self._on_price,
         )
-        # Direct on-chain Chainlink oracle (no RTDS WebSocket)
-        # This reads the EXACT same contract Polymarket uses to resolve
         self.chainlink_feed = ChainlinkFeed(
             on_price=self._on_price,
         )
@@ -55,7 +54,7 @@ class Orchestrator:
             on_orderbook_update=self._on_orderbook_update,
         )
 
-        # Signal engine - microstructure bayesian
+        # Multi-strategy signal engine
         self.signal_engine = SignalEngine(config.signal)
 
         # Portfolio + Trader
@@ -70,7 +69,7 @@ class Orchestrator:
                 self.portfolio, self.db, config.polymarket
             )
 
-        # State
+        # Internal state
         self._btc_binance: float = 0.0
         self._btc_chainlink: float = 0.0
         self._active_markets: dict[str, MarketInfo] = {}
@@ -78,13 +77,16 @@ class Orchestrator:
         self._running = False
         self._snapshot_interval = 60
 
+        # Maps trade_id → strategy_used, for record_result() after resolution
+        self._strategy_by_trade: dict[int, str] = {}
+
     async def start(self) -> None:
         log.info("=" * 60)
-        log.info("  BTC SNIPER - Microstructure Bayesian Strategy")
+        log.info("  BTC SNIPER v3 - Multi-Strategy Engine")
+        log.info("  Strategies: ChainlinkArb | Momentum | MeanReversion")
         log.info("  Mode: %s", config.trading_mode.upper())
         log.info("  Capital: $%.2f", config.paper_initial_balance)
         log.info("  Chainlink: DIRECT on-chain oracle (Polygon)")
-        log.info("  Resolution: Polymarket API only (no BTC fallback)")
         log.info("=" * 60)
 
         Path("data").mkdir(exist_ok=True)
@@ -112,7 +114,6 @@ class Orchestrator:
             asyncio.create_task(self._dashboard_server(), name="dashboard"),
         ]
 
-        # Signal handlers only work on Unix, skip on Windows
         if sys.platform != "win32":
             import signal
             loop = asyncio.get_event_loop()
@@ -146,7 +147,7 @@ class Orchestrator:
             if task is not asyncio.current_task():
                 task.cancel()
 
-    # ==================== Price callbacks ====================
+    # ── Price callbacks ────────────────────────────────────────────────
 
     async def _on_price(self, source: str, price: float, timestamp: float) -> None:
         if source == "binance":
@@ -173,14 +174,14 @@ class Orchestrator:
     async def _on_orderbook_update(self, cid: str, ob) -> None:
         self._orderbooks[cid] = ob
 
-    # ==================== Core loops ====================
+    # ── Core loops ────────────────────────────────────────────────────────
 
     async def _signal_loop(self) -> None:
         while self._running:
             try:
                 await self._evaluate_markets()
-            except Exception as e:
-                log.error("[Signal] Loop error: %s", e, exc_info=True)
+            except Exception as exc:
+                log.error("[Signal] Loop error: %s", exc, exc_info=True)
             await asyncio.sleep(2)
 
     async def _evaluate_markets(self) -> None:
@@ -190,8 +191,6 @@ class Orchestrator:
             return
 
         consecutive_losses = await self.db.get_consecutive_losses(config.trading_mode)
-
-        # Snapshot to avoid RuntimeError: dictionary changed size
         markets_snapshot = list(self._active_markets.items())
 
         for cid, market in markets_snapshot:
@@ -230,13 +229,20 @@ class Orchestrator:
                 open_positions=self.portfolio.open_position_count,
                 has_position_on_market=self.portfolio.has_position_on_market(cid),
             )
+
+            # Populate market-level metadata
             sig.slug = market.slug
             sig.market_start_time = market.start_time
             sig.market_duration = market.duration_seconds
 
+            # Populate outcome token IDs for live trader
+            # (BUGFIX: previously conditionId was used as tokenID)
+            sig.token_id_yes = market.token_id_up
+            sig.token_id_no = market.token_id_down
+
             filters = ",".join(sig.filter_reasons) if sig.filter_reasons else "ALL_PASS"
             log.info(
-                "[Signal] %s T-%ds d=%.3f%% P=%.2f edge=%.3f -> %s [%s] | %s",
+                "[Signal] %s T-%ds d=%.3f%% P=%.2f edge=%.3f -> %s [%s] | %s | strategy=%s",
                 market.slug[-14:],
                 int(sig.time_remaining_sec),
                 sig.delta_chainlink * 100,
@@ -245,6 +251,7 @@ class Orchestrator:
                 sig.action,
                 filters,
                 sig.status,
+                sig.strategy_used,
             )
 
             await self.db.insert_signal({
@@ -287,6 +294,8 @@ class Orchestrator:
                 "filter_reasons": sig.filter_reasons,
                 "status": sig.status,
                 "confidence": sig.confidence,
+                "strategy_used": sig.strategy_used,
+                "strategies_agreeing": sig.strategies_agreeing,
                 "micro": {
                     "chainlink_boost": round(sig.micro.chainlink_edge_boost, 4),
                     "ofi": round(sig.micro.ofi_raw, 4),
@@ -303,10 +312,15 @@ class Orchestrator:
             if sig.action == "BUY":
                 trade_id = await self.trader.execute(sig)
                 if trade_id:
+                    # Track which strategy fired this trade
+                    self._strategy_by_trade[trade_id] = sig.strategy_used
+
                     full = await self.db.get_trade(trade_id)
                     if full:
                         await dashboard_state.update_trade(full)
-                    await dashboard_state.update_portfolio(self.portfolio.get_stats())
+                    await dashboard_state.update_portfolio(
+                        self.portfolio.get_stats()
+                    )
                     self.signal_engine.reset_market_stability(market.slug)
 
         await dashboard_state.update_portfolio(self.portfolio.get_stats())
@@ -320,14 +334,48 @@ class Orchestrator:
                         fetch_outcome=self.polymarket_feed.fetch_market_outcome,
                     )
                     for r in resolved:
-                        full = await self.db.get_trade(r["trade_id"])
+                        trade_id = r["trade_id"]
+                        outcome = r["outcome"]   # "won" or "lost"
+                        side = r["side"]          # "YES" or "NO"
+                        won = outcome == "won"
+
+                        # Update per-strategy performance tracker
+                        strategy = self._strategy_by_trade.pop(
+                            trade_id, r.get("strategy_used", "chainlink_arb")
+                        )
+                        self.signal_engine.record_result(strategy, won)
+
+                        # Update market trend tracker
+                        # YES bet won  → BTC ended ABOVE ref → market went UP
+                        # YES bet lost → BTC ended BELOW ref → market went DOWN
+                        # NO bet won   → BTC ended BELOW ref → market went DOWN
+                        # NO bet lost  → BTC ended ABOVE ref → market went UP
+                        if side == "YES":
+                            market_direction = "up" if won else "down"
+                        else:
+                            market_direction = "down" if won else "up"
+                        try:
+                            market_trend.record(market_direction)
+                        except Exception:
+                            pass
+
+                        log.info(
+                            "[Resolution] trade=%d strategy=%s won=%s "
+                            "trend_direction=%s | pnl=$%.2f",
+                            trade_id, strategy, won,
+                            market_direction, r["pnl"],
+                        )
+
+                        full = await self.db.get_trade(trade_id)
                         if full:
                             await dashboard_state.update_trade(full)
                         else:
                             await dashboard_state.update_trade(r)
-                        await dashboard_state.update_portfolio(self.portfolio.get_stats())
-            except Exception as e:
-                log.error("[Resolution] Loop error: %s", e)
+                        await dashboard_state.update_portfolio(
+                            self.portfolio.get_stats()
+                        )
+            except Exception as exc:
+                log.error("[Resolution] Loop error: %s", exc)
             await asyncio.sleep(3)
 
     async def _snapshot_loop(self) -> None:
@@ -344,8 +392,8 @@ class Orchestrator:
                 total_pnl=self.portfolio.total_pnl,
                 mode=config.trading_mode,
             )
-        except Exception as e:
-            log.error("[Snapshot] Error: %s", e)
+        except Exception as exc:
+            log.error("[Snapshot] Error: %s", exc)
 
     async def _dashboard_server(self) -> None:
         server_config = uvicorn.Config(
@@ -361,7 +409,9 @@ class Orchestrator:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="BTC Sniper - Microstructure Bayesian Strategy")
+    parser = argparse.ArgumentParser(
+        description="BTC Sniper v3 - Multi-Strategy Engine"
+    )
     parser.add_argument("--mode", choices=["paper", "live", "collect"], default=None)
     parser.add_argument("--balance", type=float, default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -378,7 +428,6 @@ def main():
 
     orchestrator = Orchestrator()
 
-    # Windows compatibility
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
