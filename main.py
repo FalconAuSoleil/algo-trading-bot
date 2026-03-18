@@ -359,6 +359,21 @@ class Orchestrator:
                         except Exception:
                             pass
 
+                        # Cross-market propagation: notify booster if this was
+                        # a 5-minute market. The booster will then apply a
+                        # decaying confidence boost to 15m bets for 45 seconds.
+                        if r.get("duration", 300) == 300:
+                            try:
+                                self.signal_engine.record_5m_resolution(
+                                    chainlink_price=r["btc_price"],
+                                    reference_price=r["ref_price"],
+                                    direction=market_direction,
+                                )
+                            except Exception as exc:
+                                log.debug(
+                                    "[CrossMarket] record error: %s", exc
+                                )
+
                         log.info(
                             "[Resolution] trade=%d strategy=%s won=%s "
                             "trend_direction=%s | pnl=$%.2f",

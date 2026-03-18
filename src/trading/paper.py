@@ -93,6 +93,7 @@ class PaperTrader:
             "reference_price": signal.reference_price,
             "start_time": signal.market_start_time,
             "duration": signal.market_duration,
+            "slug": signal.slug,
             # Stored here as a crash-safe fallback.
             # main.py's _strategy_by_trade is the primary source.
             "strategy_used": signal.strategy_used,
@@ -187,6 +188,8 @@ class PaperTrader:
                 "side": side,
                 "btc_price": btc_chainlink_price,
                 "ref_price": info["reference_price"],
+                "slug": info.get("slug", ""),
+                "duration": info.get("duration", 300),
                 # Consistent with live.py — enables accurate feedback
                 # to PerformanceTracker even after crash/restart
                 "strategy_used": info.get("strategy_used", "chainlink_arb"),

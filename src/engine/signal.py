@@ -1,5 +1,12 @@
-"""Signal Engine v3.2 - Multi-Strategy Router + Diffusion Risk Model
+"""Signal Engine v3.3 - Multi-Strategy Router + Diffusion Risk Model
 ======================================================================
+
+v3.3 addition (cross-market propagation exploit):
+  After a 5m BTC market resolves, Polymarket takes 12-45 seconds to
+  reprice correlated 15m markets (QR-PM-2026-0041 §6 empirical finding).
+  CrossMarketBooster tracks 5m closes and adds an additive p_true boost
+  (up to +5%) to 15m bets during this window. Boost decays linearly
+  from MAX_BOOST at t=0 to 0 at t=45s. Direction agreement required.
 
 v3.2 fixes (post warroom — small-delta crash):
   A trade with delta=0.039% at T-177s passed the v3.1 filters by 0.001%
@@ -46,6 +53,7 @@ from typing import List, Optional
 
 from src.config import SignalConfig
 from src.engine.performance import PerformanceTracker
+from src.engine.cross_market import CrossMarketBooster
 from src.utils.logger import setup_logger
 
 log = setup_logger("engine.signal")
@@ -996,6 +1004,7 @@ class SignalEngine:
         self._mom = _MomentumEngine(cfg)
         self._rev = _MeanReversionEngine(cfg)
         self.perf = PerformanceTracker(window=30)
+        self.cross_market = CrossMarketBooster()
 
     def update_price(self, p: float, ts: float) -> None:
         self._cl.update_price(p, ts)
@@ -1009,6 +1018,21 @@ class SignalEngine:
 
     def record_result(self, strategy: str, won: bool) -> None:
         self.perf.record(strategy, won)
+
+    def record_5m_resolution(
+        self, chainlink_price: float, reference_price: float, direction: str
+    ) -> None:
+        """Notify the cross-market booster of a resolved 5m market.
+
+        Called by main.py _resolution_loop after each 5-minute market
+        resolves. The booster will apply an additive confidence boost
+        to 15m market bets for the next 45 seconds.
+        """
+        self.cross_market.record_5m_close(
+            chainlink_price=chainlink_price,
+            reference_price_5m=reference_price,
+            direction=direction,
+        )
 
     def evaluate(
         self,
@@ -1091,5 +1115,28 @@ class SignalEngine:
                 "[CONSENSUS] %d strategies agree %s | boost=%.2fx | $%.2f",
                 agreeing, best.side, boost, best.size_usd,
             )
+
+        # ── Cross-market propagation boost (QR-PM-2026-0041 §6) ──────────────
+        # After a 5m market resolves, the 15m market takes 12-45 seconds to
+        # reprice. During this window, add an additive confidence boost to the
+        # 15m bet's p_true, decaying linearly from +5% to 0 over 45 seconds.
+        if best.filters_passed and best.action == "BUY":
+            is_15m = (
+                state.duration_seconds >= 900
+                or "15m" in (state.slug or "")
+            )
+            if is_15m:
+                cm_boost = self.cross_market.get_boost(
+                    best.side, state.btc_chainlink, state.reference_price
+                )
+                if cm_boost > 0:
+                    best.p_true = min(best.p_true + cm_boost, 0.97)
+                    best.edge = best.p_true - best.entry_price - best.taker_fee
+                    log.info(
+                        "[CrossMarket] 15m boost +%.1f%% → p_true=%.1f%% "
+                        "edge=%.1f%% | %s %s",
+                        cm_boost * 100, best.p_true * 100, best.edge * 100,
+                        best.side, state.slug or state.market_id[:14],
+                    )
 
         return _base_info(best)

@@ -237,6 +237,7 @@ class LiveTrader:
                     "reference_price": signal.reference_price,
                     "start_time": signal.market_start_time,
                     "duration": signal.market_duration,
+                    "slug": signal.slug,
                     "strategy_used": signal.strategy_used,
                 }
                 return trade_id
@@ -317,6 +318,8 @@ class LiveTrader:
                 "side": side,
                 "btc_price": btc_chainlink_price,
                 "ref_price": ref,
+                "slug": info.get("slug", ""),
+                "duration": info.get("duration", 300),
                 "strategy_used": info.get("strategy_used", "chainlink_arb"),
             })
 
