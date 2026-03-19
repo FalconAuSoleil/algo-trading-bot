@@ -1,5 +1,20 @@
-"""Signal Engine v3.3 - Multi-Strategy Router + Diffusion Risk Model
+"""Signal Engine v3.4 - Multi-Strategy Router + Diffusion Risk Model
 ======================================================================
+
+v3.4 fix (diffusion filter bypass closure):
+  DELTA_WEAK was gated by `t_rem > 90`, creating a dead zone between
+  T=45s and T=90s where delta < σ√t bets could slip through. Confirmed
+  culprit in the 21:59:05 losing trade (T=54s, delta=0.185% < σ√t=0.213%).
+  The bet passed only because the bypass silenced the filter.
+
+  Fix 1: `t_rem > 90` → `t_rem > 45` (= time_min_5m)
+    Diffusion filter now active for the entire valid betting window.
+  Fix 2: `t_rem > 60` → `t_rem > 30` (absolute floor bypass)
+    Same closure for the hard absolute floor guard.
+
+  Both thresholds now track time_min so there is no dead zone between
+  "filter active" and "TOO_LATE". A signal that is too weak at T=46s
+  is still too weak at T=54s.
 
 v3.3 addition (cross-market propagation exploit):
   After a 5m BTC market resolves, Polymarket takes 12-45 seconds to
@@ -12,33 +27,17 @@ v3.2 fixes (post warroom — small-delta crash):
   A trade with delta=0.039% at T-177s passed the v3.1 filters by 0.001%
   margin and lost when BTC crashed $91 in 177 seconds. Three fixes applied:
 
-  1. Sigma floor raised to _SIGMA_FALLBACK:
-     _realized_vol_per_sec() now returns at least the conservative fallback.
-     A quiet-market period can no longer drive sigma 5× below baseline,
-     which was shrinking min_viable_delta and creating false confidence.
-
-  2. min_viable_delta multiplier: 0.50σ√t → 1.0σ√t:
-     Delta must exceed one full standard deviation of residual BTC movement
-     to be considered actionable. 0.5σ was too permissive.
-
-  3. Hard absolute delta floor (config.delta_min_abs, default 0.10%):
-     Model-independent guard. Never bet when |delta| < 0.10% ($74 at $74k).
-     Catches any scenario where vol model underestimates future volatility.
+  1. Sigma floor raised to _SIGMA_FALLBACK.
+  2. min_viable_delta multiplier: 0.50σ√t → 1.0σ√t.
+  3. Hard absolute delta floor (config.delta_min_abs, default 0.10%).
 
 v3.1 fixes (warroom session):
-  The bot was betting 4+ minutes before market close with a small delta.
-  BTC has enough time to cross back over the reference price, causing losses.
-  Fix: integrate a Brownian-motion diffusion model into every p_true estimate.
+  Integrated Brownian-motion diffusion model into every p_true estimate.
 
 Three independent strategies:
   1. ChainlinkArb  — Bayesian oracle lag + OFI + Kyle + Hawkes (primary)
   2. PriceMomentum — Sustained BTC price trend (60s + 120s windows)
   3. MeanReversion — Contrarian fade of extreme delta moves
-
-All three now use:
-  p_diffusion = N(|delta| / (sigma_per_sec * sqrt(time_remaining)))
-  which is the probability that BTC stays on the correct side until expiry
-  modeled as standard Brownian motion.
 
 Routing: consensus boost, conflict detection, performance weighting.
 """
@@ -347,6 +346,8 @@ class _ChainlinkArbEngine:
     p_true is then a time-weighted blend of Bayesian and diffusion estimates.
 
     v3.2 addition: sigma floor + raised min_viable_delta multiplier + abs delta floor.
+
+    v3.4 fix: diffusion filter bypass closed (t_rem > 90 → t_rem > 45).
     """
     NAME = "chainlink_arb"
 
@@ -510,20 +511,19 @@ class _ChainlinkArbEngine:
 
         pd = sig.delta_chainlink
 
-        # ── DIFFUSION RISK CHECK (v3.1/v3.2) ──────────────────────────────
-        # Gate 1: sigma-relative floor (1.0σ√t, raised from 0.5σ√t in v3.2)
+        # ── DIFFUSION RISK CHECK (v3.1/v3.2/v3.4) ────────────────────────
+        # Gate 1: sigma-relative floor (1.0σ√t)
         sigma_ps = self._realized_vol_per_sec()
         t_rem = sig.time_remaining_sec
 
-        # v3.2: multiplier raised 0.50 → 1.0.
-        # Delta must exceed one full standard deviation of BTC residual movement.
-        # At 0.5σ the filter was too permissive: BTC only needed a half-sigma
-        # move against us to invalidate the bet.
         min_viable_delta = 1.0 * sigma_ps * math.sqrt(max(t_rem, 1))
         micro.realized_sigma_pct = round(sigma_ps * math.sqrt(300) * 100, 4)
         micro.min_viable_delta_pct = round(min_viable_delta * 100, 4)
 
-        if abs(pd) < min_viable_delta and t_rem > 90:
+        # v3.4: threshold lowered 90s → 45s (= time_min_5m).
+        # Previously the filter was silenced at T<90s, allowing bets where
+        # delta < σ√t to pass unchecked. Now active for the full valid window.
+        if abs(pd) < min_viable_delta and t_rem > 45:
             sig.filter_reasons.append(
                 f"delta_weak:{abs(pd)*100:.3f}%<{min_viable_delta*100:.3f}%"
             )
@@ -533,12 +533,10 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
 
-        # Gate 2: v3.2 — hard absolute floor on delta.
-        # Completely model-independent: never bet when BTC gap is trivially small
-        # regardless of what the vol estimator thinks.
-        # Default 0.10% = $74 on a $74k BTC. Override via DELTA_MIN_ABS env var.
+        # Gate 2: hard absolute floor on delta.
+        # v3.4: threshold lowered 60s → 30s for same reason.
         delta_abs_floor = getattr(cfg, "delta_min_abs", 0.0010)
-        if abs(pd) < delta_abs_floor and t_rem > 60:
+        if abs(pd) < delta_abs_floor and t_rem > 30:
             sig.filter_reasons.append(
                 f"delta_abs:{abs(pd)*100:.3f}%<{delta_abs_floor*100:.3f}%"
             )
