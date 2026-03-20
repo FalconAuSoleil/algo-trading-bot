@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS trades (
     p_market REAL NOT NULL,
     edge REAL NOT NULL,
     time_remaining_sec REAL NOT NULL,
+    oracle_age_sec REAL DEFAULT 0.0,
     outcome TEXT DEFAULT 'pending',
     pnl REAL DEFAULT 0.0,
     mode TEXT NOT NULL DEFAULT 'paper',
@@ -56,7 +57,8 @@ CREATE TABLE IF NOT EXISTS signals (
     edge REAL,
     filters_passed INTEGER,
     filter_details TEXT,
-    action TEXT
+    action TEXT,
+    oracle_age_sec REAL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
@@ -80,6 +82,7 @@ class TradeRecord:
     p_market: float
     edge: float
     time_remaining_sec: float
+    oracle_age_sec: float = 0.0  # seconds since last Chainlink update at bet (v3.5)
     mode: str = "paper"
     timestamp: float = 0.0
     outcome: str = "pending"
@@ -105,6 +108,19 @@ class Database:
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+
+        # v3.5 migration: add oracle_age_sec to existing tables.
+        # CREATE TABLE IF NOT EXISTS does not add new columns to existing
+        # tables, so we ALTER TABLE here. Safe to run on every startup.
+        for _tbl in ("trades", "signals"):
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE {_tbl} "
+                    f"ADD COLUMN oracle_age_sec REAL DEFAULT 0.0"
+                )
+                await self._db.commit()
+            except Exception:
+                pass  # column already exists — safe to ignore
 
     async def close(self) -> None:
         if self._db:
