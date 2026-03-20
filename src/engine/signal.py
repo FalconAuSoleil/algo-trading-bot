@@ -1,5 +1,18 @@
-"""Signal Engine v3.4 - Multi-Strategy Router + Diffusion Risk Model
+"""Signal Engine v3.5 - Multi-Strategy Router + Diffusion Risk Model
 ======================================================================
+
+v3.5 addition (oracle freshness filter):
+  Chainlink oracle resolution uses the last on-chain update BEFORE
+  market expiry, not the real-time BTC price at that timestamp.
+  If Chainlink has been silent for >55s when T_remaining < 90s,
+  the final resolution price may capture a temporary dip/spike that
+  occurred before BTC recovered. Three confirmed losses had oracle
+  silence of 60-170s at bet time (19:03, 02:29, 21:59).
+
+  Fix: ORACLE_STALE filter — if (now - last_cl_update) > 55s AND
+  T_remaining < 90s, bet is blocked. Threshold configurable via
+  ORACLE_FRESHNESS_MAX_AGE_SEC env var (set to 0.0 to disable).
+  oracle_age_sec added to MicrostructureState, Signal, and trade DB.
 
 v3.4 fix (diffusion filter bypass closure):
   DELTA_WEAK was gated by `t_rem > 90`, creating a dead zone between
@@ -58,7 +71,7 @@ from src.utils.logger import setup_logger
 log = setup_logger("engine.signal")
 
 
-# ── Maths helpers ─────────────────────────────────────────────────────────────
+# ── Maths helpers ───────────────────────────────────────────────────────────────────────
 
 def sigmoid(x: float) -> float:
     if x >= 0:
@@ -128,7 +141,7 @@ def p_brownian(
     return 0.5 * (1.0 + _erf_approx(z / 1.41421356237))
 
 
-# ── Data structures ──────────────────────────────────────────────────────────
+# ── Data structures ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class MarketState:
@@ -175,6 +188,8 @@ class MicrostructureState:
     p_diffusion: float = 0.5
     realized_sigma_pct: float = 0.0   # annualised-equivalent sigma in % per sec
     min_viable_delta_pct: float = 0.0  # minimum |delta|% to pass diffusion filter
+    # v3.5: oracle freshness diagnostic
+    oracle_age_sec: float = 0.0        # seconds since last Chainlink update
     components: dict = field(default_factory=dict)
 
 
@@ -210,9 +225,10 @@ class Signal:
     strategies_agreeing: int = 1
     token_id_yes: str = ""
     token_id_no: str = ""
+    oracle_age_sec: float = 0.0        # seconds since last Chainlink update at bet (v3.5)
 
 
-# ── Microstructure sub-modules ──────────────────────────────────────────────────
+# ── Microstructure sub-modules ────────────────────────────────────────────────────────
 
 class _OFI:
     def __init__(self, w):
@@ -326,7 +342,7 @@ class _Stability:
         self._h.pop(s, None)
 
 
-# ── Strategy 1: Chainlink Arb + Diffusion Model ────────────────────────────────
+# ── Strategy 1: Chainlink Arb + Diffusion Model ────────────────────────────────────────────
 
 # Conservative fallback: 0.5% per 5 minutes = sqrt(0.005^2 / 300) per second
 _SIGMA_FALLBACK = 0.005 / math.sqrt(300)  # ~2.89e-4
@@ -348,6 +364,8 @@ class _ChainlinkArbEngine:
     v3.2 addition: sigma floor + raised min_viable_delta multiplier + abs delta floor.
 
     v3.4 fix: diffusion filter bypass closed (t_rem > 90 → t_rem > 45).
+
+    v3.5 addition: oracle freshness filter (oracle_age > 55s AND t_rem < 90s).
     """
     NAME = "chainlink_arb"
 
@@ -500,6 +518,26 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
 
+        # v3.5: Oracle freshness filter ───────────────────────────────────────────────
+        # Block late bets when Chainlink has been silent too long.
+        # Resolution uses the last oracle update BEFORE expiry; a stale oracle
+        # can capture a temporary dip/spike before BTC recovered, causing a
+        # loss even when BTC is on the correct side at the actual expiry time.
+        # Confirmed mechanism: 3 losses had oracle silence 60-170s at bet time.
+        oracle_age = (now - self._cl_ts) if self._cl_ts > 0 else 0.0
+        micro.oracle_age_sec = round(oracle_age, 1)
+        if (
+            cfg.oracle_freshness_max_age_sec > 0
+            and sig.time_remaining_sec < 90.0
+            and self._cl_ts > 0
+            and oracle_age > cfg.oracle_freshness_max_age_sec
+        ):
+            sig.filter_reasons.append(f"oracle_stale:{oracle_age:.0f}s")
+            sig.status = f"ORACLE_STALE ({oracle_age:.0f}s)"
+            sig.oracle_age_sec = round(oracle_age, 1)
+            sig.micro = micro
+            return sig
+
         accum = sig.time_remaining_sec > max_t
         tr = max_t - min_t
         tdf = (
@@ -511,7 +549,7 @@ class _ChainlinkArbEngine:
 
         pd = sig.delta_chainlink
 
-        # ── DIFFUSION RISK CHECK (v3.1/v3.2/v3.4) ────────────────────────
+        # ── DIFFUSION RISK CHECK (v3.1/v3.2/v3.4) ────────────────────────────────────
         # Gate 1: sigma-relative floor (1.0σ√t)
         sigma_ps = self._realized_vol_per_sec()
         t_rem = sig.time_remaining_sec
@@ -544,7 +582,7 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
 
-        # ── Bayesian pipeline ────────────────────────────────────────────
+        # ── Bayesian pipeline ────────────────────────────────────────────────────────────────
         z = cfg.momentum_factor * pd + 0.2 * self._momentum(15)
         pp = sigmoid(z)
         micro.base_prob_up = pp
@@ -581,7 +619,7 @@ class _ChainlinkArbEngine:
         pdn = 1 - pu
         micro.final_prob_up = pu
 
-        # ── Blend Bayesian + Diffusion ───────────────────────────────────
+        # ── Blend Bayesian + Diffusion ─────────────────────────────────────────────────────────
         # p_diffusion = probability BTC stays on correct side until T=0
         # blend_weight: early bets are more penalised (more weight to diffusion)
         #   at t=max_t (180s): blend=0.55 — diffusion has strong say
@@ -620,7 +658,7 @@ class _ChainlinkArbEngine:
         sig.taker_fee = fee
         micro.taker_fee = fee
 
-        # ── Filters ──────────────────────────────────────────────────
+        # ── Filters ──────────────────────────────────────────────────────────────────────
         if edge < eff_min:
             self.stab.record(slug, side, max(edge, 0.001), now)
             sig.status = (
@@ -726,14 +764,17 @@ class _ChainlinkArbEngine:
         sig.action = "BUY"
         sig.status = "BETTING"
         sig.filters_passed = True
+        sig.oracle_age_sec = micro.oracle_age_sec  # v3.5: persist to trade record
         sig.micro = micro
 
         log.info(
             "[BET:CL_ARB] %s %s | edge=+%.1f%% P=%.0f%%(diff=%.0f%%) "
-            "@%.0fc | $%.2f | T-%ds | σ√t=%.3f%% | abs_Δ=%.3f%% | %s",
+            "@%.0fc | $%.2f | T-%ds | σ√t=%.3f%% | abs_Δ=%.3f%% | "
+            "CL_age=%.0fs | %s",
             side, slug[-14:], edge * 100, prob * 100, p_diff * 100,
             entry * 100, size, int(t_rem),
-            min_viable_delta * 100, abs(pd) * 100, sig.confidence,
+            min_viable_delta * 100, abs(pd) * 100,
+            micro.oracle_age_sec, sig.confidence,
         )
         return sig
 
@@ -741,7 +782,7 @@ class _ChainlinkArbEngine:
         self.stab.reset(slug)
 
 
-# ── Strategy 2: Price Momentum ──────────────────────────────────────────────────
+# ── Strategy 2: Price Momentum ────────────────────────────────────────────────────────────────
 
 class _MomentumEngine:
     """
@@ -885,7 +926,7 @@ class _MomentumEngine:
         return sig
 
 
-# ── Strategy 3: Mean Reversion ──────────────────────────────────────────────────
+# ── Strategy 3: Mean Reversion ────────────────────────────────────────────────────────────────
 
 class _MeanReversionEngine:
     """
@@ -988,7 +1029,7 @@ class _MeanReversionEngine:
         return sig
 
 
-# ── Multi-Strategy Router ───────────────────────────────────────────────────────
+# ── Multi-Strategy Router ───────────────────────────────────────────────────────────────────────
 
 class SignalEngine:
     """
@@ -1114,7 +1155,7 @@ class SignalEngine:
                 agreeing, best.side, boost, best.size_usd,
             )
 
-        # ── Cross-market propagation boost (QR-PM-2026-0041 §6) ──────────────
+        # ── Cross-market propagation boost (QR-PM-2026-0041 §6) ────────────────────
         # After a 5m market resolves, the 15m market takes 12-45 seconds to
         # reprice. During this window, add an additive confidence boost to the
         # 15m bet's p_true, decaying linearly from +5% to 0 over 45 seconds.

@@ -147,7 +147,7 @@ class Orchestrator:
             if task is not asyncio.current_task():
                 task.cancel()
 
-    # ── Price callbacks ────────────────────────────────────────────────
+    # ── Price callbacks ──────────────────────────────────────────────────────────────────
 
     async def _on_price(self, source: str, price: float, timestamp: float) -> None:
         if source == "binance":
@@ -174,7 +174,7 @@ class Orchestrator:
     async def _on_orderbook_update(self, cid: str, ob) -> None:
         self._orderbooks[cid] = ob
 
-    # ── Core loops ────────────────────────────────────────────────────────
+    # ── Core loops ────────────────────────────────────────────────────────────────────────
 
     async def _signal_loop(self) -> None:
         while self._running:
@@ -242,7 +242,8 @@ class Orchestrator:
 
             filters = ",".join(sig.filter_reasons) if sig.filter_reasons else "ALL_PASS"
             log.info(
-                "[Signal] %s T-%ds d=%.3f%% P=%.2f edge=%.3f -> %s [%s] | %s | strategy=%s",
+                "[Signal] %s T-%ds d=%.3f%% P=%.2f edge=%.3f -> %s [%s] | %s | "
+                "strategy=%s | CL_age=%.0fs",
                 market.slug[-14:],
                 int(sig.time_remaining_sec),
                 sig.delta_chainlink * 100,
@@ -252,6 +253,7 @@ class Orchestrator:
                 filters,
                 sig.status,
                 sig.strategy_used,
+                sig.micro.oracle_age_sec,
             )
 
             await self.db.insert_signal({
@@ -270,6 +272,7 @@ class Orchestrator:
                 "filters_passed": 1 if sig.filters_passed else 0,
                 "filter_details": ",".join(sig.filter_reasons),
                 "action": sig.action,
+                "oracle_age_sec": round(sig.micro.oracle_age_sec, 1),
             })
 
             await dashboard_state.update_signal({
@@ -296,6 +299,7 @@ class Orchestrator:
                 "confidence": sig.confidence,
                 "strategy_used": sig.strategy_used,
                 "strategies_agreeing": sig.strategies_agreeing,
+                "oracle_age_sec": round(sig.micro.oracle_age_sec, 1),
                 "micro": {
                     "chainlink_boost": round(sig.micro.chainlink_edge_boost, 4),
                     "ofi": round(sig.micro.ofi_raw, 4),
@@ -306,6 +310,7 @@ class Orchestrator:
                     "taker_fee": round(sig.micro.taker_fee, 5),
                     "source_divergence": round(sig.micro.source_divergence, 6),
                     "time_decay": round(sig.micro.time_decay_factor, 3),
+                    "oracle_age_sec": round(sig.micro.oracle_age_sec, 1),
                 },
             })
 
