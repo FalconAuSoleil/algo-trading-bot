@@ -64,6 +64,7 @@ class PaperTrader:
             p_market=signal.p_market,
             edge=signal.edge,
             time_remaining_sec=signal.time_remaining_sec,
+            oracle_age_sec=signal.oracle_age_sec,
             mode="paper",
         )
         trade_id = await self.db.insert_trade(record)
@@ -102,7 +103,7 @@ class PaperTrader:
         log.info(
             "[Paper] EXECUTED %s %s | $%.2f @ $%.4f | "
             "edge=%.1f%% | P_true=%.1f%% | T=%.0fs | "
-            "delta=%.4f%% | strategy=%s",
+            "delta=%.4f%% | CL_age=%.0fs | strategy=%s",
             signal.side,
             signal.market_id[:16],
             signal.size_usd,
@@ -111,6 +112,7 @@ class PaperTrader:
             signal.p_true * 100,
             signal.time_remaining_sec,
             signal.delta_chainlink * 100,
+            signal.oracle_age_sec,
             signal.strategy_used,
         )
         return trade_id

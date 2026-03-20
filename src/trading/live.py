@@ -178,6 +178,7 @@ class LiveTrader:
             p_market=signal.p_market,
             edge=signal.edge,
             time_remaining_sec=signal.time_remaining_sec,
+            oracle_age_sec=signal.oracle_age_sec,
             mode="live",
         )
         trade_id = await self.db.insert_trade(record)
@@ -185,9 +186,9 @@ class LiveTrader:
         # Submit signed FOK order in thread executor
         try:
             log.info(
-                "[Live] Submitting FOK | %s %s | shares=%.2f @ %.4f | $%.2f",
+                "[Live] Submitting FOK | %s %s | shares=%.2f @ %.4f | $%.2f | CL_age=%.0fs",
                 signal.side, signal.market_id[:16], shares,
-                entry_price, signal.size_usd,
+                entry_price, signal.size_usd, signal.oracle_age_sec,
             )
 
             def _place_order():

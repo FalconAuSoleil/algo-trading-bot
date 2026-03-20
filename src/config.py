@@ -18,7 +18,7 @@ def _envi(key, default=0): return int(os.getenv(key, str(default)))
 
 @dataclass(frozen=True)
 class SignalConfig:
-    # ── Edge filters ───────────────────────────────────────────────────────
+    # ── Edge filters ─────────────────────────────────────────────────────
     edge_min: float = _envf("EDGE_MIN", 0.06)
     edge_max: float = _envf("EDGE_MAX", 0.15)
     min_true_prob: float = _envf("MIN_TRUE_PROB", 0.56)
@@ -44,41 +44,50 @@ class SignalConfig:
     chainlink_period: float = _envf("CHAINLINK_PERIOD", 27.0)
     chainlink_edge_window: float = _envf("CHAINLINK_EDGE_WINDOW", 8.0)
 
-    # ── OFI ───────────────────────────────────────────────────────────────
+    # ── OFI ──────────────────────────────────────────────────────────────────
     ofi_weight: float = _envf("OFI_WEIGHT", 0.20)
 
-    # ── Kyle ─────────────────────────────────────────────────────────────────
+    # ── Kyle ─────────────────────────────────────────────────────────────────────
     kyle_spread_penalty: float = _envf("KYLE_SPREAD_PENALTY", 0.15)
 
-    # ── Hawkes ───────────────────────────────────────────────────────────────
+    # ── Hawkes ───────────────────────────────────────────────────────────────────
     hawkes_mu: float = _envf("HAWKES_MU", 0.1)
     hawkes_alpha: float = _envf("HAWKES_ALPHA", 0.8)
     hawkes_beta: float = _envf("HAWKES_BETA", 2.0)
     hawkes_history: int = _envi("HAWKES_HISTORY", 200)
 
-    # ── Momentum ─────────────────────────────────────────────────────────────
+    # ── Momentum ───────────────────────────────────────────────────────────────────
     momentum_factor: float = _envf("MOMENTUM_FACTOR", 80.0)
     momentum_min_threshold: float = _envf("MOMENTUM_MIN_THRESHOLD", 0.0008)
 
-    # ── Mean Reversion ───────────────────────────────────────────────────────
+    # ── Mean Reversion ─────────────────────────────────────────────────────────────────
     mean_reversion_delta_threshold: float = _envf("MEAN_REV_DELTA_THRESHOLD", 0.0020)
 
-    # ── Diffusion model (v3.2) ────────────────────────────────────────────────
+    # ── Diffusion model (v3.2) ────────────────────────────────────────────────────────────
     # Hard absolute floor on |delta| regardless of realized volatility.
     # 0.10% = ~$74 on a $74k BTC. Any smaller and 30s of random walk can
     # wipe the edge before close. Override via DELTA_MIN_ABS env var.
     delta_min_abs: float = _envf("DELTA_MIN_ABS", 0.0010)
 
-    # ── Stability filter ─────────────────────────────────────────────────────
+    # ── Oracle freshness filter (v3.5) ───────────────────────────────────────────────────────
+    # If Chainlink's last update is older than this (seconds) when
+    # T_remaining < 90s, the bet is blocked (ORACLE_STALE). Resolution
+    # uses the last oracle update BEFORE expiry; a stale oracle can
+    # capture a temporary dip/spike even when BTC is correct at expiry.
+    # Confirmed mechanism: 3 losses had oracle silence 60-170s at bet time.
+    # Set to 0.0 to disable. Default: 55s (~2× median Chainlink period).
+    oracle_freshness_max_age_sec: float = _envf("ORACLE_FRESHNESS_MAX_AGE_SEC", 55.0)
+
+    # ── Stability filter ─────────────────────────────────────────────────────────────────
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
     stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 3)
     stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.75)
     stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.60)
 
-    # ── Source coherence ─────────────────────────────────────────────────────
+    # ── Source coherence ─────────────────────────────────────────────────────────────────
     source_coherence_max: float = _envf("SOURCE_COHERENCE_MAX", 0.003)
 
-    # ── Fee model ────────────────────────────────────────────────────────────
+    # ── Fee model ────────────────────────────────────────────────────────────────────
     delta_min: float = _envf("DELTA_MIN", 0.0012)
     volatility_max: float = _envf("VOLATILITY_MAX", 0.0015)
     volatility_window_minutes: int = 30
