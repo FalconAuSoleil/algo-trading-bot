@@ -19,19 +19,27 @@ def _envi(key, default=0): return int(os.getenv(key, str(default)))
 @dataclass(frozen=True)
 class AssetConfig:
     """Per-asset configuration for multi-asset support (v3.7).
-    
-    Each asset can have its own oracle update frequency, volatility profile,
-    and delta thresholds. The signal engine will use these overrides when
-    evaluating bets on that asset's markets.
+
+    Each asset has its own oracle update frequency, volatility profile,
+    delta thresholds, and supported market intervals.
+
+    IMPORTANT — Polymarket API constraint (verified 2026-03-21):
+      The past-results API (used to fetch reference prices) only supports
+      5-minute markets for BTC. All other assets (ETH, SOL, XRP) must use
+      supported_intervals=(900,) — 15-minute markets only.
     """
-    symbol: str                              # "BTC", "ETH", "XRP", "SOL"
-    chainlink_address: str                   # Polygon contract address
-    binance_symbol: str                      # "BTCUSDT", "ETHUSDT", etc.
-    polymarket_prefix: str                   # "btc", "eth", "xrp", "sol"
-    chainlink_period: float = 27.0           # expected update interval (seconds)
-    oracle_freshness_max_age_sec: float = 55.0  # staleness threshold
-    delta_min_abs: float = 0.0010            # minimum |delta| to bet (%)
-    sigma_fallback: float = 0.0              # fallback sigma for diffusion model
+    symbol: str                                   # "BTC", "ETH", "XRP", "SOL"
+    chainlink_address: str                        # Polygon contract address
+    binance_symbol: str                           # "BTCUSDT", "ETHUSDT", etc.
+    polymarket_prefix: str                        # "btc", "eth", "xrp", "sol"
+    chainlink_period: float = 27.0                # expected update interval (seconds)
+    oracle_freshness_max_age_sec: float = 55.0    # staleness threshold
+    delta_min_abs: float = 0.0010                 # minimum |delta| to bet
+    sigma_fallback: float = 0.0                   # fallback sigma for diffusion model
+    # Polymarket market intervals this asset supports (seconds).
+    # ETH/SOL/XRP: (900,) only — 5m past-results API not supported.
+    # BTC: (300, 900) — both 5m and 15m.
+    supported_intervals: tuple = (300, 900)
     enabled: bool = True
 
 
@@ -48,14 +56,13 @@ class SignalConfig:
 
     # ── Timing windows ───────────────────────────────────────────────────────
     time_min_5m: float = _envf("TIME_MIN_5M", 45.0)
-    # WARROOM FIX: reduced from 240s → 180s.
-    # Hard cap on how early we bet in a 5-min window.
-    # The diffusion model handles fine-grained rejection within this window.
-    # Evidence: all screenshot losses occurred at T=248-269s (well above old cap).
     time_max_5m: float = _envf("TIME_MAX_5M", 180.0)
     time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 290.0)
     time_min_15m: float = _envf("TIME_MIN_15M", 60.0)
-    time_max_15m: float = _envf("TIME_MAX_15M", 780.0)
+    # v3.8: reduced from 780s → 550s.
+    # At T-780s on a 15m market, diffusion uncertainty over 13min is too
+    # large for reliable edge. Tighter window cuts false positives.
+    time_max_15m: float = _envf("TIME_MAX_15M", 550.0)
 
     # ── Chainlink arb ───────────────────────────────────────────────────────
     chainlink_period: float = _envf("CHAINLINK_PERIOD", 27.0)
@@ -80,29 +87,27 @@ class SignalConfig:
     # ── Mean Reversion ─────────────────────────────────────────────────────────────────
     mean_reversion_delta_threshold: float = _envf("MEAN_REV_DELTA_THRESHOLD", 0.0020)
 
-    # ── Diffusion model (v3.2) ────────────────────────────────────────────────────────────
-    # Hard absolute floor on |delta| regardless of realized volatility.
-    # 0.10% = ~$74 on a $74k BTC. Any smaller and 30s of random walk can
-    # wipe the edge before close. Override via DELTA_MIN_ABS env var.
+    # ── Diffusion model ────────────────────────────────────────────────────────────
     delta_min_abs: float = _envf("DELTA_MIN_ABS", 0.0010)
 
-    # ── Oracle freshness filter (v3.5) ───────────────────────────────────────────────────────
-    # If Chainlink's last update is older than this (seconds) when
-    # T_remaining < 90s, the bet is blocked (ORACLE_STALE). Resolution
-    # uses the last oracle update BEFORE expiry; a stale oracle can
-    # capture a temporary dip/spike even when BTC is correct at expiry.
-    # Confirmed mechanism: 3 losses had oracle silence 60-170s at bet time.
-    # Set to 0.0 to disable. Default: 55s (~2× median Chainlink period).
+    # ── Oracle freshness filter ───────────────────────────────────────────────────────
     oracle_freshness_max_age_sec: float = _envf("ORACLE_FRESHNESS_MAX_AGE_SEC", 55.0)
 
     # ── Stability filter ─────────────────────────────────────────────────────────────────
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
-    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 3)
+    # v3.8: raised from 3 → 8. 3 obs = only 15min of history, too easy
+    # to pass on a lucky streak. 8 obs ≈ 40min, substantially more robust.
+    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 8)
     stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.75)
-    stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.60)
+    # v3.8: tightened from 0.60 → 0.40. CV 60% accepted very dispersed
+    # edges. 40% requires more consistent edge magnitude before betting.
+    stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.40)
 
     # ── Source coherence ─────────────────────────────────────────────────────────────────
-    source_coherence_max: float = _envf("SOURCE_COHERENCE_MAX", 0.003)
+    # v3.8: raised from 0.003 → 0.005.
+    # Chainlink BTC lag ~27s × vol ~0.0145%/s = ~0.39% expected divergence.
+    # 0.3% threshold blocked ~33% of valid signals due to normal oracle lag.
+    source_coherence_max: float = _envf("SOURCE_COHERENCE_MAX", 0.005)
 
     # ── Fee model ────────────────────────────────────────────────────────────────────
     delta_min: float = _envf("DELTA_MIN", 0.0012)
@@ -161,13 +166,11 @@ class AppConfig:
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
 
     # v3.7: Per-asset configurations
-    # Only assets with enabled=True will be traded.
-    # Asset parameters can be overridden via env vars:
-    #   ASSET_<SYMBOL>_ENABLED=true/false
-    #   ASSET_<SYMBOL>_CHAINLINK_PERIOD=<seconds>
-    #   ASSET_<SYMBOL>_ORACLE_FRESHNESS=<seconds>
-    #   ASSET_<SYMBOL>_DELTA_MIN_ABS=<percent>
-    assets: list[AssetConfig] = field(default_factory=lambda: [
+    # v3.8: supported_intervals added — ETH/SOL/XRP restricted to 15m only.
+    #   Polymarket past-results API does not support 5m for non-BTC assets.
+    #   Verified 2026-03-21 via live API: returns
+    #   {"error": "5-minute markets currently supported only for BTC"}
+    assets: list = field(default_factory=lambda: [
         AssetConfig(
             symbol="BTC",
             chainlink_address="0xc907E116054Ad103354f2D350FD2514433D57F6f",
@@ -177,6 +180,7 @@ class AppConfig:
             oracle_freshness_max_age_sec=55.0,
             delta_min_abs=0.0010,
             sigma_fallback=0.005 / (300 ** 0.5),  # ~2.89e-4
+            supported_intervals=(300, 900),  # 5m + 15m
             enabled=True,
         ),
         AssetConfig(
@@ -188,6 +192,7 @@ class AppConfig:
             oracle_freshness_max_age_sec=55.0,
             delta_min_abs=0.0015,
             sigma_fallback=0.007 / (300 ** 0.5),  # ~4.04e-4
+            supported_intervals=(900,),  # 15m only — 5m API not supported for ETH
             enabled=True,
         ),
         AssetConfig(
@@ -199,6 +204,7 @@ class AppConfig:
             oracle_freshness_max_age_sec=90.0,
             delta_min_abs=0.0020,
             sigma_fallback=0.009 / (300 ** 0.5),  # ~5.20e-4
+            supported_intervals=(900,),  # 15m only — 5m API not supported for SOL
             enabled=True,
         ),
         AssetConfig(
@@ -209,7 +215,10 @@ class AppConfig:
             chainlink_period=120.0,
             oracle_freshness_max_age_sec=90.0,
             delta_min_abs=0.0015,
-            sigma_fallback=0.009 / (300 ** 0.5),  # ~5.20e-4
+            # v3.8: 0.008 (was 0.009 = same as SOL). XRP is less volatile
+            # than SOL; using SOL's fallback was over-conservative.
+            sigma_fallback=0.008 / (300 ** 0.5),  # ~4.62e-4
+            supported_intervals=(900,),  # 15m only — 5m API not supported for XRP
             enabled=True,
         ),
     ])
@@ -219,7 +228,7 @@ class AppConfig:
     @property
     def is_live(self): return self.trading_mode == "live"
 
-    def get_asset_config(self, symbol: str) -> AssetConfig | None:
+    def get_asset_config(self, symbol: str):
         """Look up asset config by symbol."""
         for ac in self.assets:
             if ac.symbol == symbol:

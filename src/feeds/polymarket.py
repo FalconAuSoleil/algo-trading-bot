@@ -4,6 +4,10 @@ Uses deterministic slug-based discovery for Up/Down markets:
   5-min:  {prefix}-updown-5m-{floor(unix_ts / 300) * 300}
   15-min: {prefix}-updown-15m-{floor(unix_ts / 900) * 900}
 
+v3.8: Uses per-asset interval dict so ETH/SOL/XRP only discover
+15-minute markets (Polymarket past-results API does not support
+5-minute markets for non-BTC assets — verified 2026-03-21).
+
 v3.7: Generalized to support multiple asset prefixes (btc, eth, sol, xrp).
 Reference price (\"price to beat\") is fetched from the Polymarket
 past-results API, which provides the exact Chainlink snapshot price
@@ -51,7 +55,7 @@ class MarketInfo:
     slug: str = ""
     active: bool = False
     accepting_orders: bool = False
-    outcome_prices: tuple[float, float] = (0.5, 0.5)
+    outcome_prices: tuple = (0.5, 0.5)
 
     @property
     def time_remaining(self) -> float:
@@ -87,7 +91,6 @@ class OrderbookState:
     def mid_down(self) -> float:
         return 1.0 - self.mid_up
 
-    # Aliases for compatibility with signal engine
     @property
     def best_bid_yes(self) -> float:
         return self.best_bid_up
@@ -118,16 +121,7 @@ class OrderbookState:
 
 
 def compute_slug(asset_prefix: str, interval_sec: int, ts: float = 0) -> str:
-    """Compute the deterministic market slug for a given time.
-    
-    Args:
-        asset_prefix: Asset prefix (e.g., "btc", "eth", "xrp", "sol")
-        interval_sec: Market interval in seconds (300 or 900)
-        ts: Timestamp (defaults to now)
-    
-    Returns:
-        Slug string like "eth-updown-5m-1234567890"
-    """
+    """Compute the deterministic market slug for a given time."""
     if ts <= 0:
         ts = time.time()
     aligned = int(ts // interval_sec) * interval_sec
@@ -138,8 +132,10 @@ def compute_slug(asset_prefix: str, interval_sec: int, ts: float = 0) -> str:
 class PolymarketFeed:
     """Discovers Up/Down markets using slug-based lookup
     and polls orderbooks for active markets.
-    
-    Supports multiple asset prefixes (btc, eth, sol, xrp, etc).
+
+    v3.8: accepts asset_intervals dict {prefix: (interval1, interval2, ...)}
+    so each asset can have different supported intervals.
+    ETH/SOL/XRP: (900,) only. BTC: (300, 900).
     """
 
     def __init__(
@@ -147,30 +143,46 @@ class PolymarketFeed:
         gamma_url: str = "https://gamma-api.polymarket.com",
         clob_url: str = "https://clob.polymarket.com",
         clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/",
-        asset_prefixes: tuple[str, ...] = ("btc", "eth", "sol", "xrp"),
-        intervals: tuple[int, ...] = (INTERVAL_5M, INTERVAL_15M),
+        # v3.8: primary parameter — per-asset intervals.
+        # e.g. {"btc": (300, 900), "eth": (900,), "sol": (900,), "xrp": (900,)}
+        asset_intervals: Optional[dict] = None,
+        # Legacy params kept for backward compat — ignored if asset_intervals provided
+        asset_prefixes: tuple = ("btc",),
+        intervals: tuple = (INTERVAL_5M, INTERVAL_15M),
         on_market_update: Optional[Callable] = None,
         on_orderbook_update: Optional[Callable] = None,
     ):
         self.gamma_url = gamma_url
         self.clob_url = clob_url
         self.clob_ws_url = clob_ws_url
-        self.asset_prefixes = asset_prefixes
-        self.intervals = intervals
         self.on_market_update = on_market_update
         self.on_orderbook_update = on_orderbook_update
 
-        self.active_markets: dict[str, MarketInfo] = {}
-        self.orderbooks: dict[str, OrderbookState] = {}
+        # v3.8: build internal asset_intervals dict
+        if asset_intervals is not None:
+            self._asset_intervals: dict = asset_intervals
+        else:
+            # Backward compat: expand legacy asset_prefixes × intervals
+            self._asset_intervals = {
+                prefix: tuple(intervals) for prefix in asset_prefixes
+            }
+
+        self.active_markets: dict = {}
+        self.orderbooks: dict = {}
         self._running = False
         self._session: Optional[aiohttp.ClientSession] = None
+
+    @property
+    def asset_prefixes(self) -> tuple:
+        """All asset prefixes being monitored."""
+        return tuple(self._asset_intervals.keys())
 
     async def start(self) -> None:
         self._running = True
         self._session = aiohttp.ClientSession()
         log.info(
-            "[Polymarket] Feed starting (multi-asset slug-based discovery) | "
-            "prefixes=%s", ",".join(self.asset_prefixes)
+            "[Polymarket] Feed starting | asset_intervals=%s",
+            {k: v for k, v in self._asset_intervals.items()},
         )
         await asyncio.gather(
             self._market_discovery_loop(),
@@ -203,7 +215,7 @@ class PolymarketFeed:
                     if ptb > 0:
                         market.reference_price = ptb
                         log.info(
-                            "[Polymarket] Price to beat for %s: $%.2f",
+                            "[Polymarket] Price to beat for %s: $%.4f",
                             market.slug, ptb,
                         )
 
@@ -216,11 +228,16 @@ class PolymarketFeed:
             await asyncio.sleep(1)
 
     async def _discover_markets(self) -> None:
+        """Discover markets for each asset using its supported intervals.
+
+        v3.8: iterates over asset_intervals dict so ETH/SOL/XRP only
+        look for 15m markets, while BTC looks for both 5m and 15m.
+        """
         now = time.time()
         found = 0
 
-        for asset_prefix in self.asset_prefixes:
-            for interval in self.intervals:
+        for asset_prefix, prefix_intervals in self._asset_intervals.items():
+            for interval in prefix_intervals:
                 aligned = int(now // interval) * interval
                 for offset in range(3):
                     window_start = aligned + (offset * interval)
@@ -308,7 +325,7 @@ class PolymarketFeed:
             if start_ts > 0 and time.time() >= start_ts:
                 ref_price = await self._fetch_price_to_beat(slug, start_ts, duration)
             if ref_price > 0:
-                log.info("[Polymarket] Price to beat for %s: $%.2f", slug, ref_price)
+                log.info("[Polymarket] Price to beat for %s: $%.4f", slug, ref_price)
 
             return MarketInfo(
                 condition_id=cid,
@@ -329,16 +346,12 @@ class PolymarketFeed:
             return None
 
     async def _orderbook_poll_loop(self) -> None:
-        """Poll orderbooks for all active markets within their betting windows."""
         while self._running:
             for cid, market in list(self.active_markets.items()):
                 if market.is_expired:
                     continue
                 if not market.accepting_orders:
                     continue
-                # FIX: poll orderbooks for ALL markets within their
-                # strategy window, not just the last 5 minutes.
-                # For 15m markets, the betting window extends to 850s.
                 max_ob_window = 900 if market.duration_seconds > 300 else 420
                 if market.time_remaining > max_ob_window:
                     continue
@@ -401,7 +414,6 @@ class PolymarketFeed:
                     ob.best_ask_down = best_ask
                     ob.depth_bid_down = depth_bid
                     ob.depth_ask_down = depth_ask
-                    # FIX: compute spread_down properly
                     if best_bid and best_ask:
                         ob.spread_down = best_ask - best_bid
 
@@ -424,11 +436,11 @@ class PolymarketFeed:
     async def _fetch_price_to_beat(
         self, slug: str, start_time: float, duration: int
     ) -> float:
-        """Fetch the reference price for a market.
-        
-        Extracts the asset symbol from the slug and uses it for the API call.
+        """Fetch the reference price for a market from the past-results API.
+
+        NOTE: As of 2026-03-21, Polymarket only supports 5-minute markets
+        for BTC. ETH/SOL/XRP only work with variant='fifteen' (15m).
         """
-        # Extract symbol from slug: "btc-updown-5m-..." or "eth-updown-15m-..."
         parts = slug.split("-")
         symbol = parts[0].upper() if parts else "BTC"
 
@@ -454,6 +466,12 @@ class PolymarketFeed:
                 data = await resp.json()
 
             if data.get("status") != "success":
+                # Log API-level errors at debug (e.g. non-BTC 5m rejection)
+                err = data.get("error", "unknown")
+                log.debug(
+                    "[Polymarket] past-results error for %s (variant=%s): %s",
+                    slug, variant, err,
+                )
                 return 0.0
 
             results = data.get("data", {}).get("results", [])
@@ -466,9 +484,10 @@ class PolymarketFeed:
             log.debug("[Polymarket] Price-to-beat fetch error (%s): %s", slug, e)
             return 0.0
 
-    async def fetch_market_outcome(self, slug: str, start_time: float, duration: int) -> Optional[str]:
+    async def fetch_market_outcome(
+        self, slug: str, start_time: float, duration: int
+    ) -> Optional[str]:
         """Fetch the outcome of a resolved market."""
-        # Extract symbol from slug
         parts = slug.split("-")
         symbol = parts[0].upper() if parts else "BTC"
 
