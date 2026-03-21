@@ -95,6 +95,13 @@ class Orchestrator:
         db_state = await self.db.load_portfolio_state(config.trading_mode)
         self.portfolio.restore_from_db(db_state)
 
+        # v3.6: restore in-flight trades from DB after crash/restart.
+        # paper.py and live.py both implement restore_pending(); without
+        # calling it here the methods are dead code and trades placed
+        # before the crash stay stuck as outcome='pending' forever.
+        if hasattr(self.trader, 'restore_pending'):
+            await self.trader.restore_pending()
+
         dashboard_state.set_db(self.db)
         await dashboard_state.refresh_from_db()
         await dashboard_state.update_portfolio(self.portfolio.get_stats())

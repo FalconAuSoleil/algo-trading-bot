@@ -63,7 +63,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from src.config import SignalConfig
+from src.config import SignalConfig, config as _global_cfg  # v3.6: module-level, not lazy hot-path import
 from src.engine.performance import PerformanceTracker
 from src.engine.cross_market import CrossMarketBooster
 from src.utils.logger import setup_logger
@@ -715,11 +715,11 @@ class _ChainlinkArbEngine:
             return sig
 
         # Risk filters
+        # v3.6: use module-level _global_cfg instead of lazy import inside hot-path
         reasons = []
         if has_position_on_market:
             reasons.append("in_market")
-        from src.config import config as _cfg
-        risk = _cfg.risk
+        risk = _global_cfg.risk
         if consecutive_losses >= risk.max_consecutive_losses:
             reasons.append(f"circuit:{consecutive_losses}")
         if daily_pnl_pct < -risk.max_daily_drawdown:
@@ -1171,6 +1171,10 @@ class SignalEngine:
                 if cm_boost > 0:
                     best.p_true = min(best.p_true + cm_boost, 0.97)
                     best.edge = best.p_true - best.entry_price - best.taker_fee
+                    # v3.6: cap edge at edge_max after boost to avoid bypassing
+                    # the SUSPICIOUS_EDGE filter that ran pre-boost on the base signal
+                    if best.edge > self.cfg.edge_max:
+                        best.edge = self.cfg.edge_max
                     log.info(
                         "[CrossMarket] 15m boost +%.1f%% → p_true=%.1f%% "
                         "edge=%.1f%% | %s %s",
