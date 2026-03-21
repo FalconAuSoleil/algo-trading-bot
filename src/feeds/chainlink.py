@@ -1,9 +1,7 @@
-"""Chainlink BTC/USD price feed - direct on-chain oracle reading.
+"""Chainlink price feed - direct on-chain oracle reading.
 
-Reads the Chainlink BTC/USD aggregator contract on Polygon via
-latestRoundData().  This is the same oracle that Polymarket uses
-to resolve BTC Up/Down markets, so our price feed is now *exactly*
-aligned with the resolution source.
+Reads Chainlink aggregator contracts on Polygon via latestRoundData().
+Supports multiple assets (BTC, ETH, SOL, XRP, etc).
 
 Multiple free Polygon RPC endpoints are used with automatic rotation
 on failure.  If all RPCs are down, falls back to Binance REST as a
@@ -12,6 +10,9 @@ last resort (logged as a warning so we know).
 v3.6 fix: Binance fallback no longer updates last_chainlink_ts.
 Previously setting last_chainlink_ts = now() during fallback would
 reset oracle_age to 0, masking staleness and silencing ORACLE_STALE.
+
+v3.7: Made generic to support multiple assets. Takes symbol, address,
+and binance_symbol as constructor params.
 """
 
 from __future__ import annotations
@@ -26,10 +27,6 @@ from src.utils.logger import setup_logger
 
 log = setup_logger("feeds.chainlink")
 
-# Chainlink BTC/USD Price Feed on Polygon
-CHAINLINK_BTC_USD = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-CHAINLINK_DECIMALS = 8
-
 # Free Polygon RPC endpoints (rotated on failure)
 RPC_ENDPOINTS = [
     "https://polygon-bor-rpc.publicnode.com",
@@ -37,20 +34,35 @@ RPC_ENDPOINTS = [
     "https://polygon.drpc.org",
 ]
 
+CHAINLINK_DECIMALS = 8
+
 
 class ChainlinkFeed:
-    """Polls Chainlink BTC/USD price directly from the Polygon oracle.
+    """Polls Chainlink price directly from a Polygon oracle contract.
 
     Reads latestRoundData() from the on-chain aggregator every
     poll_interval seconds.  Falls back to Binance REST only when
     *all* RPC endpoints are unreachable.
+    
+    Args:
+        symbol: Asset symbol (e.g., "BTC", "ETH", "SOL", "XRP")
+        contract_address: Polygon Chainlink aggregator contract address
+        binance_symbol: Binance pair symbol (e.g., "BTCUSDT", "ETHUSDT")
+        on_price: Callback for price updates
+        poll_interval: Polling frequency in seconds
     """
 
     def __init__(
         self,
+        symbol: str = "BTC",
+        contract_address: str = "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+        binance_symbol: str = "BTCUSDT",
         on_price: Optional[Callable] = None,
         poll_interval: float = 3.0,
     ):
+        self.symbol = symbol
+        self.contract_address = contract_address
+        self.binance_symbol = binance_symbol
         self.on_price = on_price
         self.poll_interval = poll_interval
         self._running = False
@@ -65,9 +77,10 @@ class ChainlinkFeed:
         self._running = True
         self._session = aiohttp.ClientSession()
         log.info(
-            "[Chainlink] Starting DIRECT oracle feed on Polygon "
+            "[Chainlink] Starting DIRECT oracle feed on Polygon for %s "
             "(contract=%s, poll=%.1fs)",
-            CHAINLINK_BTC_USD[:10] + "...",
+            self.symbol,
+            self.contract_address[:10] + "...",
             self.poll_interval,
         )
 
@@ -83,6 +96,7 @@ class ChainlinkFeed:
                             source="chainlink",
                             price=price,
                             timestamp=self.last_chainlink_ts,
+                            symbol=self.symbol,
                         )
                 else:
                     # All RPCs failed - try Binance as emergency fallback
@@ -102,23 +116,25 @@ class ChainlinkFeed:
                                 source="chainlink_binance_fallback",
                                 price=price,
                                 timestamp=now,
+                                symbol=self.symbol,
                             )
                         if self._consecutive_rpc_failures <= 1:
                             log.warning(
-                                "[Chainlink] All RPCs failed, using "
+                                "[Chainlink] %s: All RPCs failed, using "
                                 "Binance fallback ($%.2f). "
                                 "oracle_age preserved for ORACLE_STALE filter.",
+                                self.symbol,
                                 price,
                             )
             except Exception as e:
-                log.debug("[Chainlink] Poll error: %s", e)
+                log.debug("[Chainlink] %s: Poll error: %s", self.symbol, e)
             await asyncio.sleep(self.poll_interval)
 
     async def stop(self) -> None:
         self._running = False
         if self._session:
             await self._session.close()
-        log.info("[Chainlink] Feed stopped")
+        log.info("[Chainlink] %s: Feed stopped", self.symbol)
 
     # ------------------------------------------------------------------
     # Chainlink on-chain read via eth_call JSON-RPC
@@ -133,7 +149,10 @@ class ChainlinkFeed:
                 if price > 0:
                     return price, updated_at
             except Exception as e:
-                log.debug("[Chainlink] RPC %s failed: %s", rpc, e)
+                log.debug(
+                    "[Chainlink] %s: RPC %s failed: %s", 
+                    self.symbol, rpc, e
+                )
             self._rpc_index = (self._rpc_index + 1) % len(RPC_ENDPOINTS)
         return 0.0, None
 
@@ -145,7 +164,7 @@ class ChainlinkFeed:
             "method": "eth_call",
             "params": [
                 {
-                    "to": CHAINLINK_BTC_USD,
+                    "to": self.contract_address,
                     "data": "0xfeaf968c",  # latestRoundData()
                 },
                 "latest",
@@ -186,11 +205,11 @@ class ChainlinkFeed:
     # ------------------------------------------------------------------
 
     async def _fetch_binance_fallback(self) -> float:
-        """Fetch BTC price from Binance REST as emergency fallback."""
+        """Fetch price from Binance REST as emergency fallback."""
         try:
             async with self._session.get(
                 "https://api.binance.com/api/v3/ticker/price",
-                params={"symbol": "BTCUSDT"},
+                params={"symbol": self.binance_symbol},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status == 200:
