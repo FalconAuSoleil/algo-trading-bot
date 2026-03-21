@@ -17,6 +17,25 @@ def _envi(key, default=0): return int(os.getenv(key, str(default)))
 
 
 @dataclass(frozen=True)
+class AssetConfig:
+    """Per-asset configuration for multi-asset support (v3.7).
+    
+    Each asset can have its own oracle update frequency, volatility profile,
+    and delta thresholds. The signal engine will use these overrides when
+    evaluating bets on that asset's markets.
+    """
+    symbol: str                              # "BTC", "ETH", "XRP", "SOL"
+    chainlink_address: str                   # Polygon contract address
+    binance_symbol: str                      # "BTCUSDT", "ETHUSDT", etc.
+    polymarket_prefix: str                   # "btc", "eth", "xrp", "sol"
+    chainlink_period: float = 27.0           # expected update interval (seconds)
+    oracle_freshness_max_age_sec: float = 55.0  # staleness threshold
+    delta_min_abs: float = 0.0010            # minimum |delta| to bet (%)
+    sigma_fallback: float = 0.0              # fallback sigma for diffusion model
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class SignalConfig:
     # ── Edge filters ─────────────────────────────────────────────────────
     edge_min: float = _envf("EDGE_MIN", 0.06)
@@ -141,9 +160,71 @@ class AppConfig:
     binance: BinanceConfig = field(default_factory=BinanceConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
 
+    # v3.7: Per-asset configurations
+    # Only assets with enabled=True will be traded.
+    # Asset parameters can be overridden via env vars:
+    #   ASSET_<SYMBOL>_ENABLED=true/false
+    #   ASSET_<SYMBOL>_CHAINLINK_PERIOD=<seconds>
+    #   ASSET_<SYMBOL>_ORACLE_FRESHNESS=<seconds>
+    #   ASSET_<SYMBOL>_DELTA_MIN_ABS=<percent>
+    assets: list[AssetConfig] = field(default_factory=lambda: [
+        AssetConfig(
+            symbol="BTC",
+            chainlink_address="0xc907E116054Ad103354f2D350FD2514433D57F6f",
+            binance_symbol="BTCUSDT",
+            polymarket_prefix="btc",
+            chainlink_period=27.0,
+            oracle_freshness_max_age_sec=55.0,
+            delta_min_abs=0.0010,
+            sigma_fallback=0.005 / (300 ** 0.5),  # ~2.89e-4
+            enabled=True,
+        ),
+        AssetConfig(
+            symbol="ETH",
+            chainlink_address="0xF9680D99D6C9589e2a93a78A04A279e509205945",
+            binance_symbol="ETHUSDT",
+            polymarket_prefix="eth",
+            chainlink_period=45.0,
+            oracle_freshness_max_age_sec=55.0,
+            delta_min_abs=0.0015,
+            sigma_fallback=0.007 / (300 ** 0.5),  # ~4.04e-4
+            enabled=True,
+        ),
+        AssetConfig(
+            symbol="SOL",
+            chainlink_address="0x10C8264C0935b3B9870013e057f330Ff3e9C56dC",
+            binance_symbol="SOLUSDT",
+            polymarket_prefix="sol",
+            chainlink_period=90.0,
+            oracle_freshness_max_age_sec=90.0,
+            delta_min_abs=0.0020,
+            sigma_fallback=0.009 / (300 ** 0.5),  # ~5.20e-4
+            enabled=True,
+        ),
+        AssetConfig(
+            symbol="XRP",
+            chainlink_address="0x785ba89291f676b5386652eB12b30cF361020694",
+            binance_symbol="XRPUSDT",
+            polymarket_prefix="xrp",
+            chainlink_period=120.0,
+            oracle_freshness_max_age_sec=90.0,
+            delta_min_abs=0.0015,
+            sigma_fallback=0.009 / (300 ** 0.5),  # ~5.20e-4
+            enabled=True,
+        ),
+    ])
+
     @property
     def is_paper(self): return self.trading_mode == "paper"
     @property
     def is_live(self): return self.trading_mode == "live"
+
+    def get_asset_config(self, symbol: str) -> AssetConfig | None:
+        """Look up asset config by symbol."""
+        for ac in self.assets:
+            if ac.symbol == symbol:
+                return ac
+        return None
+
 
 config = AppConfig()
