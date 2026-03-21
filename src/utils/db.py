@@ -106,6 +106,12 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self.db_path))
         self._db.row_factory = aiosqlite.Row
+
+        # v3.6: WAL mode allows concurrent reads during high-frequency signal
+        # inserts (every 2s). NORMAL sync is safe and much faster than FULL.
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
 
@@ -121,6 +127,14 @@ class Database:
                 await self._db.commit()
             except Exception:
                 pass  # column already exists — safe to ignore
+
+        # v3.6: auto-purge signals older than 7 days to prevent unbounded growth.
+        # At ~3 signals/s this table accumulates ~1.8M rows/week without cleanup.
+        _signals_cutoff = time.time() - 7 * 86400
+        await self._db.execute(
+            "DELETE FROM signals WHERE timestamp < ?", (_signals_cutoff,)
+        )
+        await self._db.commit()
 
     async def close(self) -> None:
         if self._db:
@@ -148,10 +162,12 @@ class Database:
         )
         await self._db.commit()
 
-    async def get_pending_trades(self) -> list[dict]:
+    async def get_pending_trades(self, mode: str = "paper") -> list[dict]:
+        """Return all trades still awaiting resolution for a given mode."""
         cursor = await self._db.execute(
-            "SELECT * FROM trades WHERE outcome='pending' "
-            "ORDER BY timestamp DESC"
+            "SELECT * FROM trades WHERE outcome='pending' AND mode=? "
+            "ORDER BY timestamp DESC",
+            (mode,),
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]

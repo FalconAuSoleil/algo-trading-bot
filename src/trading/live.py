@@ -13,6 +13,10 @@ Trade flow:
 BUGFIX (v3): previous version used conditionId as tokenID in the order
 payload, which is wrong. The CLOB needs the YES or NO *outcome* token ID.
 These are now carried on the Signal object and populated by main.py.
+
+v3.6: BTC price fallback delay increased 30s→120s to reduce incorrect
+resolutions when the API is temporarily slow. Also add restore_pending()
+to reload in-flight trades from DB after a crash or restart.
 """
 
 from __future__ import annotations
@@ -44,6 +48,11 @@ except ImportError:
 
 # BUY side constant (avoids importing the enum in the order payload)
 _BUY = "BUY"
+
+# Seconds after expiry before falling back to BTC price for resolution.
+# Increased from 30s to 120s (v3.6) to reduce incorrect resolutions
+# when the Polymarket API is temporarily slow to publish outcomes.
+_FALLBACK_DELAY_SEC = 120
 
 
 class LiveTrader:
@@ -128,6 +137,40 @@ class LiveTrader:
     async def stop(self) -> None:
         self._client = None
         log.info("[Live] Trader stopped")
+
+    async def restore_pending(self) -> None:
+        """Reload in-flight trades from DB after a crash or restart.
+
+        Called by main.py on startup. Without this, any trade that was
+        pending when the process died stays as outcome='pending' in the
+        DB forever and the capital is never returned to the portfolio.
+
+        v3.6 addition.
+        """
+        pending = await self.db.get_pending_trades(mode="live")
+        restored = 0
+        for row in pending:
+            trade_id = row["id"]
+            if trade_id in self._pending_resolutions:
+                continue  # already tracked
+            approx_start = row["timestamp"] - row.get("time_remaining_sec", 300)
+            end_time = row["timestamp"] + row.get("time_remaining_sec", 300)
+            self._pending_resolutions[trade_id] = {
+                "market_id": row["market_id"],
+                "side": row["side"],
+                "end_time": end_time,
+                "reference_price": 0.0,  # not stored in trades table
+                "start_time": approx_start,
+                "duration": 300,
+                "slug": row.get("slug", ""),
+                "strategy_used": "chainlink_arb",
+            }
+            restored += 1
+        if restored:
+            log.info(
+                "[Live] Restored %d pending trade(s) from DB after restart",
+                restored,
+            )
 
     async def execute(self, signal: Signal) -> Optional[int]:
         """
@@ -266,7 +309,9 @@ class LiveTrader:
         Check if pending positions have resolved.
 
         Prefers the real Polymarket API outcome; falls back to BTC
-        price comparison 30s after expiry if API is still pending.
+        price comparison only after _FALLBACK_DELAY_SEC (120s) if
+        the API is still pending. Delay increased from 30s in v3.6
+        to reduce incorrect resolutions on slow API responses.
         """
         now = time.time()
         resolved = []
@@ -277,8 +322,9 @@ class LiveTrader:
 
             ref = info["reference_price"]
             side = info["side"]
-            if ref <= 0:
-                continue
+            if ref <= 0 and now < info["end_time"] + _FALLBACK_DELAY_SEC:
+                # No reference price (restored from DB) — wait for API only
+                pass
 
             # Try real outcome from Polymarket API
             real_outcome = None
@@ -297,16 +343,21 @@ class LiveTrader:
                     "[Live] Resolved trade %d via API | outcome=%s side=%s won=%s",
                     trade_id, real_outcome, side, won,
                 )
-            else:
-                if now < info["end_time"] + 30:
-                    continue  # wait a bit longer for API
+            elif ref > 0 and now >= info["end_time"] + _FALLBACK_DELAY_SEC:
+                # API still not ready after _FALLBACK_DELAY_SEC — use BTC price
+                # as last resort. Note: this uses the CURRENT price, not the
+                # price at expiry, which may differ if BTC moved post-resolution.
                 btc_above = btc_chainlink_price >= ref
                 won = btc_above if side == "YES" else not btc_above
                 log.warning(
-                    "[Live] Resolved trade %d via BTC FALLBACK | "
-                    "btc=$%.2f ref=$%.2f side=%s won=%s",
-                    trade_id, btc_chainlink_price, ref, side, won,
+                    "[Live] Resolved trade %d via BTC FALLBACK (%ds wait) | "
+                    "btc=$%.2f ref=$%.2f side=%s won=%s — "
+                    "verify manually if outcome seems wrong",
+                    trade_id, int(now - info["end_time"]),
+                    btc_chainlink_price, ref, side, won,
                 )
+            else:
+                continue  # still waiting for API
 
             outcome, pnl = self.portfolio.close_position(trade_id, won)
             await self.db.resolve_trade(trade_id, outcome, pnl)

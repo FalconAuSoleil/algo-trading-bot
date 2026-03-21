@@ -33,6 +33,43 @@ class PaperTrader:
         self.db = db
         self._pending_resolutions: dict[int, dict] = {}
 
+    async def restore_pending(self) -> None:
+        """Reload in-flight trades from DB after a crash or restart.
+
+        Called by main.py on startup. Without this, any trade that was
+        pending when the process died stays as outcome='pending' in the
+        DB forever and the capital is never returned to the portfolio.
+
+        v3.6 addition.
+        """
+        pending = await self.db.get_pending_trades(mode="paper")
+        restored = 0
+        for row in pending:
+            trade_id = row["id"]
+            if trade_id in self._pending_resolutions:
+                continue  # already tracked
+            # Reconstruct enough context for check_resolutions() to work.
+            # We don't have market_start_time in the trades table, so we
+            # approximate it from timestamp - time_remaining_sec.
+            approx_start = row["timestamp"] - row.get("time_remaining_sec", 300)
+            end_time = row["timestamp"] + row.get("time_remaining_sec", 300)
+            self._pending_resolutions[trade_id] = {
+                "market_id": row["market_id"],
+                "side": row["side"],
+                "end_time": end_time,
+                "reference_price": 0.0,  # not stored in trades table
+                "start_time": approx_start,
+                "duration": 300,
+                "slug": row.get("slug", ""),
+                "strategy_used": "chainlink_arb",
+            }
+            restored += 1
+        if restored:
+            log.info(
+                "[Paper] Restored %d pending trade(s) from DB after restart",
+                restored,
+            )
+
     async def execute(self, signal: Signal) -> Optional[int]:
         """Execute a paper trade based on signal.
 
@@ -192,8 +229,6 @@ class PaperTrader:
                 "ref_price": info["reference_price"],
                 "slug": info.get("slug", ""),
                 "duration": info.get("duration", 300),
-                # Consistent with live.py — enables accurate feedback
-                # to PerformanceTracker even after crash/restart
                 "strategy_used": info.get("strategy_used", "chainlink_arb"),
             })
 

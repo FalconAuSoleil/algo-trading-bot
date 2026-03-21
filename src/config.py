@@ -37,8 +37,6 @@ class SignalConfig:
     time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 290.0)
     time_min_15m: float = _envf("TIME_MIN_15M", 60.0)
     time_max_15m: float = _envf("TIME_MAX_15M", 780.0)
-    time_min_seconds: int = _envi("TIME_MIN_SECONDS", 45)
-    time_max_seconds: int = _envi("TIME_MAX_SECONDS", 180)
 
     # ── Chainlink arb ───────────────────────────────────────────────────────
     chainlink_period: float = _envf("CHAINLINK_PERIOD", 27.0)

@@ -8,6 +8,10 @@ aligned with the resolution source.
 Multiple free Polygon RPC endpoints are used with automatic rotation
 on failure.  If all RPCs are down, falls back to Binance REST as a
 last resort (logged as a warning so we know).
+
+v3.6 fix: Binance fallback no longer updates last_chainlink_ts.
+Previously setting last_chainlink_ts = now() during fallback would
+reset oracle_age to 0, masking staleness and silencing ORACLE_STALE.
 """
 
 from __future__ import annotations
@@ -87,7 +91,12 @@ class ChainlinkFeed:
                     if price and price > 0:
                         now = time.time()
                         self.last_chainlink_price = price
-                        self.last_chainlink_ts = now
+                        # v3.6 FIX: do NOT update last_chainlink_ts here.
+                        # oracle_age = now - last_chainlink_ts is used by the
+                        # ORACLE_STALE filter in signal.py. If we reset ts to
+                        # now() during a Binance fallback, oracle_age drops to
+                        # ~0 and the filter never fires — even when Chainlink
+                        # has been silent for minutes. Preserve the real ts.
                         if self.on_price:
                             await self.on_price(
                                 source="chainlink_binance_fallback",
@@ -97,7 +106,8 @@ class ChainlinkFeed:
                         if self._consecutive_rpc_failures <= 1:
                             log.warning(
                                 "[Chainlink] All RPCs failed, using "
-                                "Binance fallback ($%.2f)",
+                                "Binance fallback ($%.2f). "
+                                "oracle_age preserved for ORACLE_STALE filter.",
                                 price,
                             )
             except Exception as e:
