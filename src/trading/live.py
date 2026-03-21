@@ -17,6 +17,9 @@ These are now carried on the Signal object and populated by main.py.
 v3.6: BTC price fallback delay increased 30s→120s to reduce incorrect
 resolutions when the API is temporarily slow. Also add restore_pending()
 to reload in-flight trades from DB after a crash or restart.
+
+v3.9: fixed fetch_outcome call — was missing slug as first arg, causing
+silent TypeError and trades never resolving.
 """
 
 from __future__ import annotations
@@ -303,7 +306,7 @@ class LiveTrader:
     async def check_resolutions(
         self,
         btc_chainlink_price: float,
-        fetch_outcome: Optional[Callable] = None,
+        fetch_outcome: Optional[Callable[[str, float, int], object]] = None,
     ) -> list[dict]:
         """
         Check if pending positions have resolved.
@@ -312,6 +315,8 @@ class LiveTrader:
         price comparison only after _FALLBACK_DELAY_SEC (120s) if
         the API is still pending. Delay increased from 30s in v3.6
         to reduce incorrect resolutions on slow API responses.
+
+        fetch_outcome signature: (slug: str, start_time: float, duration: int) -> Optional[str]
         """
         now = time.time()
         resolved = []
@@ -331,6 +336,7 @@ class LiveTrader:
             if fetch_outcome:
                 try:
                     real_outcome = await fetch_outcome(
+                        info.get("slug", ""),          # v3.9: was missing
                         info.get("start_time", 0),
                         info.get("duration", 300),
                     )

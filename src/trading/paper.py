@@ -158,7 +158,7 @@ class PaperTrader:
         self,
         btc_chainlink_price: float,
         fetch_outcome: Optional[
-            Callable[[float, int], object]
+            Callable[[str, float, int], object]
         ] = None,
     ) -> list[dict]:
         """Check if any pending positions should be resolved.
@@ -166,6 +166,8 @@ class PaperTrader:
         Uses ONLY the real Polymarket API outcome. Retries
         indefinitely until the API returns "up" or "down".
         No BTC price fallback - only the official result counts.
+
+        fetch_outcome signature: (slug: str, start_time: float, duration: int) -> Optional[str]
         """
         now = time.time()
         resolved = []
@@ -184,6 +186,7 @@ class PaperTrader:
             if fetch_outcome:
                 try:
                     real_outcome = await fetch_outcome(
+                        info.get("slug", ""),          # v3.9: was missing
                         info.get("start_time", 0),
                         info.get("duration", 300),
                     )
