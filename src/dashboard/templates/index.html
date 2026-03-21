@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BTC Sniper — Polymarket Dashboard</title>
+  <title>Crypto Sniper — Polymarket Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
     :root {
@@ -287,7 +287,7 @@
 <body>
   <!-- Header -->
   <div class="header">
-    <h1><span>BTC</span> SNIPER <span style="font-size:12px;color:var(--text-dim)">v1.0</span></h1>
+    <h1><span>CRYPTO</span> SNIPER <span style="font-size:12px;color:var(--text-dim)">v3.9</span></h1>
     <div class="status-bar">
       <span><span class="status-dot off" id="dot-binance"></span>Binance</span>
       <span><span class="status-dot off" id="dot-chainlink"></span>Chainlink</span>
@@ -343,7 +343,8 @@
 
       <div class="signal-grid">
         <div class="signal-item">
-          <div class="signal-label">BTC Chainlink</div>
+          <!-- v3.9: label updated dynamically from signal slug -->
+          <div class="signal-label" id="sig-asset-label">Chainlink</div>
           <div class="signal-val" id="sig-btc-cl">$0.00</div>
         </div>
         <div class="signal-item">
@@ -471,6 +472,7 @@
           <thead>
             <tr>
               <th>Time</th>
+              <th>Asset</th>
               <th>Market</th>
               <th>Side</th>
               <th>Entry</th>
@@ -485,7 +487,7 @@
           </thead>
           <tbody id="trades-body">
             <tr>
-              <td colspan="11" style="text-align:center;color:var(--text-dim);padding:24px">
+              <td colspan="12" style="text-align:center;color:var(--text-dim);padding:24px">
                 No trades yet. Waiting for signals...
               </td>
             </tr>
@@ -509,6 +511,19 @@ let state = {
 
 let equityChart = null;
 let dailyChart = null;
+
+// v3.9: per-asset badge colors
+const ASSET_COLORS = {
+  BTC: '#f59e0b',
+  ETH: '#3b82f6',
+  SOL: '#8b5cf6',
+  XRP: '#10b981',
+};
+
+function assetFromSlug(slug) {
+  if (!slug) return 'BTC';
+  return (slug.split('-')[0] || 'btc').toUpperCase();
+}
 
 // ==================== WebSocket ====================
 let ws = null;
@@ -613,7 +628,7 @@ function renderPortfolio() {
 
   // Risk meters
   const ddPct = Math.abs(p.daily_pnl_pct || 0);
-  const ddMax = 15; // max_daily_drawdown %
+  const ddMax = 15;
   document.getElementById('risk-dd-val').textContent = ddPct.toFixed(1) + '%';
   const ddBar = document.getElementById('risk-dd-bar');
   ddBar.style.width = Math.min(100, (ddPct / ddMax) * 100) + '%';
@@ -652,10 +667,13 @@ function renderSignal() {
     action.className = 'signal-action no-trade';
   }
 
-  const fmt = (v, d=2) => v ? Number(v).toFixed(d) : '0';
   const fmtPct = (v, d=1) => v ? (Number(v) * 100).toFixed(d) + '%' : '0%';
   const fmtUsd = (v) => v ? '$' + Number(v).toLocaleString('en-US',
     {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '$0.00';
+
+  // v3.9: dynamic asset label derived from slug
+  const asset = assetFromSlug(s.slug);
+  document.getElementById('sig-asset-label').textContent = asset + ' Chainlink';
 
   document.getElementById('sig-btc-cl').textContent = fmtUsd(s.btc_chainlink);
   document.getElementById('sig-ref').textContent = fmtUsd(s.reference_price);
@@ -677,6 +695,12 @@ function renderSignal() {
   document.getElementById('sig-fee').textContent = fmtPct(s.taker_fee, 3);
   document.getElementById('sig-size').textContent = fmtUsd(s.size_usd);
 
+  // Market label with slug
+  const slug = s.slug || '';
+  if (slug) {
+    document.getElementById('market-question').textContent = slug;
+  }
+
   // Time remaining
   const tSec = s.time_remaining_sec || 0;
   const min = Math.floor(tSec / 60);
@@ -686,8 +710,8 @@ function renderSignal() {
   if (tSec < 30) timeEl.className = 'time-bar pulsing';
   else timeEl.className = 'time-bar';
 
-  // Progress bar (assuming 15 min = 900s total)
-  const totalSec = 900;
+  // v3.9: progress bar totalSec derived from slug (5m=300, 15m=900)
+  const totalSec = slug.includes('5m') ? 300 : 900;
   const pct = Math.max(0, Math.min(100, (tSec / totalSec) * 100));
   const pBar = document.getElementById('time-progress');
   pBar.style.width = pct + '%';
@@ -741,7 +765,7 @@ function renderTrades() {
   const trades = state.recent_trades || [];
 
   if (trades.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="11"
+    tbody.innerHTML = `<tr><td colspan="12"
       style="text-align:center;color:var(--text-dim);padding:24px">
       No trades yet. Waiting for signals...</td></tr>`;
     return;
@@ -751,16 +775,25 @@ function renderTrades() {
     const ts = new Date((t.timestamp || 0) * 1000);
     const timeStr = ts.toLocaleTimeString();
     const slug = t.slug || '';
+
+    // v3.9: extract asset from slug prefix (btc/eth/sol/xrp)
+    const asset = assetFromSlug(slug);
+    const assetColor = ASSET_COLORS[asset] || 'var(--text-dim)';
+    const assetBadge = `<span class="badge" style="background:rgba(255,255,255,0.07);color:${assetColor};border:1px solid ${assetColor}33">${asset}</span>`;
+
+    // v3.9: strip any asset prefix generically (not just btc-updown-)
+    const slugShort = slug.replace(/^[a-z]+-updown-/, '');
     const is15m = slug.includes('15m');
     const timeBadge = is15m
       ? '<span class="badge" style="background:var(--purple);color:#fff">15m</span>'
       : slug.includes('5m')
       ? '<span class="badge" style="background:var(--blue);color:#fff">5m</span>'
       : '';
-    const slugLink = slug
-      ? `<a href="https://polymarket.com/event/${slug}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none;font-size:11px;margin-left:4px">${slug.replace('btc-updown-','')}</a>`
+    const slugLink = slugShort
+      ? `<a href="https://polymarket.com/event/${slug}" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:none;font-size:11px;margin-left:4px">${slugShort}</a>`
       : '';
     const marketLabel = timeBadge + slugLink;
+
     const sideBadge = t.side === 'YES'
       ? '<span class="badge badge-yes">UP</span>'
       : '<span class="badge badge-no">DOWN</span>';
@@ -774,6 +807,7 @@ function renderTrades() {
 
     return `<tr>
       <td>${timeStr}</td>
+      <td>${assetBadge}</td>
       <td>${marketLabel}</td>
       <td>${sideBadge}</td>
       <td>$${(t.entry_price || 0).toFixed(4)}</td>
