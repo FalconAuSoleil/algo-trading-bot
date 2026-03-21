@@ -1,4 +1,8 @@
-"""Binance BTC/USDT real-time WebSocket feed."""
+"""Binance real-time WebSocket price feed.
+
+Supports multiple assets via configurable WebSocket URLs.
+v3.7: Made generic to support ETH, SOL, XRP, etc in addition to BTC.
+"""
 
 from __future__ import annotations
 
@@ -16,13 +20,21 @@ log = setup_logger("feeds.binance")
 
 
 class BinanceFeed:
-    """Streams BTC/USDT trades from Binance WebSocket."""
+    """Streams real-time trades from Binance WebSocket.
+    
+    Args:
+        symbol: Asset symbol (e.g., "BTC", "ETH", "SOL", "XRP")
+        url: WebSocket stream URL (e.g., "wss://stream.binance.com:9443/ws/btcusdt@trade")
+        on_price: Callback for price updates
+    """
 
     def __init__(
         self,
+        symbol: str = "BTC",
         url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade",
         on_price: Optional[Callable] = None,
     ):
+        self.symbol = symbol
         self.url = url
         self.on_price = on_price
         self._ws = None
@@ -34,12 +46,12 @@ class BinanceFeed:
         self._running = True
         while self._running:
             try:
-                log.info("[Binance] Connecting to %s", self.url)
+                log.info("[Binance] %s: Connecting to %s", self.symbol, self.url)
                 async with websockets.connect(
                     self.url, ping_interval=20, ping_timeout=10
                 ) as ws:
                     self._ws = ws
-                    log.info("[Binance] Connected")
+                    log.info("[Binance] %s: Connected", self.symbol)
                     async for message in ws:
                         if not self._running:
                             break
@@ -47,12 +59,13 @@ class BinanceFeed:
             except ConnectionClosed:
                 if self._running:
                     log.warning(
-                        "[Binance] Connection closed, reconnecting..."
+                        "[Binance] %s: Connection closed, reconnecting...",
+                        self.symbol,
                     )
                     await asyncio.sleep(2)
             except Exception as e:
                 if self._running:
-                    log.error("[Binance] Error: %s", e)
+                    log.error("[Binance] %s: Error: %s", self.symbol, e)
                     await asyncio.sleep(5)
 
     async def _handle_message(self, raw: str) -> None:
@@ -67,12 +80,13 @@ class BinanceFeed:
                     source="binance",
                     price=price,
                     timestamp=ts,
+                    symbol=self.symbol,
                 )
         except (KeyError, ValueError, TypeError) as e:
-            log.debug("[Binance] Parse error: %s", e)
+            log.debug("[Binance] %s: Parse error: %s", self.symbol, e)
 
     async def stop(self) -> None:
         self._running = False
         if self._ws:
             await self._ws.close()
-        log.info("[Binance] Feed stopped")
+        log.info("[Binance] %s: Feed stopped", self.symbol)
