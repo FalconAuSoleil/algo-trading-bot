@@ -1,10 +1,11 @@
 """Polymarket market discovery and orderbook feed.
 
-Uses deterministic slug-based discovery for BTC Up/Down markets:
-  5-min:  btc-updown-5m-{floor(unix_ts / 300) * 300}
-  15-min: btc-updown-15m-{floor(unix_ts / 900) * 900}
+Uses deterministic slug-based discovery for Up/Down markets:
+  5-min:  {prefix}-updown-5m-{floor(unix_ts / 300) * 300}
+  15-min: {prefix}-updown-15m-{floor(unix_ts / 900) * 900}
 
-Reference price ("price to beat") is fetched from the Polymarket
+v3.7: Generalized to support multiple asset prefixes (btc, eth, sol, xrp).
+Reference price (\"price to beat\") is fetched from the Polymarket
 past-results API, which provides the exact Chainlink snapshot price
 at each market window boundary.
 """
@@ -37,7 +38,7 @@ VARIANT_MAP = {
 
 @dataclass
 class MarketInfo:
-    """Represents an active BTC Up/Down market on Polymarket."""
+    """Represents an active Up/Down market on Polymarket."""
 
     condition_id: str = ""
     question: str = ""
@@ -116,26 +117,37 @@ class OrderbookState:
         return self.mid_up
 
 
-def compute_slug(interval_sec: int, ts: float = 0) -> str:
-    """Compute the deterministic market slug for a given time."""
+def compute_slug(asset_prefix: str, interval_sec: int, ts: float = 0) -> str:
+    """Compute the deterministic market slug for a given time.
+    
+    Args:
+        asset_prefix: Asset prefix (e.g., "btc", "eth", "xrp", "sol")
+        interval_sec: Market interval in seconds (300 or 900)
+        ts: Timestamp (defaults to now)
+    
+    Returns:
+        Slug string like "eth-updown-5m-1234567890"
+    """
     if ts <= 0:
         ts = time.time()
     aligned = int(ts // interval_sec) * interval_sec
     label = "5m" if interval_sec == INTERVAL_5M else "15m"
-    return f"btc-updown-{label}-{aligned}"
+    return f"{asset_prefix}-updown-{label}-{aligned}"
 
 
 class PolymarketFeed:
-    """Discovers BTC Up/Down markets using slug-based lookup
-    and polls orderbooks for active markets."""
+    """Discovers Up/Down markets using slug-based lookup
+    and polls orderbooks for active markets.
+    
+    Supports multiple asset prefixes (btc, eth, sol, xrp, etc).
+    """
 
     def __init__(
         self,
         gamma_url: str = "https://gamma-api.polymarket.com",
         clob_url: str = "https://clob.polymarket.com",
-        clob_ws_url: str = (
-            "wss://ws-subscriptions-clob.polymarket.com/ws/"
-        ),
+        clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/",
+        asset_prefixes: tuple[str, ...] = ("btc", "eth", "sol", "xrp"),
         intervals: tuple[int, ...] = (INTERVAL_5M, INTERVAL_15M),
         on_market_update: Optional[Callable] = None,
         on_orderbook_update: Optional[Callable] = None,
@@ -143,6 +155,7 @@ class PolymarketFeed:
         self.gamma_url = gamma_url
         self.clob_url = clob_url
         self.clob_ws_url = clob_ws_url
+        self.asset_prefixes = asset_prefixes
         self.intervals = intervals
         self.on_market_update = on_market_update
         self.on_orderbook_update = on_orderbook_update
@@ -155,7 +168,10 @@ class PolymarketFeed:
     async def start(self) -> None:
         self._running = True
         self._session = aiohttp.ClientSession()
-        log.info("[Polymarket] Feed starting (slug-based discovery)")
+        log.info(
+            "[Polymarket] Feed starting (multi-asset slug-based discovery) | "
+            "prefixes=%s", ",".join(self.asset_prefixes)
+        )
         await asyncio.gather(
             self._market_discovery_loop(),
             self._orderbook_poll_loop(),
@@ -180,12 +196,9 @@ class PolymarketFeed:
                         log.info("[Polymarket] Market expired: %s", market.slug)
                         del self.active_markets[cid]
                         self.orderbooks.pop(cid, None)
-                elif (
-                    market.reference_price <= 0
-                    and now >= market.start_time
-                ):
+                elif market.reference_price <= 0 and now >= market.start_time:
                     ptb = await self._fetch_price_to_beat(
-                        market.start_time, market.duration_seconds
+                        market.slug, market.start_time, market.duration_seconds
                     )
                     if ptb > 0:
                         market.reference_price = ptb
@@ -206,24 +219,28 @@ class PolymarketFeed:
         now = time.time()
         found = 0
 
-        for interval in self.intervals:
-            aligned = int(now // interval) * interval
-            for offset in range(3):
-                window_start = aligned + (offset * interval)
-                slug = compute_slug(interval, window_start)
+        for asset_prefix in self.asset_prefixes:
+            for interval in self.intervals:
+                aligned = int(now // interval) * interval
+                for offset in range(3):
+                    window_start = aligned + (offset * interval)
+                    slug = compute_slug(asset_prefix, interval, window_start)
 
-                existing = [m for m in self.active_markets.values() if m.slug == slug]
-                if existing:
-                    continue
+                    existing = [
+                        m for m in self.active_markets.values() if m.slug == slug
+                    ]
+                    if existing:
+                        continue
 
-                market_info = await self._fetch_market_by_slug(slug)
-                if market_info and not market_info.is_expired:
-                    self.active_markets[market_info.condition_id] = market_info
-                    found += 1
-                    log.info(
-                        "[Polymarket] Discovered: %s | accepting=%s | T-%ds",
-                        slug, market_info.accepting_orders, int(market_info.time_remaining),
-                    )
+                    market_info = await self._fetch_market_by_slug(slug)
+                    if market_info and not market_info.is_expired:
+                        self.active_markets[market_info.condition_id] = market_info
+                        found += 1
+                        log.info(
+                            "[Polymarket] Discovered: %s | accepting=%s | T-%ds",
+                            slug, market_info.accepting_orders,
+                            int(market_info.time_remaining),
+                        )
 
         expired = [cid for cid, m in self.active_markets.items() if m.is_expired]
         for cid in expired:
@@ -289,7 +306,7 @@ class PolymarketFeed:
 
             ref_price = 0.0
             if start_ts > 0 and time.time() >= start_ts:
-                ref_price = await self._fetch_price_to_beat(start_ts, duration)
+                ref_price = await self._fetch_price_to_beat(slug, start_ts, duration)
             if ref_price > 0:
                 log.info("[Polymarket] Price to beat for %s: $%.2f", slug, ref_price)
 
@@ -404,7 +421,17 @@ class PolymarketFeed:
         except ValueError:
             return 0.0
 
-    async def _fetch_price_to_beat(self, start_time: float, duration: int) -> float:
+    async def _fetch_price_to_beat(
+        self, slug: str, start_time: float, duration: int
+    ) -> float:
+        """Fetch the reference price for a market.
+        
+        Extracts the asset symbol from the slug and uses it for the API call.
+        """
+        # Extract symbol from slug: "btc-updown-5m-..." or "eth-updown-15m-..."
+        parts = slug.split("-")
+        symbol = parts[0].upper() if parts else "BTC"
+
         variant = VARIANT_MAP.get(duration, "fiveminute")
         start_iso = datetime.fromtimestamp(
             start_time, tz=timezone.utc
@@ -414,7 +441,7 @@ class PolymarketFeed:
             async with self._session.get(
                 "https://polymarket.com/api/past-results",
                 params={
-                    "symbol": "BTC",
+                    "symbol": symbol,
                     "variant": variant,
                     "assetType": "crypto",
                     "currentEventStartTime": start_iso,
@@ -436,10 +463,15 @@ class PolymarketFeed:
             return float(results[-1]["closePrice"])
 
         except (aiohttp.ClientError, TimeoutError, KeyError, ValueError, IndexError) as e:
-            log.debug("[Polymarket] Price-to-beat fetch error: %s", e)
+            log.debug("[Polymarket] Price-to-beat fetch error (%s): %s", slug, e)
             return 0.0
 
-    async def fetch_market_outcome(self, start_time: float, duration: int) -> Optional[str]:
+    async def fetch_market_outcome(self, slug: str, start_time: float, duration: int) -> Optional[str]:
+        """Fetch the outcome of a resolved market."""
+        # Extract symbol from slug
+        parts = slug.split("-")
+        symbol = parts[0].upper() if parts else "BTC"
+
         next_start = start_time + duration
         variant = VARIANT_MAP.get(duration, "fiveminute")
         next_iso = datetime.fromtimestamp(
@@ -450,7 +482,7 @@ class PolymarketFeed:
             async with self._session.get(
                 "https://polymarket.com/api/past-results",
                 params={
-                    "symbol": "BTC",
+                    "symbol": symbol,
                     "variant": variant,
                     "assetType": "crypto",
                     "currentEventStartTime": next_iso,
