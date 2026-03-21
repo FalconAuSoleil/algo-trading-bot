@@ -1,4 +1,7 @@
-"""BTC Sniper v3 - Multi-Strategy Orchestrator.
+"""BTC Sniper v3.7 - Multi-Asset Multi-Strategy Orchestrator.
+
+v3.7: Supports multiple assets (BTC, ETH, SOL, XRP) with per-asset
+Chainlink feeds, Binance feeds, and optimized signal engines.
 
 Coordinates all components: feeds, multi-strategy signal engine,
 trading, trend tracking, and dashboard.
@@ -23,7 +26,7 @@ from src.feeds.binance import BinanceFeed
 from src.feeds.chainlink import ChainlinkFeed
 from src.feeds.polymarket import PolymarketFeed, MarketInfo
 from src.engine.signal import SignalEngine, MarketState, Signal
-from src.engine.trend import market_trend          # module-level singleton
+from src.engine.trend import market_trend
 from src.trading.portfolio import Portfolio
 from src.trading.paper import PaperTrader
 from src.trading.live import LiveTrader
@@ -33,29 +36,77 @@ log = setup_logger("main", config.log_level)
 
 
 class Orchestrator:
-    """Main system coordinator."""
+    """Main system coordinator with multi-asset support."""
 
     def __init__(self):
         self.db = Database(config.db_path)
 
-        # Feeds
-        self.binance_feed = BinanceFeed(
-            url=config.binance.ws_url,
-            on_price=self._on_price,
-        )
-        self.chainlink_feed = ChainlinkFeed(
-            on_price=self._on_price,
+        # ── Multi-asset feeds ────────────────────────────────────────────────────────
+        # v3.7: Create per-asset Chainlink and Binance feeds for all enabled assets.
+        self._chainlink_feeds: dict[str, ChainlinkFeed] = {}
+        self._binance_feeds: dict[str, BinanceFeed] = {}
+        self._signal_engines: dict[str, SignalEngine] = {}
+        self._asset_prices: dict[str, dict] = {}
+
+        for asset in config.assets:
+            if not asset.enabled:
+                continue
+
+            # Chainlink feed for this asset
+            cl_feed = ChainlinkFeed(
+                symbol=asset.symbol,
+                contract_address=asset.chainlink_address,
+                binance_symbol=asset.binance_symbol,
+                on_price=self._on_price,
+            )
+            self._chainlink_feeds[asset.symbol] = cl_feed
+
+            # Binance feed for this asset
+            # Construct WS URL: wss://stream.binance.com:9443/ws/{symbol_lower}usdt@trade
+            binance_ws_url = (
+                f"wss://stream.binance.com:9443/ws/{asset.binance_symbol.lower()}@trade"
+            )
+            bn_feed = BinanceFeed(
+                symbol=asset.symbol,
+                url=binance_ws_url,
+                on_price=self._on_price,
+            )
+            self._binance_feeds[asset.symbol] = bn_feed
+
+            # Signal engine for this asset
+            signal_engine = SignalEngine(
+                cfg=config.signal,
+                sigma_fallback=asset.sigma_fallback,
+                delta_min_abs=asset.delta_min_abs,
+            )
+            self._signal_engines[asset.symbol] = signal_engine
+
+            # Initialize price state
+            self._asset_prices[asset.symbol] = {
+                "chainlink": 0.0,
+                "binance": 0.0,
+                "chainlink_ts": 0.0,
+            }
+
+            log.info(
+                "[Multi-Asset] Initialized %s | CL_addr=%s | "
+                "sigma_fallback=%.2e | delta_min_abs=%.4f",
+                asset.symbol, asset.chainlink_address[:10] + "...",
+                asset.sigma_fallback, asset.delta_min_abs,
+            )
+
+        # Polymarket feed (multi-asset)
+        asset_prefixes = tuple(
+            asset.polymarket_prefix for asset in config.assets if asset.enabled
         )
         self.polymarket_feed = PolymarketFeed(
             gamma_url=config.polymarket.gamma_url,
             clob_url=config.polymarket.clob_url,
             clob_ws_url=config.polymarket.clob_ws_url,
+            asset_prefixes=asset_prefixes,
             on_market_update=self._on_market_update,
             on_orderbook_update=self._on_orderbook_update,
         )
-
-        # Multi-strategy signal engine
-        self.signal_engine = SignalEngine(config.signal)
 
         # Portfolio + Trader
         self.portfolio = Portfolio(
@@ -70,8 +121,6 @@ class Orchestrator:
             )
 
         # Internal state
-        self._btc_binance: float = 0.0
-        self._btc_chainlink: float = 0.0
         self._active_markets: dict[str, MarketInfo] = {}
         self._orderbooks: dict = {}
         self._running = False
@@ -82,11 +131,11 @@ class Orchestrator:
 
     async def start(self) -> None:
         log.info("=" * 60)
-        log.info("  BTC SNIPER v3 - Multi-Strategy Engine")
+        log.info("  BTC SNIPER v3.7 - Multi-Asset Multi-Strategy Engine")
+        log.info("  Assets: %s", ", ".join(a.symbol for a in config.assets if a.enabled))
         log.info("  Strategies: ChainlinkArb | Momentum | MeanReversion")
         log.info("  Mode: %s", config.trading_mode.upper())
         log.info("  Capital: $%.2f", config.paper_initial_balance)
-        log.info("  Chainlink: DIRECT on-chain oracle (Polygon)")
         log.info("=" * 60)
 
         Path("data").mkdir(exist_ok=True)
@@ -95,10 +144,6 @@ class Orchestrator:
         db_state = await self.db.load_portfolio_state(config.trading_mode)
         self.portfolio.restore_from_db(db_state)
 
-        # v3.6: restore in-flight trades from DB after crash/restart.
-        # paper.py and live.py both implement restore_pending(); without
-        # calling it here the methods are dead code and trades placed
-        # before the crash stay stuck as outcome='pending' forever.
         if hasattr(self.trader, 'restore_pending'):
             await self.trader.restore_pending()
 
@@ -111,15 +156,24 @@ class Orchestrator:
 
         self._running = True
 
+        # Create tasks for all feeds
         tasks = [
-            asyncio.create_task(self.binance_feed.start(), name="binance_feed"),
-            asyncio.create_task(self.chainlink_feed.start(), name="chainlink_feed"),
             asyncio.create_task(self.polymarket_feed.start(), name="polymarket_feed"),
             asyncio.create_task(self._signal_loop(), name="signal_loop"),
             asyncio.create_task(self._resolution_loop(), name="resolution_loop"),
             asyncio.create_task(self._snapshot_loop(), name="snapshot_loop"),
             asyncio.create_task(self._dashboard_server(), name="dashboard"),
         ]
+
+        # Add per-asset feed tasks
+        for symbol, cl_feed in self._chainlink_feeds.items():
+            tasks.append(
+                asyncio.create_task(cl_feed.start(), name=f"chainlink_feed_{symbol}")
+            )
+        for symbol, bn_feed in self._binance_feeds.items():
+            tasks.append(
+                asyncio.create_task(bn_feed.start(), name=f"binance_feed_{symbol}")
+            )
 
         if sys.platform != "win32":
             import signal
@@ -142,9 +196,14 @@ class Orchestrator:
             return
         self._running = False
         log.info("[Main] Shutting down...")
-        await self.binance_feed.stop()
-        await self.chainlink_feed.stop()
+
+        # Stop all feeds
         await self.polymarket_feed.stop()
+        for cl_feed in self._chainlink_feeds.values():
+            await cl_feed.stop()
+        for bn_feed in self._binance_feeds.values():
+            await bn_feed.stop()
+
         if config.is_live and hasattr(self.trader, "stop"):
             await self.trader.stop()
         await self._save_snapshot()
@@ -156,25 +215,32 @@ class Orchestrator:
 
     # ── Price callbacks ──────────────────────────────────────────────────────────────────
 
-    async def _on_price(self, source: str, price: float, timestamp: float) -> None:
+    async def _on_price(self, source: str, price: float, timestamp: float, symbol: str = "BTC") -> None:
+        """Handle price updates from feeds. v3.7: routes by symbol."""
+        if symbol not in self._asset_prices:
+            return
+
         if source == "binance":
-            self._btc_binance = price
-            self.signal_engine.update_price(price, timestamp)
+            self._asset_prices[symbol]["binance"] = price
+            if symbol in self._signal_engines:
+                self._signal_engines[symbol].update_price(price, timestamp)
         elif source in ("chainlink", "chainlink_binance_fallback"):
-            self._btc_chainlink = price
-            self.signal_engine.update_chainlink_price(price, timestamp)
+            self._asset_prices[symbol]["chainlink"] = price
+            self._asset_prices[symbol]["chainlink_ts"] = timestamp
+            if symbol in self._signal_engines:
+                self._signal_engines[symbol].update_chainlink_price(price, timestamp)
 
         await dashboard_state.update_feeds({
-            "binance": self._btc_binance > 0,
-            "chainlink": self._btc_chainlink > 0,
+            "binance": any(p["binance"] > 0 for p in self._asset_prices.values()),
+            "chainlink": any(p["chainlink"] > 0 for p in self._asset_prices.values()),
             "polymarket": len(self._active_markets) > 0,
         })
 
     async def _on_market_update(self, markets: dict[str, MarketInfo]) -> None:
         self._active_markets = markets
         await dashboard_state.update_feeds({
-            "binance": self._btc_binance > 0,
-            "chainlink": self._btc_chainlink > 0,
+            "binance": any(p["binance"] > 0 for p in self._asset_prices.values()),
+            "chainlink": any(p["chainlink"] > 0 for p in self._asset_prices.values()),
             "polymarket": len(markets) > 0,
         })
 
@@ -194,10 +260,8 @@ class Orchestrator:
     async def _evaluate_markets(self) -> None:
         if not self._active_markets:
             return
-        if self._btc_chainlink <= 0:
-            return
 
-        consecutive_losses = await self.db.get_consecutive_losses(config.trading_mode)
+        # Extract asset symbol from market slug to route to correct signal engine
         markets_snapshot = list(self._active_markets.items())
 
         for cid, market in markets_snapshot:
@@ -206,14 +270,38 @@ class Orchestrator:
             if market.reference_price <= 0:
                 continue
 
+            # Parse asset from slug: "btc-updown-5m-..." → "BTC"
+            slug_parts = market.slug.split("-")
+            asset_prefix = slug_parts[0].upper() if slug_parts else "BTC"
+
+            # Find the asset config for this slug
+            asset_config = None
+            for ac in config.assets:
+                if ac.polymarket_prefix.upper() == asset_prefix:
+                    asset_config = ac
+                    break
+
+            if asset_config is None or not asset_config.enabled:
+                continue
+
+            symbol = asset_config.symbol
+            if symbol not in self._signal_engines:
+                continue
+
+            prices = self._asset_prices.get(symbol, {})
+            chainlink_price = prices.get("chainlink", 0.0)
+
+            if chainlink_price <= 0:
+                continue
+
             ob = self._orderbooks.get(cid)
 
             state = MarketState(
                 market_id=cid,
                 reference_price=market.reference_price,
                 end_time=market.end_time,
-                btc_chainlink=self._btc_chainlink,
-                btc_binance=self._btc_binance,
+                btc_chainlink=chainlink_price,  # named btc_* for compat, but is asset-generic
+                btc_binance=prices.get("binance", 0.0),
                 p_market_yes=ob.mid_yes if ob else 0.5,
                 depth_yes=ob.depth_ask_yes if ob else 0,
                 depth_no=ob.depth_ask_no if ob else 0,
@@ -228,7 +316,9 @@ class Orchestrator:
                 duration_seconds=market.duration_seconds,
             )
 
-            sig = self.signal_engine.evaluate(
+            consecutive_losses = await self.db.get_consecutive_losses(config.trading_mode)
+
+            sig = self._signal_engines[symbol].evaluate(
                 state=state,
                 capital=self.portfolio.balance,
                 consecutive_losses=consecutive_losses,
@@ -241,9 +331,6 @@ class Orchestrator:
             sig.slug = market.slug
             sig.market_start_time = market.start_time
             sig.market_duration = market.duration_seconds
-
-            # Populate outcome token IDs for live trader
-            # (BUGFIX: previously conditionId was used as tokenID)
             sig.token_id_yes = market.token_id_up
             sig.token_id_no = market.token_id_down
 
@@ -324,16 +411,14 @@ class Orchestrator:
             if sig.action == "BUY":
                 trade_id = await self.trader.execute(sig)
                 if trade_id:
-                    # Track which strategy fired this trade
                     self._strategy_by_trade[trade_id] = sig.strategy_used
-
                     full = await self.db.get_trade(trade_id)
                     if full:
                         await dashboard_state.update_trade(full)
                     await dashboard_state.update_portfolio(
                         self.portfolio.get_stats()
                     )
-                    self.signal_engine.reset_market_stability(market.slug)
+                    self._signal_engines[symbol].reset_market_stability(market.slug)
 
         await dashboard_state.update_portfolio(self.portfolio.get_stats())
 
@@ -342,45 +427,52 @@ class Orchestrator:
             try:
                 if self.trader.pending_count > 0:
                     resolved = await self.trader.check_resolutions(
-                        self._btc_chainlink,
+                        # For multi-asset, pass only the price of the asset being resolved
+                        # The trader will determine the asset from market slug/ID
+                        any(p["chainlink"] for p in self._asset_prices.values()) or 0.0,
                         fetch_outcome=self.polymarket_feed.fetch_market_outcome,
                     )
                     for r in resolved:
                         trade_id = r["trade_id"]
-                        outcome = r["outcome"]   # "won" or "lost"
-                        side = r["side"]          # "YES" or "NO"
+                        outcome = r["outcome"]
+                        side = r["side"]
                         won = outcome == "won"
 
-                        # Update per-strategy performance tracker
                         strategy = self._strategy_by_trade.pop(
                             trade_id, r.get("strategy_used", "chainlink_arb")
                         )
-                        self.signal_engine.record_result(strategy, won)
 
-                        # Update market trend tracker
-                        # YES bet won  → BTC ended ABOVE ref → market went UP
-                        # YES bet lost → BTC ended BELOW ref → market went DOWN
-                        # NO bet won   → BTC ended BELOW ref → market went DOWN
-                        # NO bet lost  → BTC ended ABOVE ref → market went UP
+                        # Find the signal engine for this trade's asset
+                        # by parsing the market slug in the trade record
+                        symbol = "BTC"  # default
+                        if "slug" in r:
+                            slug_asset = r["slug"].split("-")[0].upper()
+                            for ac in config.assets:
+                                if ac.polymarket_prefix.upper() == slug_asset:
+                                    symbol = ac.symbol
+                                    break
+
+                        if symbol in self._signal_engines:
+                            self._signal_engines[symbol].record_result(strategy, won)
+
                         if side == "YES":
                             market_direction = "up" if won else "down"
                         else:
                             market_direction = "down" if won else "up"
+
                         try:
                             market_trend.record(market_direction)
                         except Exception:
                             pass
 
-                        # Cross-market propagation: notify booster if this was
-                        # a 5-minute market. The booster will then apply a
-                        # decaying confidence boost to 15m bets for 45 seconds.
                         if r.get("duration", 300) == 300:
                             try:
-                                self.signal_engine.record_5m_resolution(
-                                    chainlink_price=r["btc_price"],
-                                    reference_price=r["ref_price"],
-                                    direction=market_direction,
-                                )
+                                if symbol in self._signal_engines:
+                                    self._signal_engines[symbol].record_5m_resolution(
+                                        chainlink_price=r["btc_price"],
+                                        reference_price=r["ref_price"],
+                                        direction=market_direction,
+                                    )
                             except Exception as exc:
                                 log.debug(
                                     "[CrossMarket] record error: %s", exc
@@ -388,9 +480,9 @@ class Orchestrator:
 
                         log.info(
                             "[Resolution] trade=%d strategy=%s won=%s "
-                            "trend_direction=%s | pnl=$%.2f",
+                            "trend_direction=%s | pnl=$%.2f | symbol=%s",
                             trade_id, strategy, won,
-                            market_direction, r["pnl"],
+                            market_direction, r["pnl"], symbol,
                         )
 
                         full = await self.db.get_trade(trade_id)
@@ -437,7 +529,7 @@ class Orchestrator:
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="BTC Sniper v3 - Multi-Strategy Engine"
+        description="BTC Sniper v3.7 - Multi-Asset Multi-Strategy Engine"
     )
     parser.add_argument("--mode", choices=["paper", "live", "collect"], default=None)
     parser.add_argument("--balance", type=float, default=None)
