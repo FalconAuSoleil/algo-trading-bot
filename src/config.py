@@ -45,7 +45,7 @@ class AssetConfig:
 
 @dataclass(frozen=True)
 class SignalConfig:
-    # ── Edge filters ─────────────────────────────────────────────────────
+    # ── Edge filters ───────────────────────────────────────────────────────────────────────────────
     edge_min: float = _envf("EDGE_MIN", 0.06)
     edge_max: float = _envf("EDGE_MAX", 0.15)
     min_true_prob: float = _envf("MIN_TRUE_PROB", 0.56)
@@ -54,66 +54,71 @@ class SignalConfig:
     max_market_prob_side: float = _envf("MAX_MARKET_PROB_SIDE", 0.70)
     min_market_liquidity: float = _envf("MIN_MARKET_LIQUIDITY", 15.0)
 
-    # ── Timing windows ───────────────────────────────────────────────────────
-    time_min_5m: float = _envf("TIME_MIN_5M", 45.0)
+    # ── Timing windows ────────────────────────────────────────────────────────────────────────────
+    # v4.0: raised from 45s → 65s.
+    # Analysis of paper trade screens shows 3 consecutive losses all
+    # occurring at T=58-68s with small deltas (0.25-0.27%).
+    # Late-window bets on small moves are systematically unprofitable:
+    # the signal-to-noise ratio at T<65s is insufficient to overcome
+    # the diffusion uncertainty on a small delta.
+    time_min_5m: float = _envf("TIME_MIN_5M", 65.0)
     time_max_5m: float = _envf("TIME_MAX_5M", 180.0)
     time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 290.0)
     time_min_15m: float = _envf("TIME_MIN_15M", 60.0)
     # v3.8: reduced from 780s → 550s.
-    # At T-780s on a 15m market, diffusion uncertainty over 13min is too
-    # large for reliable edge. Tighter window cuts false positives.
     time_max_15m: float = _envf("TIME_MAX_15M", 550.0)
 
-    # ── Chainlink arb ───────────────────────────────────────────────────────
+    # ── Chainlink arb ─────────────────────────────────────────────────────────────────────────────────
     chainlink_period: float = _envf("CHAINLINK_PERIOD", 27.0)
     chainlink_edge_window: float = _envf("CHAINLINK_EDGE_WINDOW", 8.0)
 
-    # ── OFI ──────────────────────────────────────────────────────────────────
+    # ── OFI ─────────────────────────────────────────────────────────────────────────────────────────
     ofi_weight: float = _envf("OFI_WEIGHT", 0.20)
 
-    # ── Kyle ─────────────────────────────────────────────────────────────────────
+    # ── Kyle ───────────────────────────────────────────────────────────────────────────────────────────────
     kyle_spread_penalty: float = _envf("KYLE_SPREAD_PENALTY", 0.15)
 
-    # ── Hawkes ───────────────────────────────────────────────────────────────────
+    # ── Hawkes ───────────────────────────────────────────────────────────────────────────────────────────
     hawkes_mu: float = _envf("HAWKES_MU", 0.1)
     hawkes_alpha: float = _envf("HAWKES_ALPHA", 0.8)
     hawkes_beta: float = _envf("HAWKES_BETA", 2.0)
     hawkes_history: int = _envi("HAWKES_HISTORY", 200)
 
-    # ── Momentum ───────────────────────────────────────────────────────────────────
+    # ── Momentum ───────────────────────────────────────────────────────────────────────────────────────────
     momentum_factor: float = _envf("MOMENTUM_FACTOR", 80.0)
     momentum_min_threshold: float = _envf("MOMENTUM_MIN_THRESHOLD", 0.0008)
 
-    # ── Mean Reversion ─────────────────────────────────────────────────────────────────
+    # ── Mean Reversion ────────────────────────────────────────────────────────────────────────────────────────
     mean_reversion_delta_threshold: float = _envf("MEAN_REV_DELTA_THRESHOLD", 0.0020)
 
-    # ── Diffusion model ────────────────────────────────────────────────────────────
+    # ── Diffusion model ─────────────────────────────────────────────────────────────────────────────────────
     delta_min_abs: float = _envf("DELTA_MIN_ABS", 0.0010)
 
-    # ── Oracle freshness filter ───────────────────────────────────────────────────────
+    # ── Oracle freshness filter ─────────────────────────────────────────────────────────────────────────
     oracle_freshness_max_age_sec: float = _envf("ORACLE_FRESHNESS_MAX_AGE_SEC", 55.0)
 
-    # ── Stability filter ─────────────────────────────────────────────────────────────────
+    # ── Stability filter ──────────────────────────────────────────────────────────────────────────────────────
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
-    # v3.8: raised from 3 → 8. 3 obs = only 15min of history, too easy
-    # to pass on a lucky streak. 8 obs ≈ 40min, substantially more robust.
-    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 8)
+    # v4.0: reduced from 8 → 5.
+    # v3.8 raised this from 3→8 without impact analysis. At 2s loop
+    # interval, 8 samples = 16s minimum wait, causing the bot to likely
+    # under-trade and lose opportunities. 5 samples (10s accumulation)
+    # provides solid evidence while maintaining trade frequency.
+    stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 5)
     stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.75)
     # v3.8: tightened from 0.60 → 0.40. CV 60% accepted very dispersed
     # edges. 40% requires more consistent edge magnitude before betting.
     stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.40)
 
-    # ── Source coherence ─────────────────────────────────────────────────────────────────
-    # v3.8: raised from 0.003 → 0.005.
-    # Chainlink BTC lag ~27s × vol ~0.0145%/s = ~0.39% expected divergence.
-    # 0.3% threshold blocked ~33% of valid signals due to normal oracle lag.
+    # ── Source coherence ────────────────────────────────────────────────────────────────────────────────────
+    # v3.8: raised from 0.003 → 0.005 (correct, kept in v4.0).
     source_coherence_max: float = _envf("SOURCE_COHERENCE_MAX", 0.005)
 
-    # ── Fee model ────────────────────────────────────────────────────────────────────
+    # ── Fee model ──────────────────────────────────────────────────────────────────────────────────────────
     delta_min: float = _envf("DELTA_MIN", 0.0012)
     volatility_max: float = _envf("VOLATILITY_MAX", 0.0015)
     volatility_window_minutes: int = 30
-    fee_rate: float = 0.25
+    fee_rate: float = 0.02   # v4.0: corrected from 0.25 to match linear fee model
     fee_exponent: int = 2
 
 
@@ -122,7 +127,11 @@ class RiskConfig:
     kelly_fraction: float = _envf("KELLY_FRACTION", 0.25)
     max_position_pct: float = _envf("MAX_POSITION_PCT", 0.05)
     max_daily_drawdown: float = _envf("MAX_DAILY_DRAWDOWN", 0.06)
-    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 4)
+    # v4.0: reduced from 4 → 3.
+    # 3 consecutive losses on a ~60% win-rate strategy is a 1-in-15
+    # event (≈ (0.40)^3 = 6.4%). This is a strong signal to pause and
+    # reassess. The old threshold of 4 allowed too much capital erosion.
+    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 3)
     max_open_positions: int = _envi("MAX_OPEN_POSITIONS", 2)
     max_daily_risk: float = _envf("MAX_DAILY_RISK", 0.12)
 
@@ -215,8 +224,6 @@ class AppConfig:
             chainlink_period=120.0,
             oracle_freshness_max_age_sec=90.0,
             delta_min_abs=0.0015,
-            # v3.8: 0.008 (was 0.009 = same as SOL). XRP is less volatile
-            # than SOL; using SOL's fallback was over-conservative.
             sigma_fallback=0.008 / (300 ** 0.5),  # ~4.62e-4
             supported_intervals=(900,),  # 15m only — 5m API not supported for XRP
             enabled=True,
