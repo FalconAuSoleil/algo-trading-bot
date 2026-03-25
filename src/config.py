@@ -56,11 +56,6 @@ class SignalConfig:
 
     # ── Timing windows ────────────────────────────────────────────────────────────────────────────
     # v4.0: raised from 45s → 65s.
-    # Analysis of paper trade screens shows 3 consecutive losses all
-    # occurring at T=58-68s with small deltas (0.25-0.27%).
-    # Late-window bets on small moves are systematically unprofitable:
-    # the signal-to-noise ratio at T<65s is insufficient to overcome
-    # the diffusion uncertainty on a small delta.
     time_min_5m: float = _envf("TIME_MIN_5M", 65.0)
     time_max_5m: float = _envf("TIME_MAX_5M", 180.0)
     time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 290.0)
@@ -103,14 +98,9 @@ class SignalConfig:
     # ── Stability filter ──────────────────────────────────────────────────────────────────────────────────────
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
     # v4.0: reduced from 8 → 5.
-    # v3.8 raised this from 3→8 without impact analysis. At 2s loop
-    # interval, 8 samples = 16s minimum wait, causing the bot to likely
-    # under-trade and lose opportunities. 5 samples (10s accumulation)
-    # provides solid evidence while maintaining trade frequency.
     stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 5)
     stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.75)
-    # v3.8: tightened from 0.60 → 0.40. CV 60% accepted very dispersed
-    # edges. 40% requires more consistent edge magnitude before betting.
+    # v3.8: tightened from 0.60 → 0.40.
     stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.40)
 
     # ── Source coherence ────────────────────────────────────────────────────────────────────────────────────
@@ -124,35 +114,39 @@ class SignalConfig:
     fee_rate: float = 0.02   # v4.0: corrected from 0.25 to match linear fee model
     fee_exponent: int = 2
 
-    # ── BTC 15m Stabilization strategy (v4.1) ─────────────────────────────────────────────────────
-    # Activates in the last 4 minutes of BTC 15m markets when one side
-    # has stabilized at 63-85¢. Exploits late-window mispricing instead
-    # of the overcrowded Chainlink-lag arb.
+    # ── BTC 15m Stabilization strategy (v4.1 / v4.2) ──────────────────────────────────────────────
+    # Activates in the last 6-7 minutes of BTC 15m markets when one side
+    # has stabilized at 63-85¢. Two firing tiers:
     #
-    # Rationale for 63-85¢ range (v4.1 widened from 80¢ → 85¢):
-    #   <63¢: not enough consensus, reversal probability too high
-    #   >85¢: market already fully converged, fee eats the remaining edge
-    #   70¢ is the empirical sweet spot (user observation + Brownian check)
-    #   79¢ trade confirmed profitable → raised ceiling to 85¢
+    #   Normal tier (btc_stab_time_max=360s, edge_min=2%):
+    #     Standard Brownian model. Fires when p_diff - entry - fee >= 2%.
+    #
+    #   Strong-move tier (btc_stab_strong_time_max=420s, edge_min=1%):
+    #     Activates when |BTC_chainlink - reference| >= btc_stab_strong_move_usd ($150).
+    #     A large USD divergence signals the oracle update hasn't fully
+    #     propagated to the market yet — outcome near-certain, earlier/
+    #     larger entry justified. Brownian check still runs; only the
+    #     edge floor is relaxed (1% vs 2%).
     btc_stab_price_min: float = _envf("BTC_STAB_PRICE_MIN", 0.63)
     btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.85)   # v4.1: 0.80 → 0.85
     btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 60.0)     # T_remaining min
-    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 240.0)    # v4.1: 180s → 240s (4 min)
+    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 360.0)    # v4.2: 240s → 360s (6 min)
     btc_stab_window_sec: float = 30.0    # stability measurement window (seconds)
     btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.08)   # v4.1: 0.06 → 0.08
     btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 5)            # min history before firing
-    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.020)    # v4.1: 0.030 → 0.020 (relaxed)
+    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.020)    # v4.1: 0.030 → 0.020
     btc_stab_kelly_fraction: float = 0.20   # conservative Kelly multiplier
     btc_stab_max_bet_fraction: float = _envf("BTC_STAB_MAX_BET", 0.030)  # 3% cap (vs 4%)
+    # v4.2: strong-move fast-track
+    # When |btc_chainlink - reference| >= strong_move_usd, the strategy fires
+    # in an extended window with a relaxed edge floor (1% instead of 2%).
+    btc_stab_strong_move_usd: float = _envf("BTC_STAB_STRONG_MOVE_USD", 150.0)
+    btc_stab_strong_time_max: float = _envf("BTC_STAB_STRONG_TIME_MAX", 420.0)   # 7 min
+    btc_stab_strong_edge_min: float = _envf("BTC_STAB_STRONG_EDGE_MIN", 0.010)   # 1%
 
     # ── Peak hours gate — ETH/SOL/XRP + BTC 5m (v4.1) ─────────────────────────────────────────────
     # ETH/SOL/XRP and BTC 5m are restricted to Mon-Fri 08:00-18:00 ET.
-    # BTC 15m uses _BTCStabilizationEngine which is 24/7 (its own time
-    # window T=60-240s acts as a natural gate).
-    #
-    # Rationale: data shows all weekend/late-night losses correlate with
-    # thin books (spread ≥2¢) where the signal fires but edge is fictitious.
-    # Setting peak_hours_enabled=False via env var re-enables 24/7 mode.
+    # BTC 15m uses _BTCStabilizationEngine which is 24/7.
     peak_hours_enabled: bool = True
     peak_start_hour_et: int = _envi("PEAK_START_HOUR_ET", 8)   # 08:00 ET
     peak_end_hour_et: int = _envi("PEAK_END_HOUR_ET", 18)      # 18:00 ET
@@ -164,9 +158,6 @@ class RiskConfig:
     max_position_pct: float = _envf("MAX_POSITION_PCT", 0.05)
     max_daily_drawdown: float = _envf("MAX_DAILY_DRAWDOWN", 0.06)
     # v4.0: reduced from 4 → 3.
-    # 3 consecutive losses on a ~60% win-rate strategy is a 1-in-15
-    # event (≈ (0.40)^3 = 6.4%). This is a strong signal to pause and
-    # reassess. The old threshold of 4 allowed too much capital erosion.
     max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 3)
     max_open_positions: int = _envi("MAX_OPEN_POSITIONS", 2)
     max_daily_risk: float = _envf("MAX_DAILY_RISK", 0.12)
