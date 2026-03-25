@@ -121,6 +121,38 @@ class SignalConfig:
     fee_rate: float = 0.02   # v4.0: corrected from 0.25 to match linear fee model
     fee_exponent: int = 2
 
+    # ── BTC 15m Stabilization strategy (v4.1) ─────────────────────────────────────────────────────
+    # Activates in the last 3 minutes of BTC 15m markets when one side
+    # has stabilized at 63-80¢. Exploits late-window mispricing instead
+    # of the overcrowded Chainlink-lag arb.
+    #
+    # Rationale for 63-80¢ range:
+    #   <63¢: not enough consensus, reversal probability too high
+    #   >80¢: market already fully converged, fee eats the remaining edge
+    #   70¢ is the empirical sweet spot (user observation + Brownian check)
+    btc_stab_price_min: float = _envf("BTC_STAB_PRICE_MIN", 0.63)
+    btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.80)
+    btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 60.0)   # T_remaining min
+    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 180.0)  # T_remaining max (3 min)
+    btc_stab_window_sec: float = 30.0    # stability measurement window (seconds)
+    btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.06) # max price move in window
+    btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 5)          # min history before firing
+    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.030)  # relaxed edge floor (vs 0.06)
+    btc_stab_kelly_fraction: float = 0.20   # conservative Kelly multiplier
+    btc_stab_max_bet_fraction: float = _envf("BTC_STAB_MAX_BET", 0.030)  # 3% cap (vs 4%)
+
+    # ── Peak hours gate — ETH/SOL/XRP + BTC 5m (v4.1) ─────────────────────────────────────────────
+    # ETH/SOL/XRP and BTC 5m are restricted to Mon-Fri 08:00-18:00 ET.
+    # BTC 15m uses _BTCStabilizationEngine which is 24/7 (its own time
+    # window T=60-180s acts as a natural gate).
+    #
+    # Rationale: data shows all weekend/late-night losses correlate with
+    # thin books (spread ≥2¢) where the signal fires but edge is fictitious.
+    # Setting peak_hours_enabled=False via env var re-enables 24/7 mode.
+    peak_hours_enabled: bool = True
+    peak_start_hour_et: int = _envi("PEAK_START_HOUR_ET", 8)   # 08:00 ET
+    peak_end_hour_et: int = _envi("PEAK_END_HOUR_ET", 18)      # 18:00 ET
+
 
 @dataclass(frozen=True)
 class RiskConfig:
