@@ -10,6 +10,12 @@ from src.utils.logger import setup_logger
 
 log = setup_logger("trading.portfolio")
 
+# v4.0: Polymarket taker fee deducted from winning payouts.
+# Polymarket charges ~1% on the notional of winning trades.
+# Not deducting this fee caused paper trading to overstate
+# profitability vs live trading by 1-2% per winning trade.
+TAKER_FEE_RATE = 0.01
+
 
 @dataclass
 class Position:
@@ -29,8 +35,9 @@ class Position:
 
     @property
     def potential_profit(self) -> float:
-        """Max profit if position wins."""
-        return self.shares * (1.0 - self.entry_price)
+        """Max profit if position wins (after fee)."""
+        gross = self.shares * (1.0 - self.entry_price)
+        return gross * (1.0 - TAKER_FEE_RATE)
 
     @property
     def potential_loss(self) -> float:
@@ -125,6 +132,10 @@ class Portfolio:
     ) -> tuple[str, float]:
         """Close a position and update PnL.
 
+        v4.0: Deducts TAKER_FEE_RATE from winning payouts to accurately
+        reflect real Polymarket fees. Previously paper trading overstated
+        profitability by not accounting for the ~1% taker fee.
+
         Returns:
             (outcome, pnl) tuple
         """
@@ -137,17 +148,21 @@ class Portfolio:
         self.total_trades += 1
 
         if won:
-            # Win: receive $1.00 per share
-            payout = pos.shares * 1.0
+            # Win: receive $1.00 per share, minus Polymarket taker fee
+            gross = pos.shares * 1.0
+            fee_amount = gross * TAKER_FEE_RATE
+            payout = gross - fee_amount
             pnl = payout - pos.size_usd
             self.balance += payout
             self.wins += 1
             self.consecutive_losses = 0
             outcome = "won"
             log.info(
-                "[Portfolio] WON %s | PnL: +$%.2f (%.1f%%) | "
-                "balance: $%.2f",
+                "[Portfolio] WON %s | Gross: $%.2f | Fee: -$%.2f | "
+                "Net PnL: +$%.2f (%.1f%%) | balance: $%.2f",
                 pos.market_id[:16],
+                gross,
+                fee_amount,
                 pnl,
                 (pnl / pos.size_usd) * 100,
                 self.balance,
@@ -246,4 +261,5 @@ class Portfolio:
             "open_positions": self.open_position_count,
             "capital_at_risk": round(self.capital_at_risk, 2),
             "peak_balance": round(self._peak_balance, 2),
+            "taker_fee_rate_pct": round(TAKER_FEE_RATE * 100, 1),
         }

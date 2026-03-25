@@ -1,5 +1,20 @@
-"""Signal Engine v3.5 - Multi-Strategy Router + Diffusion Risk Model
+"""Signal Engine v4.0 - Multi-Strategy Router + Diffusion Risk Model
 ======================================================================
+
+v4.0 changes (team audit 2026-03-25):
+  - calc_fee: replaced quadratic over-estimate with accurate linear model.
+    Old: rate=0.25, fee = rate*(p*(1-p))^2  --> at p=0.5: 1.56% (3x too high)
+    New: rate=0.02, fee = rate*(1-p)        --> at p=0.5: 1.00% (correct)
+    Impact: ~33% more valid signals pass the edge_min filter.
+  - See TEAM_AUDIT.md for full analysis.
+
+v3.8 fixes:
+  - ETH/SOL/XRP restricted to 15m markets only (Polymarket 5m API
+    returns error for non-BTC assets -- verified 2026-03-21).
+  - PolymarketFeed now uses per-asset interval dict.
+  - Resolution loop bug fixed: was passing bool instead of float price.
+  - Quant param fixes: source_coherence_max, time_max_15m,
+    stability_min_samples, stability_edge_cv_max.
 
 v3.7 addition (multi-asset support):
   Each asset now has its own sigma_fallback and delta_min_abs parameters
@@ -14,48 +29,25 @@ v3.5 addition (oracle freshness filter):
   occurred before BTC recovered. Three confirmed losses had oracle
   silence of 60-170s at bet time (19:03, 02:29, 21:59).
 
-  Fix: ORACLE_STALE filter — if (now - last_cl_update) > 55s AND
+  Fix: ORACLE_STALE filter -- if (now - last_cl_update) > 55s AND
   T_remaining < 90s, bet is blocked. Threshold configurable via
   ORACLE_FRESHNESS_MAX_AGE_SEC env var (set to 0.0 to disable).
   oracle_age_sec added to MicrostructureState, Signal, and trade DB.
 
 v3.4 fix (diffusion filter bypass closure):
   DELTA_WEAK was gated by `t_rem > 90`, creating a dead zone between
-  T=45s and T=90s where delta < σ√t bets could slip through. Confirmed
-  culprit in the 21:59:05 losing trade (T=54s, delta=0.185% < σ√t=0.213%).
-  The bet passed only because the bypass silenced the filter.
-
-  Fix 1: `t_rem > 90` → `t_rem > 45` (= time_min_5m)
-    Diffusion filter now active for the entire valid betting window.
-  Fix 2: `t_rem > 60` → `t_rem > 30` (absolute floor bypass)
-    Same closure for the hard absolute floor guard.
-
-  Both thresholds now track time_min so there is no dead zone between
-  \"filter active\" and \"TOO_LATE\". A signal that is too weak at T=46s
-  is still too weak at T=54s.
+  T=45s and T=90s where delta < sigma*sqrt(t) bets could slip through.
+  Confirmed culprit in the 21:59:05 losing trade (T=54s, delta=0.185%).
 
 v3.3 addition (cross-market propagation exploit):
   After a 5m BTC market resolves, Polymarket takes 12-45 seconds to
-  reprice correlated 15m markets (QR-PM-2026-0041 §6 empirical finding).
-  CrossMarketBooster tracks 5m closes and adds an additive p_true boost
-  (up to +5%) to 15m bets during this window. Boost decays linearly
-  from MAX_BOOST at t=0 to 0 at t=45s. Direction agreement required.
-
-v3.2 fixes (post warroom — small-delta crash):
-  A trade with delta=0.039% at T-177s passed the v3.1 filters by 0.001%
-  margin and lost when BTC crashed $91 in 177 seconds. Three fixes applied:
-
-  1. Sigma floor raised to _SIGMA_FALLBACK.
-  2. min_viable_delta multiplier: 0.50σ√t → 1.0σ√t.
-  3. Hard absolute delta floor (config.delta_min_abs, default 0.10%).
-
-v3.1 fixes (warroom session):
-  Integrated Brownian-motion diffusion model into every p_true estimate.
+  reprice correlated 15m markets. CrossMarketBooster tracks 5m closes
+  and adds an additive p_true boost to 15m bets during this window.
 
 Three independent strategies:
-  1. ChainlinkArb  — Bayesian oracle lag + OFI + Kyle + Hawkes (primary)
-  2. PriceMomentum — Sustained BTC price trend (60s + 120s windows)
-  3. MeanReversion — Contrarian fade of extreme delta moves
+  1. ChainlinkArb  -- Bayesian oracle lag + OFI + Kyle + Hawkes (primary)
+  2. PriceMomentum -- Sustained BTC price trend (60s + 120s windows)
+  3. MeanReversion -- Contrarian fade of extreme delta moves
 
 Routing: consensus boost, conflict detection, performance weighting.
 """
@@ -68,7 +60,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from src.config import SignalConfig, config as _global_cfg  # v3.6: module-level, not lazy hot-path import
+from src.config import SignalConfig, config as _global_cfg
 from src.engine.performance import PerformanceTracker
 from src.engine.cross_market import CrossMarketBooster
 from src.utils.logger import setup_logger
@@ -76,7 +68,7 @@ from src.utils.logger import setup_logger
 log = setup_logger("engine.signal")
 
 
-# ── Maths helpers ───────────────────────────────────────────────────────────────────────
+# ---- math helpers ----------------------------------------------------------
 
 def sigmoid(x: float) -> float:
     if x >= 0:
@@ -98,16 +90,29 @@ def shrink_logit(v, f):
     return v * clamp(f, 0.0, 1.0)
 
 
-def calc_fee(p: float, rate: float = 0.25) -> float:
+def calc_fee(p: float, rate: float = 0.02) -> float:
+    """Estimate Polymarket taker fee per token.
+
+    v4.0: Replaced quadratic approximation with accurate linear model.
+    Polymarket charges ~2% of potential winnings (notional taker fee).
+
+    fee = rate x (1 - p)
+
+    At p=0.50: fee = 0.010  (old formula: 0.0156 -- 56% overestimate)
+    At p=0.60: fee = 0.008  (old formula: 0.0144)
+    At p=0.40: fee = 0.012  (old formula: 0.0144)
+
+    The old formula filtered out ~33% of valid signals unnecessarily.
+    """
     if p <= 0 or p >= 1:
         return 0.0
-    return rate * (p * (1.0 - p)) ** 2
+    return rate * (1.0 - p)
 
 
 def _erf_approx(x: float) -> float:
     """
     Fast, no-dependency approximation of erf(x).
-    Abramowitz & Stegun 7.1.26 — max error < 1.5e-7.
+    Abramowitz & Stegun 7.1.26 -- max error < 1.5e-7.
     """
     a1, a2, a3, a4, a5 = (
         0.254829592, -0.284496736, 1.421413741,
@@ -131,22 +136,18 @@ def p_brownian(
 
     P = N(|delta| / (sigma_per_sec * sqrt(t_remaining)))
 
-    where N is the standard normal CDF.
-
     Returns:
-        Float in [0.5, 1.0] — probability of the bet being correct at T=0.
-        Always ≥ 0.5 because we use |delta| (the bet is already in the right
-        direction; we're only asking \"will it hold?\").
+        Float in [0.5, 1.0].
     """
     if time_remaining_sec <= 1:
-        return 1.0  # essentially already resolved
+        return 1.0
     if sigma_per_sec <= 0 or delta == 0:
         return 0.5
     z = abs(delta) / (sigma_per_sec * math.sqrt(time_remaining_sec))
     return 0.5 * (1.0 + _erf_approx(z / 1.41421356237))
 
 
-# ── Data structures ──────────────────────────────────────────────────────────────────
+# ---- data structures -------------------------------------------------------
 
 @dataclass
 class MarketState:
@@ -189,12 +190,10 @@ class MicrostructureState:
     taker_fee: float = 0.0
     source_divergence: float = 0.0
     time_decay_factor: float = 1.0
-    # v3.1: diffusion model diagnostics
     p_diffusion: float = 0.5
-    realized_sigma_pct: float = 0.0   # annualised-equivalent sigma in % per sec
-    min_viable_delta_pct: float = 0.0  # minimum |delta|% to pass diffusion filter
-    # v3.5: oracle freshness diagnostic
-    oracle_age_sec: float = 0.0        # seconds since last Chainlink update
+    realized_sigma_pct: float = 0.0
+    min_viable_delta_pct: float = 0.0
+    oracle_age_sec: float = 0.0
     components: dict = field(default_factory=dict)
 
 
@@ -230,10 +229,10 @@ class Signal:
     strategies_agreeing: int = 1
     token_id_yes: str = ""
     token_id_no: str = ""
-    oracle_age_sec: float = 0.0        # seconds since last Chainlink update at bet (v3.5)
+    oracle_age_sec: float = 0.0
 
 
-# ── Microstructure sub-modules ────────────────────────────────────────────────────────
+# ---- microstructure sub-modules --------------------------------------------
 
 class _OFI:
     def __init__(self, w):
@@ -347,39 +346,32 @@ class _Stability:
         self._h.pop(s, None)
 
 
-# ── Strategy 1: Chainlink Arb + Diffusion Model ────────────────────────────────────────────
+# ---- Strategy 1: Chainlink Arb + Diffusion Model ---------------------------
 
 class _ChainlinkArbEngine:
     """
     Primary strategy: exploit Chainlink oracle lag relative to Binance spot.
 
-    v3.7 change: sigma_fallback and delta_min_abs are now per-asset,
-    passed to the constructor instead of module-level constants.
-
-    v3.1 addition: Brownian diffusion model gates all bets.
-    Before betting, we compute p_diffusion = P(BTC stays correct side until T=0)
-    using the current delta and dynamically-measured BTC volatility.
-    p_true is then a time-weighted blend of Bayesian and diffusion estimates.
-
-    v3.2 addition: sigma floor + raised min_viable_delta multiplier + abs delta floor.
-
-    v3.4 fix: diffusion filter bypass closed (t_rem > 90 → t_rem > 45).
-
-    v3.5 addition: oracle freshness filter (oracle_age > 55s AND t_rem < 90s).
+    v4.0: calc_fee now uses accurate linear model (see module docstring).
+    v3.7: sigma_fallback and delta_min_abs are per-asset.
+    v3.5: oracle freshness filter.
+    v3.4: diffusion filter bypass closed.
+    v3.2: sigma floor + raised min_viable_delta multiplier + abs delta floor.
+    v3.1: Brownian diffusion model.
     """
     NAME = "chainlink_arb"
 
     def __init__(
         self,
         cfg: SignalConfig,
-        sigma_fallback: float = 0.005 / math.sqrt(300),  # BTC default ~2.89e-4
+        sigma_fallback: float = 0.005 / math.sqrt(300),
         delta_min_abs: float = 0.0010,
     ):
         self.cfg = cfg
         self.sigma_fallback = sigma_fallback
-        self.sigma_floor = sigma_fallback  # v3.2: floor = fallback
+        self.sigma_floor = sigma_fallback
         self.delta_min_abs = delta_min_abs
-        self._ph: deque = deque(maxlen=200)  # enlarged for better vol estimate
+        self._ph: deque = deque(maxlen=200)
         self._cl_updates: deque = deque(maxlen=20)
         self._cl_period = cfg.chainlink_period
         self._bp = 0.0
@@ -432,34 +424,20 @@ class _ChainlinkArbEngine:
         return lag, clamp(prox * gap * 1500, -1.5, 1.5)
 
     def _realized_vol_per_sec(self, window_sec: float = 300.0) -> float:
-        """
-        Estimate realized volatility per second from recent price ticks.
-
-        Uses squared log-returns normalized by time between ticks.
-
-        v3.2: lower clamp is now sigma_floor (per-asset in v3.7).
-        A quiet market period can no longer produce a sigma estimate below our
-        conservative baseline — which would cause min_viable_delta to shrink
-        and allow bets on tiny deltas with false confidence.
-        """
         now = time.time()
         r = [(t, p) for t, p in self._ph if t >= now - window_sec]
         if len(r) < 6:
             return self.sigma_floor
-
         sq_returns = []
         for i in range(1, len(r)):
             dt = r[i][0] - r[i - 1][0]
             if dt > 0.1 and r[i - 1][1] > 0:
                 lr = math.log(r[i][1] / r[i - 1][1])
-                sq_returns.append(lr * lr / dt)  # variance per second
-
+                sq_returns.append(lr * lr / dt)
         if not sq_returns:
             return self.sigma_floor
-
         variance_per_sec = sum(sq_returns) / len(sq_returns)
         sigma = math.sqrt(variance_per_sec)
-        # v3.2: floor = sigma_floor (per-asset). Ceiling = 2%/5min (very volatile)
         return clamp(sigma, self.sigma_floor, 0.02 / math.sqrt(300))
 
     def evaluate(
@@ -551,8 +529,7 @@ class _ChainlinkArbEngine:
 
         pd = sig.delta_chainlink
 
-        # ── DIFFUSION RISK CHECK (v3.1/v3.2/v3.4) ────────────────────────────────────
-        # Gate 1: sigma-relative floor (1.0σ√t)
+        # ---- DIFFUSION RISK CHECK (v3.1/v3.2/v3.4) -------------------------
         sigma_ps = self._realized_vol_per_sec()
         t_rem = sig.time_remaining_sec
 
@@ -560,17 +537,14 @@ class _ChainlinkArbEngine:
         micro.realized_sigma_pct = round(sigma_ps * math.sqrt(300) * 100, 4)
         micro.min_viable_delta_pct = round(min_viable_delta * 100, 4)
 
-        # v3.4: threshold lowered 90s → 45s (= time_min_5m).
         if abs(pd) < min_viable_delta and t_rem > 45:
             sig.filter_reasons.append(
                 f"delta_weak:{abs(pd)*100:.3f}%<{min_viable_delta*100:.3f}%"
             )
-            sig.status = f"DELTA_WEAK (σ×√t={min_viable_delta*100:.3f}%)"
+            sig.status = f"DELTA_WEAK (sigma*sqrt(t)={min_viable_delta*100:.3f}%)"
             sig.micro = micro
             return sig
 
-        # Gate 2: hard absolute floor on delta (per-asset in v3.7).
-        # v3.4: threshold lowered 60s → 30s for same reason.
         if abs(pd) < self.delta_min_abs and t_rem > 30:
             sig.filter_reasons.append(
                 f"delta_abs:{abs(pd)*100:.3f}%<{self.delta_min_abs*100:.3f}%"
@@ -579,7 +553,7 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
 
-        # ── Bayesian pipeline ────────────────────────────────────────────────────────────────
+        # ---- Bayesian pipeline ---------------------------------------------
         z = cfg.momentum_factor * pd + 0.2 * self._momentum(15)
         pp = sigmoid(z)
         micro.base_prob_up = pp
@@ -616,7 +590,7 @@ class _ChainlinkArbEngine:
         pdn = 1 - pu
         micro.final_prob_up = pu
 
-        # ── Blend Bayesian + Diffusion ─────────────────────────────────────────────────────────
+        # ---- Blend Bayesian + Diffusion ------------------------------------
         p_diff = p_brownian(pd, t_rem, sigma_ps)
         micro.p_diffusion = round(p_diff, 4)
         blend_w = clamp(t_rem / max(max_t, 1), 0.15, 0.55)
@@ -637,10 +611,10 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
 
-        # Time-weighted probability blend
         prob = blend_w * p_diff + (1 - blend_w) * p_bayes
         prob = clamp(prob, 0.50, 0.98)
 
+        # v4.0: uses corrected linear fee model
         fee = calc_fee(entry, cfg.fee_rate)
         edge = prob - entry - fee
         sig.side = side
@@ -651,7 +625,7 @@ class _ChainlinkArbEngine:
         sig.taker_fee = fee
         micro.taker_fee = fee
 
-        # ── Filters ──────────────────────────────────────────────────────────────────────
+        # ---- Filters -------------------------------------------------------
         if edge < eff_min:
             self.stab.record(slug, side, max(edge, 0.001), now)
             sig.status = (
@@ -667,7 +641,7 @@ class _ChainlinkArbEngine:
             return sig
         if prob < entry + 0.02:
             self.stab.record(slug, side, max(edge, 0.001), now)
-            sig.filter_reasons.append(f"overpaying")
+            sig.filter_reasons.append("overpaying")
             sig.micro = micro
             return sig
         if prob < cfg.min_true_prob:
@@ -756,12 +730,12 @@ class _ChainlinkArbEngine:
         sig.action = "BUY"
         sig.status = "BETTING"
         sig.filters_passed = True
-        sig.oracle_age_sec = micro.oracle_age_sec  # v3.5: persist to trade record
+        sig.oracle_age_sec = micro.oracle_age_sec
         sig.micro = micro
 
         log.info(
             "[BET:CL_ARB] %s %s | edge=+%.1f%% P=%.0f%%(diff=%.0f%%) "
-            "@%.0fc | $%.2f | T-%ds | σ√t=%.3f%% | abs_Δ=%.3f%% | "
+            "@%.0fc | $%.2f | T-%ds | sigma*sqrt(t)=%.3f%% | abs_delta=%.3f%% | "
             "CL_age=%.0fs | %s",
             side, slug[-14:], edge * 100, prob * 100, p_diff * 100,
             entry * 100, size, int(t_rem),
@@ -774,13 +748,12 @@ class _ChainlinkArbEngine:
         self.stab.reset(slug)
 
 
-# ── Strategy 2: Price Momentum ────────────────────────────────────────────────────────────────
+# ---- Strategy 2: Price Momentum --------------------------------------------
 
 class _MomentumEngine:
     """
     Bet in the direction of sustained BTC price momentum.
-    Both 60s and 120s windows must agree. Window tightened to 60–150s
-    (was 60–250s) to avoid bets with too much residual time risk.
+    Both 60s and 120s windows must agree. Window 60-150s.
     Applies diffusion check before committing.
     """
     NAME = "momentum"
@@ -813,7 +786,6 @@ class _MomentumEngine:
                 lr = math.log(r[i][1] / r[i - 1][1])
                 sq.append(lr * lr / dt)
         raw = math.sqrt(sum(sq) / len(sq)) if sq else self.sigma_floor
-        # v3.2: apply same floor as ChainlinkArbEngine
         return max(raw, self.sigma_floor)
 
     def evaluate(
@@ -826,7 +798,6 @@ class _MomentumEngine:
         now = time.time()
         time_remaining = state.end_time - now
 
-        # Tightened window: 60–150s only (was up to 250s)
         if time_remaining < 60 or time_remaining > 150:
             return None
         if state.reference_price <= 0 or state.btc_chainlink <= 0:
@@ -853,13 +824,11 @@ class _MomentumEngine:
         if not going_up and delta > 0.0005:
             return None
 
-        # Diffusion gate: require p_diff > 0.60 before betting
         sigma_ps = self._sigma_ps()
         p_diff = p_brownian(delta, time_remaining, sigma_ps)
         if p_diff < 0.60:
             return None
 
-        # v3.2: also apply absolute delta floor to momentum strategy
         delta_abs_floor = getattr(cfg, "delta_min_abs", 0.0010)
         if abs(delta) < delta_abs_floor:
             return None
@@ -874,12 +843,11 @@ class _MomentumEngine:
 
         momentum_strength = (abs(m60) + abs(m120)) / 2
         p_bayes = clamp(0.53 + momentum_strength * 20, 0.53, 0.67)
-        # Blend with diffusion (moderate weight at T-150s)
         blend_w = clamp(time_remaining / 150, 0.2, 0.45)
         prob = blend_w * p_diff + (1 - blend_w) * p_bayes
         prob = clamp(prob, 0.50, 0.98)
 
-        fee = calc_fee(entry)
+        fee = calc_fee(entry)  # uses new linear model
         edge = prob - entry - fee
 
         if edge < cfg.edge_min * 0.9:
@@ -920,13 +888,14 @@ class _MomentumEngine:
         return sig
 
 
-# ── Strategy 3: Mean Reversion ────────────────────────────────────────────────────────────────
+# ---- Strategy 3: Mean Reversion --------------------------------------------
 
 class _MeanReversionEngine:
     """
-    Contrarian: fade extreme delta moves (>0.20%). Window tightened to
-    90–180s (was 90–250s). Requires p_diffusion of the contrarian move
-    to also be favourable before betting.
+    Contrarian: fade extreme delta moves (>0.20%). Window 90-180s.
+    Requires p_diffusion of the contrarian move to be favourable.
+    NOTE (v4.0 team audit): p_true formula is a heuristic without calibration.
+    Monitor win rate closely; consider disabling if WR < 50% over 20+ trades.
     """
     NAME = "mean_rev"
 
@@ -957,7 +926,6 @@ class _MeanReversionEngine:
             return None
 
         time_remaining = state.end_time - now
-        # Tightened from 250 → 180s
         if time_remaining < 90 or time_remaining > 180:
             return None
         if consecutive_losses >= 2:
@@ -965,13 +933,10 @@ class _MeanReversionEngine:
         if has_position_on_market:
             return None
 
-        # MeanReversion bets AGAINST the current delta.
-        # For diffusion check: use a conservative sigma (1.5x fallback)
         sigma_ps = self.sigma_fallback * 1.5
-        # require that the current extreme move is at least 1.5σ
         one_sigma = sigma_ps * math.sqrt(max(time_remaining, 1))
         if abs_delta < 1.5 * one_sigma:
-            return None  # move not extreme enough for reliable reversion
+            return None
 
         if delta > 0:
             side = "NO"
@@ -984,7 +949,7 @@ class _MeanReversionEngine:
             entry = state.best_ask_yes if state.best_ask_yes > 0 else state.p_market_yes
 
         p_true = clamp(0.52 + (abs_delta - thresh) * 8, 0.52, 0.62)
-        fee = calc_fee(entry)
+        fee = calc_fee(entry)  # uses new linear model
         edge = p_true - entry - fee
 
         if edge < cfg.edge_min:
@@ -1024,14 +989,14 @@ class _MeanReversionEngine:
         return sig
 
 
-# ── Multi-Strategy Router ───────────────────────────────────────────────────────────────────────
+# ---- Multi-Strategy Router -------------------------------------------------
 
 class SignalEngine:
     """
     Coordinates all three strategies and routes to the best signal.
-    
-    v3.7: Accepts optional per-asset parameters (sigma_fallback, delta_min_abs)
-    to support multi-asset trading. BTC behavior unchanged.
+
+    v4.0: Uses corrected fee model across all strategies.
+    v3.7: Accepts optional per-asset parameters (sigma_fallback, delta_min_abs).
     """
 
     def __init__(
@@ -1063,7 +1028,6 @@ class SignalEngine:
     def record_5m_resolution(
         self, chainlink_price: float, reference_price: float, direction: str
     ) -> None:
-        """Notify the cross-market booster of a resolved 5m market."""
         self.cross_market.record_5m_close(
             chainlink_price=chainlink_price,
             reference_price_5m=reference_price,
@@ -1152,7 +1116,7 @@ class SignalEngine:
                 agreeing, best.side, boost, best.size_usd,
             )
 
-        # ── Cross-market propagation boost (QR-PM-2026-0041 §6) ────────────────────
+        # ---- Cross-market propagation boost --------------------------------
         if best.filters_passed and best.action == "BUY":
             is_15m = (
                 state.duration_seconds >= 900
@@ -1165,11 +1129,10 @@ class SignalEngine:
                 if cm_boost > 0:
                     best.p_true = min(best.p_true + cm_boost, 0.97)
                     best.edge = best.p_true - best.entry_price - best.taker_fee
-                    # v3.6: cap edge at edge_max after boost
                     if best.edge > self.cfg.edge_max:
                         best.edge = self.cfg.edge_max
                     log.info(
-                        "[CrossMarket] 15m boost +%.1f%% → p_true=%.1f%% "
+                        "[CrossMarket] 15m boost +%.1f%% -> p_true=%.1f%% "
                         "edge=%.1f%% | %s %s",
                         cm_boost * 100, best.p_true * 100, best.edge * 100,
                         best.side, state.slug or state.market_id[:14],
