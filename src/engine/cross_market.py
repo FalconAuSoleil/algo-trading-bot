@@ -1,8 +1,8 @@
 """Cross-Market Propagation Delay Exploiter.
 
-Implements QR-PM-2026-0041 §6 — after a 5-minute BTC market resolves,
-Polymarket takes 12-45 seconds to reprice the correlated 15-minute
-market. During this window, the 15m market offers stale odds.
+After a 5-minute BTC market resolves, Polymarket takes 12-45 seconds
+to reprice the correlated 15-minute market. During this window, the
+15m market may offer temporarily stale odds.
 
 Usage:
     booster = CrossMarketBooster()
@@ -13,6 +13,18 @@ Usage:
     # In evaluate() for a 15m market:
     cm_boost = booster.get_boost("YES", btc_chainlink, ref_price_15m)
     p_true = min(p_true + cm_boost, 0.97)
+
+v4.0 CHANGES:
+  - MAX_BOOST reduced from 0.05 to 0.02.
+    The original +5% boost was too aggressive for an empirically
+    unvalidated signal. At +2%, the boost is meaningful but constrained:
+    it can push a borderline 64% p_true to 66%, which is within the
+    normal signal noise band, rather than creating artificial certainty.
+  - Added MIN_OBSERVATIONS guard: the booster is only active once at
+    least 3 five-minute resolutions have been recorded in the current
+    session. This prevents the first trade of a session from being
+    boosted by stale state from a previous run.
+  - Propagation window empirically observed at 12-45s; kept as-is.
 """
 
 from __future__ import annotations
@@ -22,13 +34,18 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-# Empirical propagation window from QR-PM-2026-0041 §6: 12-45 seconds.
-# We use 45s as the full decay window — boost is 0 at t=45s.
+# Empirically observed propagation window (12-45 seconds).
+# Boost is MAX_BOOST at t=0, decays linearly to 0 at t=45s.
 PROPAGATION_WINDOW_SEC = 45.0
 
-# Maximum confidence boost added to p_true for 15m markets.
-# 5% additive boost at t=0, decaying linearly to 0 at t=45s.
-MAX_BOOST = 0.05
+# v4.0: Reduced from 0.05 to 0.02.
+# +5% was too aggressive for an unvalidated signal source.
+# +2% is meaningful (moves borderline signals) but not dominant.
+MAX_BOOST = 0.02
+
+# v4.0: Minimum number of 5m closes this session before boost is active.
+# Prevents stale/cold-start state from influencing live trades.
+MIN_OBSERVATIONS = 3
 
 
 @dataclass
@@ -51,9 +68,9 @@ class CrossMarketBooster:
     - Direction agreement required: 5m closed "up" → only boosts YES bets
     - Linear decay: boost = MAX_BOOST * (1 - elapsed / PROPAGATION_WINDOW_SEC)
     - Minimum delta filter: the 5m close must have moved at least 0.05%
-      to be considered a meaningful directional signal
     - Only the most recent 5m close is used (stale signals are discarded)
     - Current 15m delta must agree with direction (no reversal)
+    - MIN_OBSERVATIONS sessions guard (v4.0)
     """
 
     # Minimum 5m delta to consider the signal meaningful
@@ -61,6 +78,7 @@ class CrossMarketBooster:
 
     def __init__(self) -> None:
         self._last_close: Optional[FiveMinClose] = None
+        self._total_observations: int = 0
 
     def record_5m_close(
         self,
@@ -90,6 +108,7 @@ class CrossMarketBooster:
             direction=direction,
             delta_pct=delta_pct,
         )
+        self._total_observations += 1
 
     def get_boost(
         self,
@@ -101,14 +120,9 @@ class CrossMarketBooster:
         """
         Return additive p_true boost for a 15m market bet.
 
-        Args:
-            side: "YES" or "NO" — the proposed bet side for the 15m market.
-            chainlink_now: Current Chainlink BTC price.
-            m15_reference: Reference price for the 15m market.
-            now: Current timestamp; defaults to time.time().
-
         Returns:
             Float in [0, MAX_BOOST]. Returns 0.0 if:
+            - Fewer than MIN_OBSERVATIONS 5m closes recorded this session
             - No 5m close was recorded yet
             - The propagation window has elapsed (>45s)
             - The 5m direction conflicts with the proposed bet side
@@ -117,6 +131,10 @@ class CrossMarketBooster:
         """
         if now is None:
             now = time.time()
+
+        # v4.0: guard against cold-start / insufficient history
+        if self._total_observations < MIN_OBSERVATIONS:
+            return 0.0
 
         c = self._last_close
         if c is None:
@@ -137,7 +155,6 @@ class CrossMarketBooster:
             return 0.0
 
         # Sanity check: current 15m delta must agree with direction
-        # (BTC must not have already reversed vs the 15m reference)
         if m15_reference > 0 and chainlink_now > 0:
             current_delta = (chainlink_now - m15_reference) / m15_reference
             if bet_up and current_delta < 0:
@@ -148,3 +165,8 @@ class CrossMarketBooster:
         # Linear decay over propagation window
         decay = 1.0 - (elapsed / PROPAGATION_WINDOW_SEC)
         return MAX_BOOST * decay
+
+    @property
+    def observations(self) -> int:
+        """Number of 5m closes recorded this session."""
+        return self._total_observations
