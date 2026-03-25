@@ -93,6 +93,9 @@ class SignalConfig:
 
     # ── Diffusion model ─────────────────────────────────────────────────────────────────────────────────────
     delta_min_abs: float = _envf("DELTA_MIN_ABS", 0.0010)
+    # v4.1: upper bound — blocks anomalous delta spikes (e.g. XRP +4.028% observed 2026-03-24)
+    # Such extreme moves indicate an oracle anomaly, not a tradeable edge.
+    delta_max_abs: float = _envf("DELTA_MAX_ABS", 0.025)
 
     # ── Oracle freshness filter ─────────────────────────────────────────────────────────────────────────
     oracle_freshness_max_age_sec: float = _envf("ORACLE_FRESHNESS_MAX_AGE_SEC", 55.0)
@@ -122,29 +125,30 @@ class SignalConfig:
     fee_exponent: int = 2
 
     # ── BTC 15m Stabilization strategy (v4.1) ─────────────────────────────────────────────────────
-    # Activates in the last 3 minutes of BTC 15m markets when one side
-    # has stabilized at 63-80¢. Exploits late-window mispricing instead
+    # Activates in the last 4 minutes of BTC 15m markets when one side
+    # has stabilized at 63-85¢. Exploits late-window mispricing instead
     # of the overcrowded Chainlink-lag arb.
     #
-    # Rationale for 63-80¢ range:
+    # Rationale for 63-85¢ range (v4.1 widened from 80¢ → 85¢):
     #   <63¢: not enough consensus, reversal probability too high
-    #   >80¢: market already fully converged, fee eats the remaining edge
+    #   >85¢: market already fully converged, fee eats the remaining edge
     #   70¢ is the empirical sweet spot (user observation + Brownian check)
+    #   79¢ trade confirmed profitable → raised ceiling to 85¢
     btc_stab_price_min: float = _envf("BTC_STAB_PRICE_MIN", 0.63)
-    btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.80)
-    btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 60.0)   # T_remaining min
-    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 180.0)  # T_remaining max (3 min)
+    btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.85)   # v4.1: 0.80 → 0.85
+    btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 60.0)     # T_remaining min
+    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 240.0)    # v4.1: 180s → 240s (4 min)
     btc_stab_window_sec: float = 30.0    # stability measurement window (seconds)
-    btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.06) # max price move in window
-    btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 5)          # min history before firing
-    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.030)  # relaxed edge floor (vs 0.06)
+    btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.08)   # v4.1: 0.06 → 0.08
+    btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 5)            # min history before firing
+    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.020)    # v4.1: 0.030 → 0.020 (relaxed)
     btc_stab_kelly_fraction: float = 0.20   # conservative Kelly multiplier
     btc_stab_max_bet_fraction: float = _envf("BTC_STAB_MAX_BET", 0.030)  # 3% cap (vs 4%)
 
     # ── Peak hours gate — ETH/SOL/XRP + BTC 5m (v4.1) ─────────────────────────────────────────────
     # ETH/SOL/XRP and BTC 5m are restricted to Mon-Fri 08:00-18:00 ET.
     # BTC 15m uses _BTCStabilizationEngine which is 24/7 (its own time
-    # window T=60-180s acts as a natural gate).
+    # window T=60-240s acts as a natural gate).
     #
     # Rationale: data shows all weekend/late-night losses correlate with
     # thin books (spread ≥2¢) where the signal fires but edge is fictitious.
