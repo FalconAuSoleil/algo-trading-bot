@@ -1,4 +1,10 @@
-"""BTC Sniper v3.8 - Multi-Asset Multi-Strategy Orchestrator.
+"""BTC Sniper v4.1 - Multi-Asset Multi-Strategy Orchestrator.
+
+v4.1 changes:
+  - SignalEngine now receives asset_symbol for per-asset routing:
+      BTC 15m  → _BTCStabilizationEngine (24/7, T=60-180s)
+      BTC 5m   → ChainlinkArb (peak hours Mon-Fri 08-18h ET)
+      ETH/SOL/XRP → ChainlinkArb (peak hours Mon-Fri 08-18h ET)
 
 v3.8 fixes:
   - ETH/SOL/XRP restricted to 15m markets only (Polymarket 5m API
@@ -65,10 +71,14 @@ class Orchestrator:
                 on_price=self._on_price,
             )
 
+            # v4.1: pass asset_symbol so the engine can route correctly
+            # BTC → BTCStabilization (15m) + ChainlinkArb (5m, peak hours)
+            # ETH/SOL/XRP → ChainlinkArb (15m only, peak hours)
             self._signal_engines[asset.symbol] = SignalEngine(
                 cfg=config.signal,
                 sigma_fallback=asset.sigma_fallback,
                 delta_min_abs=asset.delta_min_abs,
+                asset_symbol=asset.symbol,
             )
 
             self._asset_prices[asset.symbol] = {
@@ -120,7 +130,7 @@ class Orchestrator:
 
     async def start(self) -> None:
         log.info("=" * 60)
-        log.info("  BTC SNIPER v3.8 - Multi-Asset Multi-Strategy Engine")
+        log.info("  BTC SNIPER v4.1 - Multi-Asset Multi-Strategy Engine")
         enabled = [a for a in config.assets if a.enabled]
         for a in enabled:
             log.info(
@@ -130,6 +140,8 @@ class Orchestrator:
                 a.chainlink_address[:10],
             )
         log.info("  Mode: %s | Capital: $%.2f", config.trading_mode.upper(), config.paper_initial_balance)
+        log.info("  BTC 15m: BTCStabilization 24/7 (T=60-180s, 63-80¢)")
+        log.info("  BTC 5m + ETH/SOL/XRP: ChainlinkArb peak hours only (Mon-Fri 08-18h ET)")
         log.info("=" * 60)
 
         Path("data").mkdir(exist_ok=True)
@@ -491,7 +503,7 @@ class Orchestrator:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="BTC Sniper v3.8")
+    parser = argparse.ArgumentParser(description="BTC Sniper v4.1")
     parser.add_argument("--mode", choices=["paper", "live", "collect"], default=None)
     parser.add_argument("--balance", type=float, default=None)
     parser.add_argument("--port", type=int, default=None)
