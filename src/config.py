@@ -56,11 +56,6 @@ class SignalConfig:
 
     # ── Timing windows ────────────────────────────────────────────────────────────────────────────
     # v4.0: raised from 45s → 65s.
-    # Analysis of paper trade screens shows 3 consecutive losses all
-    # occurring at T=58-68s with small deltas (0.25-0.27%).
-    # Late-window bets on small moves are systematically unprofitable:
-    # the signal-to-noise ratio at T<65s is insufficient to overcome
-    # the diffusion uncertainty on a small delta.
     time_min_5m: float = _envf("TIME_MIN_5M", 65.0)
     time_max_5m: float = _envf("TIME_MAX_5M", 180.0)
     time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 290.0)
@@ -93,33 +88,53 @@ class SignalConfig:
 
     # ── Diffusion model ─────────────────────────────────────────────────────────────────────────────────────
     delta_min_abs: float = _envf("DELTA_MIN_ABS", 0.0010)
+    # v4.1: upper bound — blocks anomalous delta spikes (e.g. XRP +4.028% observed 2026-03-24)
+    delta_max_abs: float = _envf("DELTA_MAX_ABS", 0.025)
 
     # ── Oracle freshness filter ─────────────────────────────────────────────────────────────────────────
     oracle_freshness_max_age_sec: float = _envf("ORACLE_FRESHNESS_MAX_AGE_SEC", 55.0)
 
     # ── Stability filter ──────────────────────────────────────────────────────────────────────────────────────
     stability_window_sec: float = _envf("STABILITY_WINDOW_SEC", 45.0)
-    # v4.0: reduced from 8 → 5.
-    # v3.8 raised this from 3→8 without impact analysis. At 2s loop
-    # interval, 8 samples = 16s minimum wait, causing the bot to likely
-    # under-trade and lose opportunities. 5 samples (10s accumulation)
-    # provides solid evidence while maintaining trade frequency.
     stability_min_samples: int = _envi("STABILITY_MIN_SAMPLES", 5)
     stability_min_ratio: float = _envf("STABILITY_MIN_RATIO", 0.75)
-    # v3.8: tightened from 0.60 → 0.40. CV 60% accepted very dispersed
-    # edges. 40% requires more consistent edge magnitude before betting.
     stability_edge_cv_max: float = _envf("STABILITY_EDGE_CV_MAX", 0.40)
 
     # ── Source coherence ────────────────────────────────────────────────────────────────────────────────────
-    # v3.8: raised from 0.003 → 0.005 (correct, kept in v4.0).
     source_coherence_max: float = _envf("SOURCE_COHERENCE_MAX", 0.005)
 
     # ── Fee model ──────────────────────────────────────────────────────────────────────────────────────────
     delta_min: float = _envf("DELTA_MIN", 0.0012)
     volatility_max: float = _envf("VOLATILITY_MAX", 0.0015)
     volatility_window_minutes: int = 30
-    fee_rate: float = 0.02   # v4.0: corrected from 0.25 to match linear fee model
+    fee_rate: float = 0.02
     fee_exponent: int = 2
+
+    # ── BTC 15m Stabilization strategy (v4.1 / v4.2) ──────────────────────────────────────────────
+    # Two firing tiers:
+    #   Normal (360s / edge ≥ 2%): standard Brownian model.
+    #   Strong-move (420s / edge ≥ 1%): |BTC - ref| ≥ $120 USD.
+    btc_stab_price_min: float = _envf("BTC_STAB_PRICE_MIN", 0.63)
+    btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.85)
+    btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 60.0)
+    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 360.0)    # 6 min
+    btc_stab_window_sec: float = 30.0
+    btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.08)
+    btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 5)
+    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.020)
+    btc_stab_kelly_fraction: float = 0.20
+    btc_stab_max_bet_fraction: float = _envf("BTC_STAB_MAX_BET", 0.030)
+    # v4.2: strong-move fast-track — paper: lowered to $120
+    btc_stab_strong_move_usd: float = _envf("BTC_STAB_STRONG_MOVE_USD", 120.0)  # paper: 150→120
+    btc_stab_strong_time_max: float = _envf("BTC_STAB_STRONG_TIME_MAX", 420.0)
+    btc_stab_strong_edge_min: float = _envf("BTC_STAB_STRONG_EDGE_MIN", 0.010)
+
+    # ── Peak hours gate — ETH/SOL/XRP + BTC 5m (v4.1) ─────────────────────────────────────────────
+    # PAPER MODE: disabled (False) to maximise trade count and gather data 24/7.
+    # Re-enable (True) for live trading to avoid thin off-peak books.
+    peak_hours_enabled: bool = False   # paper: was True — disabled for data collection
+    peak_start_hour_et: int = _envi("PEAK_START_HOUR_ET", 8)
+    peak_end_hour_et: int = _envi("PEAK_END_HOUR_ET", 18)
 
 
 @dataclass(frozen=True)
@@ -127,11 +142,9 @@ class RiskConfig:
     kelly_fraction: float = _envf("KELLY_FRACTION", 0.25)
     max_position_pct: float = _envf("MAX_POSITION_PCT", 0.05)
     max_daily_drawdown: float = _envf("MAX_DAILY_DRAWDOWN", 0.06)
-    # v4.0: reduced from 4 → 3.
-    # 3 consecutive losses on a ~60% win-rate strategy is a 1-in-15
-    # event (≈ (0.40)^3 = 6.4%). This is a strong signal to pause and
-    # reassess. The old threshold of 4 allowed too much capital erosion.
-    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 3)
+    # PAPER MODE: set to 20 (effectively off) to avoid halting data collection
+    # after a loss streak. Re-set to 3 for live trading.
+    max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 20)  # paper: was 3
     max_open_positions: int = _envi("MAX_OPEN_POSITIONS", 2)
     max_daily_risk: float = _envf("MAX_DAILY_RISK", 0.12)
 
@@ -176,9 +189,6 @@ class AppConfig:
 
     # v3.7: Per-asset configurations
     # v3.8: supported_intervals added — ETH/SOL/XRP restricted to 15m only.
-    #   Polymarket past-results API does not support 5m for non-BTC assets.
-    #   Verified 2026-03-21 via live API: returns
-    #   {"error": "5-minute markets currently supported only for BTC"}
     assets: list = field(default_factory=lambda: [
         AssetConfig(
             symbol="BTC",
@@ -188,8 +198,8 @@ class AppConfig:
             chainlink_period=27.0,
             oracle_freshness_max_age_sec=55.0,
             delta_min_abs=0.0010,
-            sigma_fallback=0.005 / (300 ** 0.5),  # ~2.89e-4
-            supported_intervals=(300, 900),  # 5m + 15m
+            sigma_fallback=0.005 / (300 ** 0.5),
+            supported_intervals=(300, 900),
             enabled=True,
         ),
         AssetConfig(
@@ -200,8 +210,8 @@ class AppConfig:
             chainlink_period=45.0,
             oracle_freshness_max_age_sec=55.0,
             delta_min_abs=0.0015,
-            sigma_fallback=0.007 / (300 ** 0.5),  # ~4.04e-4
-            supported_intervals=(900,),  # 15m only — 5m API not supported for ETH
+            sigma_fallback=0.007 / (300 ** 0.5),
+            supported_intervals=(900,),
             enabled=True,
         ),
         AssetConfig(
@@ -212,8 +222,8 @@ class AppConfig:
             chainlink_period=90.0,
             oracle_freshness_max_age_sec=90.0,
             delta_min_abs=0.0020,
-            sigma_fallback=0.009 / (300 ** 0.5),  # ~5.20e-4
-            supported_intervals=(900,),  # 15m only — 5m API not supported for SOL
+            sigma_fallback=0.009 / (300 ** 0.5),
+            supported_intervals=(900,),
             enabled=True,
         ),
         AssetConfig(
@@ -224,8 +234,8 @@ class AppConfig:
             chainlink_period=120.0,
             oracle_freshness_max_age_sec=90.0,
             delta_min_abs=0.0015,
-            sigma_fallback=0.008 / (300 ** 0.5),  # ~4.62e-4
-            supported_intervals=(900,),  # 15m only — 5m API not supported for XRP
+            sigma_fallback=0.008 / (300 ** 0.5),
+            supported_intervals=(900,),
             enabled=True,
         ),
     ])
