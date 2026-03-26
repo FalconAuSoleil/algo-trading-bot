@@ -122,36 +122,33 @@ class SignalConfig:
     fee_exponent: int = 2
 
     # ── BTC 15m Stabilization strategy (v4.1) ─────────────────────────────────────────────────────
-    # Activates in the last 3 minutes of BTC 15m markets when one side
-    # has stabilized at 63-80¢. Exploits late-window mispricing instead
-    # of the overcrowded Chainlink-lag arb.
+    # v4.1.1: relaxed thresholds to fire more often when one side has
+    # stabilized around 70¢ and reversal is unlikely.
     #
-    # Rationale for 63-80¢ range:
-    #   <63¢: not enough consensus, reversal probability too high
-    #   >80¢: market already fully converged, fee eats the remaining edge
-    #   70¢ is the empirical sweet spot (user observation + Brownian check)
-    btc_stab_price_min: float = _envf("BTC_STAB_PRICE_MIN", 0.63)
-    btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.80)
-    btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 60.0)   # T_remaining min
-    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 180.0)  # T_remaining max (3 min)
-    btc_stab_window_sec: float = 30.0    # stability measurement window (seconds)
-    btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.06) # max price move in window
-    btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 5)          # min history before firing
-    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.030)  # relaxed edge floor (vs 0.06)
-    btc_stab_kelly_fraction: float = 0.20   # conservative Kelly multiplier
-    btc_stab_max_bet_fraction: float = _envf("BTC_STAB_MAX_BET", 0.030)  # 3% cap (vs 4%)
+    # Changes from v4.1:
+    #   - Price zone widened: 0.63-0.80 → 0.58-0.85 (catches 58-85¢)
+    #   - Time window extended: T=60-180s → T=45-300s (5 min window)
+    #   - Stability faster: 30s/5obs → 20s/3obs
+    #   - Edge floor lowered: 3% → 2% (diffusion model is the guard)
+    #   - Sizing slightly more aggressive: Kelly 0.22, cap 3.5%
+    btc_stab_price_min: float = _envf("BTC_STAB_PRICE_MIN", 0.58)
+    btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.85)
+    btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 45.0)
+    btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 300.0)
+    btc_stab_window_sec: float = 20.0
+    btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.08)
+    btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 3)
+    btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.020)
+    btc_stab_kelly_fraction: float = 0.22
+    btc_stab_max_bet_fraction: float = _envf("BTC_STAB_MAX_BET", 0.035)
 
-    # ── Peak hours gate — ETH/SOL/XRP + BTC 5m (v4.1) ─────────────────────────────────────────────
-    # ETH/SOL/XRP and BTC 5m are restricted to Mon-Fri 08:00-18:00 ET.
-    # BTC 15m uses _BTCStabilizationEngine which is 24/7 (its own time
-    # window T=60-180s acts as a natural gate).
-    #
-    # Rationale: data shows all weekend/late-night losses correlate with
-    # thin books (spread ≥2¢) where the signal fires but edge is fictitious.
-    # Setting peak_hours_enabled=False via env var re-enables 24/7 mode.
-    peak_hours_enabled: bool = True
-    peak_start_hour_et: int = _envi("PEAK_START_HOUR_ET", 8)   # 08:00 ET
-    peak_end_hour_et: int = _envi("PEAK_END_HOUR_ET", 18)      # 18:00 ET
+    # ── Peak hours gate (v4.1.1: DISABLED by default) ─────────────────────────────────────────────
+    # v4.1 restricted ETH/SOL/XRP + BTC 5m to Mon-Fri 08-18h ET.
+    # v4.1.1: disabled by default — bot trades 24/7 on all assets.
+    # Set PEAK_HOURS_ENABLED=true env var to re-enable the gate.
+    peak_hours_enabled: bool = _env("PEAK_HOURS_ENABLED", "false").lower() in ("true", "1", "yes")
+    peak_start_hour_et: int = _envi("PEAK_START_HOUR_ET", 8)
+    peak_end_hour_et: int = _envi("PEAK_END_HOUR_ET", 18)
 
 
 @dataclass(frozen=True)

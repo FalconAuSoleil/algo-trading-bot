@@ -1,5 +1,15 @@
-"""Signal Engine v4.1 - Multi-Strategy Router + Diffusion Risk Model
+"""Signal Engine v4.1.1 - Multi-Strategy Router + Diffusion Risk Model
 ======================================================================
+
+v4.1.1 hotfix (2026-03-26):
+  - CRITICAL: BTC 15m routing no longer short-circuits to WATCHING
+    when BTCStabilization doesn't fire. Falls through to ChainlinkArb
+    multi-strategy router as fallback (restores v4.0 BTC 15m behavior).
+  - Peak hours gate: now disabled by default (config change).
+  - BTCStabilization relaxed: wider price zone (58-85¢), longer time
+    window (T=45-300s), faster stability (20s/3obs), lower edge floor
+    (2%). Fires much more often on the "one side at ~70¢, unlikely to
+    reverse" pattern.
 
 v4.1 changes (team discussion 2026-03-25):
   - New _BTCStabilizationEngine: dedicated BTC 15m strategy.
@@ -61,7 +71,7 @@ Three independent strategies:
   1. ChainlinkArb  -- Bayesian oracle lag + OFI + Kyle + Hawkes (primary)
   2. PriceMomentum -- Sustained BTC price trend (60s + 120s windows)
   3. MeanReversion -- Contrarian fade of extreme delta moves
-  4. BTCStabilization -- BTC 15m late-entry at stable 63-80¢ (v4.1)
+  4. BTCStabilization -- BTC 15m late-entry at stable 58-85¢ (v4.1.1)
 
 Routing: consensus boost, conflict detection, performance weighting.
 """
@@ -171,17 +181,8 @@ def is_peak_hours(now: Optional[float] = None) -> bool:
     Peak = Monday-Friday, 08:00-18:00 ET.
     ET offset: UTC-5 (EST, Nov-Mar) or UTC-4 (EDT, Mar-Nov).
 
-    Rationale: Polymarket crypto markets have significantly higher
-    liquidity and tighter spreads during US/EU overlap hours.
-    Outside these windows the min_market_liquidity filter already
-    blocks most trades, but thin books create fictitious edge signals
-    (spread artificially inflates the YES/NO mid price).
-
-    Weekends excluded: empirically all weekend losses in the trade
-    dataset correlate with spread > 4¢, which consumes the edge.
-
-    To disable and run 24/7, set PEAK_HOURS_ENABLED=false (env) or
-    set peak_hours_enabled=False in config.
+    v4.1.1: disabled by default (peak_hours_enabled=False in config).
+    Set PEAK_HOURS_ENABLED=true env var to restore.
     """
     cfg = _global_cfg.signal
     if not cfg.peak_hours_enabled:
@@ -191,8 +192,6 @@ def is_peak_hours(now: Optional[float] = None) -> bool:
     utc_dt = datetime.datetime.utcfromtimestamp(ts)
 
     # DST approximation: March–November = EDT (UTC-4), else EST (UTC-5).
-    # Exact DST boundaries differ by year but this is accurate enough
-    # for trading purposes (at most 1h error twice/year).
     et_offset = -4 if 3 <= utc_dt.month <= 11 else -5
     et_dt = utc_dt + datetime.timedelta(hours=et_offset)
 
@@ -1045,36 +1044,31 @@ class _MeanReversionEngine:
         return sig
 
 
-# ---- Strategy 4: BTC 15m Stabilization (v4.1) ------------------------------
+# ---- Strategy 4: BTC 15m Stabilization (v4.1 / v4.1.1) --------------------
 
 class _BTCStabilizationEngine:
     """
-    BTC 15m high-confidence late-entry strategy (v4.1).
+    BTC 15m high-confidence late-entry strategy (v4.1, relaxed v4.1.1).
 
-    Replaces ChainlinkArb for BTC 15m markets. Targets the window
-    T=60-180s (last 3 minutes) when one side has stabilized at 63-80¢,
-    indicating a strong directional consensus that the market hasn't
-    yet fully priced to 1.0.
+    Targets the window T=45-300s (last 5 minutes) when one side has
+    stabilized at 58-85¢, indicating strong directional consensus that
+    the market hasn't yet fully priced to 1.0.
+
+    v4.1.1 changes (relaxed to trade more often):
+      - Price zone: 63-80¢ → 58-85¢ (wider catch zone)
+      - Time window: T=60-180s → T=45-300s (fires earlier)
+      - Stability: 30s/5obs → 20s/3obs (triggers faster)
+      - Max swing: 6¢ → 8¢ (tolerates more noise)
+      - Edge floor: 3% → 2% (relies on diffusion as guard)
+      - Sizing: Kelly×0.22 cap 3.5% (slightly more aggressive)
 
     Core logic:
-    1. Market price in [63¢, 80¢] continuously for ≥30s (stability)
-    2. Delta direction matches the winning side (BTC above ref for YES)
-    3. Brownian diffusion: p_true > market_price + fee (real edge exists)
-    4. Chainlink oracle fresh (<55s) — delta computed from live data
-    5. Standard risk filters (circuit breaker, drawdown, position cap)
-
-    Why this beats ChainlinkArb on BTC 15m:
-    - ChainlinkArb exploits the 27s oracle lag (information edge).
-      On BTC 15m, this lag is heavily arbitraged by dozens of bots.
-    - BTCStabilization exploits structural mispricing: the market prices
-      the side at 70¢ because there's still 90-180s of uncertainty, but
-      the Brownian model shows the delta is large enough that reversal
-      is statistically improbable (p_diffusion > 72%).
-    - The stability filter ensures we only bet when the price has been
-      at 70¢ for 30s — ruling out transient spikes that quickly revert.
-
-    Sizing: conservative (Kelly×0.20, cap 3%) vs ChainlinkArb (Kelly×0.25,
-    cap 4%) — this strategy has fewer microstructure confirmations.
+    1. Market price in [58¢, 85¢] on one side (stability zone)
+    2. That price stable for ≥20s with ≥3 observations
+    3. Delta direction matches the winning side
+    4. Brownian diffusion: p_true > market_price + fee (real edge)
+    5. Chainlink oracle fresh (<55s)
+    6. Standard risk filters (circuit breaker, drawdown, position cap)
     """
     NAME = "btc_stabilization"
 
@@ -1089,7 +1083,7 @@ class _BTCStabilizationEngine:
         # BTC price history — 10-minute window for 15m vol estimation
         self._ph: deque = deque(maxlen=600)
         # Market price history — tracks YES price stability over ~3min
-        self._market_ph: deque = deque(maxlen=90)
+        self._market_ph: deque = deque(maxlen=150)
         self._cl_ts: float = 0.0
         self._cp: float = 0.0
 
@@ -1122,11 +1116,10 @@ class _BTCStabilizationEngine:
 
     def _is_market_stable(self, current_price: float) -> bool:
         """
-        Returns True if the market price has been in a ±6¢ range
-        for the last 30 seconds with at least 5 observations.
+        Returns True if the market price has been in a tight range
+        for the stability window with enough observations.
 
-        This filters out transient spikes where the side momentarily
-        hits 70¢ before reversing to 55¢.
+        v4.1.1: 20s window, 3 observations, ±8¢ swing tolerance.
         """
         cfg = self.cfg
         now = time.time()
@@ -1152,7 +1145,7 @@ class _BTCStabilizationEngine:
         cfg = self.cfg
         t_rem = state.end_time - now
 
-        # Window: T=60-180s (last 3 minutes of 15m market)
+        # Window: T=45-300s (last 5 minutes of 15m market)
         if t_rem < cfg.btc_stab_time_min or t_rem > cfg.btc_stab_time_max:
             return None
         if state.reference_price <= 0 or state.btc_chainlink <= 0:
@@ -1181,13 +1174,13 @@ class _BTCStabilizationEngine:
             if delta <= 0:
                 return None
         else:
-            # Neither side in the 63-80¢ target zone
+            # Neither side in the target zone
             return None
 
         # Record market price every loop iteration for stability tracking
         self._market_ph.append((now, market_price))
 
-        # Stability: price must have been in zone continuously for ≥30s
+        # Stability: price must have been in zone continuously
         if not self._is_market_stable(market_price):
             return None
 
@@ -1208,9 +1201,7 @@ class _BTCStabilizationEngine:
         fee = calc_fee(entry, cfg.fee_rate)
         edge = p_diff - entry - fee
 
-        # Relaxed edge floor (3% vs 6% for ChainlinkArb) — justified because:
-        # the stability filter provides a stronger structural guarantee,
-        # replacing the microstructure stack (OFI + Kyle + Hawkes).
+        # v4.1.1: relaxed edge floor (2% vs original 3%)
         if edge < cfg.btc_stab_edge_min:
             return None
         if p_diff <= entry:  # no true edge: market already fairly priced
@@ -1230,7 +1221,7 @@ class _BTCStabilizationEngine:
         if md < cfg.min_market_liquidity:
             return None
 
-        # Conservative Kelly sizing: 0.20 fraction, 3% cap
+        # Conservative Kelly sizing
         c_eff = entry + fee
         if c_eff >= 1:
             return None
@@ -1304,10 +1295,12 @@ class SignalEngine:
     """
     Coordinates all strategies and routes to the correct engine per asset/interval.
 
-    v4.1 routing:
-      - BTC 15m  → _BTCStabilizationEngine (24/7, T=60-180s gate)
-      - BTC 5m   → ChainlinkArb multi-strategy (peak hours Mon-Fri 08-18h ET)
-      - ETH/SOL/XRP → ChainlinkArb multi-strategy (peak hours Mon-Fri 08-18h ET)
+    v4.1.1 routing (fixed):
+      - BTC 15m  → Try _BTCStabilizationEngine first (24/7, T=45-300s).
+                   If it doesn't fire, fall through to ChainlinkArb
+                   multi-strategy router (restores v4.0 behavior as fallback).
+      - BTC 5m   → ChainlinkArb multi-strategy (24/7, peak hours disabled)
+      - ETH/SOL/XRP → ChainlinkArb multi-strategy (24/7, peak hours disabled)
 
     v4.0: Uses corrected fee model across all strategies.
     v3.7: Accepts optional per-asset parameters (sigma_fallback, delta_min_abs).
@@ -1318,7 +1311,7 @@ class SignalEngine:
         cfg: SignalConfig,
         sigma_fallback: float = 0.005 / math.sqrt(300),
         delta_min_abs: float = 0.0010,
-        asset_symbol: str = "BTC",  # v4.1: routing depends on asset
+        asset_symbol: str = "BTC",
     ):
         self.cfg = cfg
         self.asset_symbol = asset_symbol.upper()
@@ -1333,11 +1326,11 @@ class SignalEngine:
     def update_price(self, p: float, ts: float) -> None:
         self._cl.update_price(p, ts)
         self._mom.update_price(p, ts)
-        self._btc_stab.update_price(p, ts)  # v4.1
+        self._btc_stab.update_price(p, ts)
 
     def update_chainlink_price(self, p: float, ts: float) -> None:
         self._cl.update_chainlink(p, ts)
-        self._btc_stab.update_chainlink(p, ts)  # v4.1
+        self._btc_stab.update_chainlink(p, ts)
 
     def reset_market_stability(self, slug: str) -> None:
         self._cl.reset_stability(slug)
@@ -1386,11 +1379,13 @@ class SignalEngine:
                 )
             return sig
 
-        # ── v4.1: ROUTING ────────────────────────────────────────────────────
+        # ── v4.1.1: ROUTING (fixed) ──────────────────────────────────────────
         is_15m = state.duration_seconds >= 900 or "15m" in (state.slug or "")
 
-        # BTC 15m → _BTCStabilizationEngine (24/7)
-        # This engine has its own T=60-180s gate; no need for peak hours here.
+        # BTC 15m → Try BTCStabilization first, then fall through to
+        # ChainlinkArb multi-strategy if it doesn't fire.
+        # v4.1 BUG FIX: was "return _blank('WATCHING')" which killed
+        # ChainlinkArb entirely for BTC 15m. Now falls through.
         if self.asset_symbol == "BTC" and is_15m:
             stab_sig = self._btc_stab.evaluate(
                 state, capital, consecutive_losses, daily_pnl_pct,
@@ -1402,9 +1397,12 @@ class SignalEngine:
                 stab_sig.market_duration = state.duration_seconds
                 stab_sig.time_remaining_sec = state.end_time - now
                 return stab_sig
-            return _blank("WATCHING")
+            # v4.1.1: fall through to ChainlinkArb multi-strategy below
+            # (BTCStab only fires under specific conditions; ChainlinkArb
+            # covers the rest of the BTC 15m opportunity space)
 
-        # BTC 5m + ETH/SOL/XRP → ChainlinkArb, peak hours only
+        # All assets: ChainlinkArb multi-strategy router
+        # v4.1.1: peak hours gate disabled by default (trades 24/7)
         if not is_peak_hours(now):
             return _blank("OFF_PEAK")
 
