@@ -63,7 +63,7 @@ class SignalConfig:
     # the diffusion uncertainty on a small delta.
     time_min_5m: float = _envf("TIME_MIN_5M", 65.0)
     time_max_5m: float = _envf("TIME_MAX_5M", 180.0)
-    time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 290.0)
+    time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 180.0)  # v4.1.1: was 290s, too early for 5m
     time_min_15m: float = _envf("TIME_MIN_15M", 60.0)
     # v3.8: reduced from 780s → 550s.
     time_max_15m: float = _envf("TIME_MAX_15M", 550.0)
