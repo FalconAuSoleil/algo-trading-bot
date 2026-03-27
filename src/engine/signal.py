@@ -584,11 +584,16 @@ class _ChainlinkArbEngine:
 
         pd = sig.delta_chainlink
 
-        # ---- DIFFUSION RISK CHECK (v3.1/v3.2/v3.4) -------------------------
+        # ---- DIFFUSION RISK CHECK (v3.1/v3.2/v3.4/v4.1.2) ------------------
         sigma_ps = self._realized_vol_per_sec()
         t_rem = sig.time_remaining_sec
 
-        min_viable_delta = 1.0 * sigma_ps * math.sqrt(max(t_rem, 1))
+        # v4.1.2: stale oracle data adds uncertainty — the real price may
+        # already be closer to the strike than the frozen CL delta suggests.
+        # Penalise by inflating effective time so the diffusion threshold
+        # stays higher when data is old.
+        t_eff = t_rem + oracle_age * 0.5
+        min_viable_delta = 1.0 * sigma_ps * math.sqrt(max(t_eff, 1))
         micro.realized_sigma_pct = round(sigma_ps * math.sqrt(300) * 100, 4)
         micro.min_viable_delta_pct = round(min_viable_delta * 100, 4)
 
