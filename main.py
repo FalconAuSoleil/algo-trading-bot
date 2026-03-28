@@ -443,12 +443,6 @@ class Orchestrator:
                             else ("down" if won else "up")
                         )
 
-                        # v4.2: track ALL resolution directions for trend exhaustion
-                        if symbol in self._signal_engines:
-                            self._signal_engines[symbol].record_resolution_direction(
-                                market_direction
-                            )
-
                         try:
                             market_trend.record(market_direction)
                         except Exception:
