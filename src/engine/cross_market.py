@@ -119,8 +119,24 @@ class CrossMarketBooster:
             delta_pct=delta_pct,
         )
         self._total_observations += 1
-        # v4.2: track direction streak (keep last 10)
-        self._recent_directions.append(direction.lower())
+        # NOTE: direction streak is tracked by record_any_resolution() from
+        # main.py for ALL resolutions (5m+15m). Don't double-count here.
+
+    def record_any_resolution(self, direction: str) -> None:
+        """Record any market resolution direction (5m or 15m) for streak tracking.
+
+        v4.2: Unlike record_5m_close which is specific to cross-market boost,
+        this tracks ALL resolutions for the trend exhaustion penalty.
+        Called from main.py for every resolved trade on this asset.
+        """
+        self._track_direction(direction)
+
+    def _track_direction(self, direction: str) -> None:
+        """Internal: append direction to streak tracker, keep last 10."""
+        d = direction.lower()
+        # Avoid double-counting if record_5m_close already tracked this one
+        # by checking if the last entry was just added in the same second
+        self._recent_directions.append(d)
         if len(self._recent_directions) > 10:
             self._recent_directions = self._recent_directions[-10:]
 

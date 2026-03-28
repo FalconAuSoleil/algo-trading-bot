@@ -1418,6 +1418,14 @@ class SignalEngine:
     def record_result(self, strategy: str, won: bool) -> None:
         self.perf.record(strategy, won)
 
+    def record_resolution_direction(self, direction: str) -> None:
+        """Track market resolution direction for trend exhaustion (v4.2).
+
+        Called for ALL resolutions (5m and 15m) on this asset.
+        Feeds the consecutive streak tracker in CrossMarketBooster.
+        """
+        self.cross_market.record_any_resolution(direction)
+
     def record_5m_resolution(
         self, chainlink_price: float, reference_price: float, direction: str
     ) -> None:
