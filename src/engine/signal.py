@@ -1580,4 +1580,37 @@ class SignalEngine:
                         best.side, state.slug or state.market_id[:14],
                     )
 
+        # ---- v4.2: Trend exhaustion penalty ----------------------------------
+        # After 3+ consecutive resolutions in the same direction, the next
+        # bet continuing that direction faces higher pullback risk. Reduce
+        # sizing progressively (not p_true — the model may be right on
+        # direction, but the risk of a brief dip is elevated).
+        if best.filters_passed and best.action == "BUY":
+            streak_n, streak_dir = self.cross_market.consecutive_same_direction()
+            if streak_n >= 3:
+                # Check if we're betting WITH the streak
+                bet_with_streak = (
+                    (best.side == "YES" and streak_dir == "up")
+                    or (best.side == "NO" and streak_dir == "down")
+                )
+                if bet_with_streak:
+                    # Progressive penalty: 3→0.7x, 4→0.5x, 5+→0.35x sizing
+                    exhaust_mult = max(0.35, 1.0 - 0.15 * streak_n)
+                    best.size_usd = round(best.size_usd * exhaust_mult, 2)
+                    if best.size_usd < 1.0:
+                        best.action = "HOLD"
+                        best.filters_passed = False
+                        best.filter_reasons.append(
+                            f"trend_exhaust:{streak_n}x{streak_dir}"
+                        )
+                        best.status = f"TREND_EXHAUST ({streak_n}x {streak_dir})"
+                    else:
+                        log.info(
+                            "[TrendExhaust] %dx %s streak | sizing %.0f%% | "
+                            "$%.2f | %s %s",
+                            streak_n, streak_dir, exhaust_mult * 100,
+                            best.size_usd, best.side,
+                            state.slug or state.market_id[:14],
+                        )
+
         return _base_info(best)

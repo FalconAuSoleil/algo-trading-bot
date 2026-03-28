@@ -25,6 +25,14 @@ v4.0 CHANGES:
     session. This prevents the first trade of a session from being
     boosted by stale state from a previous run.
   - Propagation window empirically observed at 12-45s; kept as-is.
+
+v4.2 CHANGES:
+  - Trend exhaustion tracking: after 3+ consecutive resolutions in the
+    same direction, a skepticism penalty is applied. Empirically, crypto
+    micro-structure shows higher pullback probability after extended
+    unidirectional runs (profit-taking, mean reversion).
+  - consecutive_same_direction() method: returns the current streak count
+    and direction. Used by SignalEngine to penalize p_true.
 """
 
 from __future__ import annotations
@@ -79,6 +87,8 @@ class CrossMarketBooster:
     def __init__(self) -> None:
         self._last_close: Optional[FiveMinClose] = None
         self._total_observations: int = 0
+        # v4.2: track consecutive same-direction resolutions for exhaustion
+        self._recent_directions: list = []  # last N directions ("up"/"down")
 
     def record_5m_close(
         self,
@@ -109,6 +119,10 @@ class CrossMarketBooster:
             delta_pct=delta_pct,
         )
         self._total_observations += 1
+        # v4.2: track direction streak (keep last 10)
+        self._recent_directions.append(direction.lower())
+        if len(self._recent_directions) > 10:
+            self._recent_directions = self._recent_directions[-10:]
 
     def get_boost(
         self,
@@ -165,6 +179,27 @@ class CrossMarketBooster:
         # Linear decay over propagation window
         decay = 1.0 - (elapsed / PROPAGATION_WINDOW_SEC)
         return MAX_BOOST * decay
+
+    def consecutive_same_direction(self) -> tuple:
+        """Return (streak_count, direction) of recent consecutive same-direction closes.
+
+        v4.2: After 3+ consecutive resolutions in the same direction,
+        the next bet in that direction should be penalized (trend exhaustion /
+        pullback risk). Returns (0, "") if no streak or < 2 observations.
+
+        Example: ["up","up","up","up"] → (4, "up")
+                 ["up","up","down"]    → (1, "down")
+        """
+        if len(self._recent_directions) < 2:
+            return 0, ""
+        last_dir = self._recent_directions[-1]
+        count = 0
+        for d in reversed(self._recent_directions):
+            if d == last_dir:
+                count += 1
+            else:
+                break
+        return count, last_dir
 
     @property
     def observations(self) -> int:
