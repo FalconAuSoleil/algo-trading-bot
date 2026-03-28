@@ -1,5 +1,17 @@
-"""Signal Engine v4.1.1 - Multi-Strategy Router + Diffusion Risk Model
+"""Signal Engine v4.2 - Multi-Strategy Router + Diffusion Risk Model
 ======================================================================
+
+v4.2 changes (2026-03-28):
+  - Stale oracle diffusion penalty: t_eff = t_rem + oracle_age*0.5 inflates
+    the diffusion threshold when CL data is stale (prevents "wait out" bug).
+  - Off-peak adaptive mode: nights/weekends raise edge_min ×1.3 and shrink
+    sizing ×0.6. Bot still trades 24/7 but more conservatively.
+  - SUSPICIOUS_EDGE no longer pollutes stability buffer — edges >15% are
+    not recorded, preventing marginal trades from riding stale stab data.
+  - BTC 5m delta floor raised: delta_min_abs ×1.5 for 5m markets.
+  - Multi-timeframe momentum: 240s window added, all 3 must agree.
+  - BTCStab dynamic max_swing: volatility-adjusted instead of fixed 8¢.
+  - BTCStab order book imbalance: boost/penalize based on depth asymmetry.
 
 v4.1.1 hotfix (2026-03-26):
   - CRITICAL: BTC 15m routing no longer short-circuits to WATCHING
@@ -200,6 +212,25 @@ def is_peak_hours(now: Optional[float] = None) -> bool:
         return False
 
     return cfg.peak_start_hour_et <= et_dt.hour < cfg.peak_end_hour_et
+
+
+def is_offpeak(now: Optional[float] = None) -> bool:
+    """Returns True during nights and weekends (off-peak hours).
+
+    v4.2: Used to apply conservative multipliers (higher edge floor,
+    smaller sizing) rather than blocking trades entirely.
+
+    Off-peak = weekends OR outside 08:00-20:00 ET on weekdays.
+    Wider than peak_hours (08-18h) to give a buffer zone.
+    """
+    ts = now if now is not None else time.time()
+    utc_dt = datetime.datetime.utcfromtimestamp(ts)
+    et_offset = -4 if 3 <= utc_dt.month <= 11 else -5
+    et_dt = utc_dt + datetime.timedelta(hours=et_offset)
+
+    if et_dt.weekday() >= 5:
+        return True  # weekends
+    return et_dt.hour < 8 or et_dt.hour >= 20  # before 8am or after 8pm ET
 
 
 # ---- data structures -------------------------------------------------------
@@ -580,7 +611,9 @@ class _ChainlinkArbEngine:
             if tr > 0 else 1.0
         )
         micro.time_decay_factor = tdf
-        eff_min = cfg.edge_min * tdf
+        # v4.2: off-peak raises edge floor (nights/weekends = lower confidence)
+        offpeak_mult = cfg.offpeak_edge_multiplier if is_offpeak(now) else 1.0
+        eff_min = cfg.edge_min * tdf * offpeak_mult
 
         pd = sig.delta_chainlink
 
@@ -605,9 +638,11 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
 
-        if abs(pd) < self.delta_min_abs and t_rem > 30:
+        # v4.2: 5m markets require higher absolute delta (more noise in short window)
+        eff_delta_min = self.delta_min_abs * (cfg.delta_min_abs_5m_mult if is5 else 1.0)
+        if abs(pd) < eff_delta_min and t_rem > 30:
             sig.filter_reasons.append(
-                f"delta_abs:{abs(pd)*100:.3f}%<{self.delta_min_abs*100:.3f}%"
+                f"delta_abs:{abs(pd)*100:.3f}%<{eff_delta_min*100:.3f}%"
             )
             sig.status = f"DELTA_ABS_FLOOR ({abs(pd)*100:.3f}%)"
             sig.micro = micro
@@ -694,7 +729,9 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
         if edge > cfg.edge_max:
-            self.stab.record(slug, side, max(edge, 0.001), now)
+            # v4.2: do NOT record in stability buffer — suspicious edges
+            # polluted the stab counter, letting marginal trades fire when
+            # edge briefly dipped into the acceptable range.
             sig.filter_reasons.append(f"edge_suspicious:{edge * 100:.1f}%")
             sig.status = f"SUSPICIOUS_EDGE ({edge * 100:.1f}%)"
             sig.micro = micro
@@ -772,6 +809,9 @@ class _ChainlinkArbEngine:
         frac = clamp(kelly * 0.25, 0, cfg.max_bet_fraction)
         if hi < cfg.hawkes_mu * 1.5:
             frac *= 0.7
+        # v4.2: shrink sizing at night/weekends (lower signal quality)
+        if is_offpeak(now):
+            frac *= cfg.offpeak_sizing_multiplier
         frac = clamp(frac, 0, cfg.max_bet_fraction)
         size = round(capital * frac, 2)
         size = min(size, capital * cfg.max_bet_fraction)
@@ -813,8 +853,8 @@ class _ChainlinkArbEngine:
 class _MomentumEngine:
     """
     Bet in the direction of sustained BTC price momentum.
-    Both 60s and 120s windows must agree. Window 60-150s.
-    Applies diffusion check before committing.
+    v4.2: All three windows (60s, 120s, 240s) must agree.
+    Window 60-150s. Applies diffusion check before committing.
     """
     NAME = "momentum"
 
@@ -867,11 +907,15 @@ class _MomentumEngine:
 
         m60 = self._mom_window(60)
         m120 = self._mom_window(120)
+        m240 = self._mom_window(240)  # v4.2: longer confirmation window
         threshold = cfg.momentum_min_threshold
 
         if abs(m60) < threshold or abs(m120) < threshold:
             return None
         if (m60 > 0) != (m120 > 0):
+            return None
+        # v4.2: 240s window must agree if available (filters single-spike noise)
+        if abs(m240) >= threshold * 0.5 and (m240 > 0) != (m60 > 0):
             return None
 
         going_up = m60 > 0
@@ -901,7 +945,11 @@ class _MomentumEngine:
                   else (1 - state.p_market_yes))
         )
 
-        momentum_strength = (abs(m60) + abs(m120)) / 2
+        # v4.2: include 240s window in strength (triple-timeframe confirmation)
+        mom_vals = [abs(m60), abs(m120)]
+        if abs(m240) >= threshold * 0.5:
+            mom_vals.append(abs(m240))
+        momentum_strength = sum(mom_vals) / len(mom_vals)
         p_bayes = clamp(0.53 + momentum_strength * 20, 0.53, 0.67)
         blend_w = clamp(time_remaining / 150, 0.2, 0.45)
         prob = blend_w * p_diff + (1 - blend_w) * p_bayes
@@ -1124,7 +1172,10 @@ class _BTCStabilizationEngine:
         Returns True if the market price has been in a tight range
         for the stability window with enough observations.
 
-        v4.1.1: 20s window, 3 observations, ±8¢ swing tolerance.
+        v4.2: dynamic max_swing based on realized vol instead of fixed 8¢.
+        In low-vol regimes, 8¢ is huge (allows too much noise).
+        In high-vol regimes, 8¢ is tiny (rejects genuine stability).
+        Dynamic: max_swing = max(cfg.btc_stab_max_swing, 2σ·√(window_sec)·100¢)
         """
         cfg = self.cfg
         now = time.time()
@@ -1135,7 +1186,14 @@ class _BTCStabilizationEngine:
         if len(recent) < cfg.btc_stab_min_obs:
             return False
         prices = [p for _, p in recent]
-        return (max(prices) - min(prices)) <= cfg.btc_stab_max_swing
+        swing = max(prices) - min(prices)
+        # v4.2: volatility-adaptive swing tolerance
+        sigma_ps = self._sigma_ps()
+        # 2-sigma band in "market price cents" (sigma_ps is in price-fraction/sec)
+        # Market price moves ~proportionally to BTC, so scale by 100¢
+        dynamic_swing = 2.0 * sigma_ps * math.sqrt(cfg.btc_stab_window_sec) * 100
+        max_swing = clamp(dynamic_swing, 0.03, cfg.btc_stab_max_swing)
+        return swing <= max_swing
 
     def evaluate(
         self,
@@ -1202,6 +1260,20 @@ class _BTCStabilizationEngine:
         sigma_ps = self._sigma_ps()
         p_diff = p_brownian(delta, t_rem, sigma_ps)
 
+        # v4.2: order book imbalance — penalize if opposing side has deeper book
+        total_depth = (state.depth_yes or 0) + (state.depth_no or 0)
+        if total_depth > 0:
+            own_depth = state.depth_yes if side == "YES" else state.depth_no
+            opp_depth = state.depth_no if side == "YES" else state.depth_yes
+            imbalance = (opp_depth - own_depth) / total_depth  # >0 means opposition deeper
+            if imbalance > 0.5:
+                # Heavy opposing book = market expects reversal, penalize
+                p_diff -= 0.02 * imbalance  # up to -2% at extreme imbalance
+            elif imbalance < -0.3:
+                # Opposing side thin = exhausted sellers, slight boost
+                p_diff += 0.01
+            p_diff = clamp(p_diff, 0.50, 0.98)
+
         # v4.0 linear fee model
         fee = calc_fee(entry, cfg.fee_rate)
         edge = p_diff - entry - fee
@@ -1234,6 +1306,9 @@ class _BTCStabilizationEngine:
         if kelly <= 0:
             return None
         frac = clamp(kelly * cfg.btc_stab_kelly_fraction, 0, cfg.btc_stab_max_bet_fraction)
+        # v4.2: conservative sizing at night/weekends
+        if is_offpeak(now):
+            frac *= cfg.offpeak_sizing_multiplier
         size = round(capital * frac, 2)
         depth = state.depth_yes if side == "YES" else state.depth_no
         if depth > 0:

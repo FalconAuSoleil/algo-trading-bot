@@ -150,6 +150,18 @@ class SignalConfig:
     peak_start_hour_et: int = _envi("PEAK_START_HOUR_ET", 8)
     peak_end_hour_et: int = _envi("PEAK_END_HOUR_ET", 18)
 
+    # ── Off-peak adaptive mode (v4.2) ────────────────────────────────────────────
+    # Bot still trades 24/7 but is MORE CONSERVATIVE at night/weekends:
+    # higher edge floor, smaller bets. Lower vol + fewer participants + staler
+    # oracle updates = worse signal quality at night.
+    offpeak_edge_multiplier: float = _envf("OFFPEAK_EDGE_MULT", 1.3)    # edge_min × 1.3 at night
+    offpeak_sizing_multiplier: float = _envf("OFFPEAK_SIZING_MULT", 0.6) # bets × 0.6 at night
+
+    # ── BTC 5m delta floor multiplier (v4.2) ─────────────────────────────────────
+    # 5m markets need a higher delta to overcome short-window noise.
+    # Effective delta_min_abs for 5m = base × this multiplier.
+    delta_min_abs_5m_mult: float = _envf("DELTA_MIN_ABS_5M_MULT", 1.5)
+
 
 @dataclass(frozen=True)
 class RiskConfig:
