@@ -1253,12 +1253,17 @@ class _BTCStabilizationEngine:
             return None
 
         # Absolute delta floor: move must be meaningful
-        if abs(delta) < cfg.delta_min_abs:
+        # v4.2.1: off-peak raises delta floor — tiny deltas at night are pure noise
+        offpeak = is_offpeak(now)
+        eff_delta_min = cfg.delta_min_abs * (cfg.offpeak_edge_multiplier if offpeak else 1.0)
+        if abs(delta) < eff_delta_min:
             return None
 
         # Brownian reversal probability
         sigma_ps = self._sigma_ps()
-        p_diff = p_brownian(delta, t_rem, sigma_ps)
+        # v4.2.1: stale CL penalty (same as ChainlinkArb v4.1.2)
+        t_eff = t_rem + oracle_age * 0.5
+        p_diff = p_brownian(delta, t_eff, sigma_ps)
 
         # v4.2: order book imbalance — penalize if opposing side has deeper book
         total_depth = (state.depth_yes or 0) + (state.depth_no or 0)
@@ -1278,8 +1283,9 @@ class _BTCStabilizationEngine:
         fee = calc_fee(entry, cfg.fee_rate)
         edge = p_diff - entry - fee
 
-        # v4.1.1: relaxed edge floor (2% vs original 3%)
-        if edge < cfg.btc_stab_edge_min:
+        # v4.2.1: off-peak raises edge floor (night/WE need stronger edge)
+        eff_stab_edge_min = cfg.btc_stab_edge_min * (cfg.offpeak_edge_multiplier if offpeak else 1.0)
+        if edge < eff_stab_edge_min:
             return None
         if p_diff <= entry:  # no true edge: market already fairly priced
             return None
@@ -1321,7 +1327,7 @@ class _BTCStabilizationEngine:
         micro.p_diffusion = round(p_diff, 4)
         micro.oracle_age_sec = round(oracle_age, 1)
         micro.realized_sigma_pct = round(sigma_ps * math.sqrt(300) * 100, 4)
-        micro.min_viable_delta_pct = round(sigma_ps * math.sqrt(t_rem) * 100, 4)
+        micro.min_viable_delta_pct = round(sigma_ps * math.sqrt(t_eff) * 100, 4)
         micro.taker_fee = fee
 
         delta_binance = 0.0
