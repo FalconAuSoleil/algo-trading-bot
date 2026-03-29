@@ -1287,6 +1287,11 @@ class _BTCStabilizationEngine:
         eff_stab_edge_min = cfg.btc_stab_edge_min * (cfg.offpeak_edge_multiplier if offpeak else 1.0)
         if edge < eff_stab_edge_min:
             return None
+        # v4.2.1: BTCStab needs an edge ceiling too — if the diffusion model
+        # says 13%+ edge but the market prices it at 59¢, the market knows
+        # something. Same edge_max as ChainlinkArb.
+        if edge > cfg.edge_max:
+            return None
         if p_diff <= entry:  # no true edge: market already fairly priced
             return None
 
