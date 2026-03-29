@@ -228,7 +228,10 @@ class AppConfig:
             polymarket_prefix="btc",
             chainlink_period=27.0,
             oracle_freshness_max_age_sec=55.0,
-            delta_min_abs=0.0010,
+            # v4.2.1: raised from 0.0010 → 0.0015 (aligned with ETH/XRP).
+            # Sunday analysis: 5/8 weekend losses had |delta| < 0.22%.
+            # Tiny BTC deltas are noise, not signal. Plus 5m gets ×1.5 on top.
+            delta_min_abs=0.0015,
             sigma_fallback=0.005 / (300 ** 0.5),  # ~2.89e-4
             supported_intervals=(300, 900),  # 5m + 15m
             enabled=True,
