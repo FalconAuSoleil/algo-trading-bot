@@ -55,15 +55,16 @@ class SignalConfig:
     min_market_liquidity: float = _envf("MIN_MARKET_LIQUIDITY", 15.0)
 
     # ── Timing windows ────────────────────────────────────────────────────────────────────────────
-    # v4.0: raised from 45s → 65s.
-    # Analysis of paper trade screens shows 3 consecutive losses all
-    # occurring at T=58-68s with small deltas (0.25-0.27%).
-    # Late-window bets on small moves are systematically unprofitable:
-    # the signal-to-noise ratio at T<65s is insufficient to overcome
-    # the diffusion uncertainty on a small delta.
-    time_min_5m: float = _envf("TIME_MIN_5M", 65.0)
-    time_max_5m: float = _envf("TIME_MAX_5M", 180.0)
-    time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 180.0)  # v4.1.1: was 290s, too early for 5m
+    # v4.2.1: tightened 5m window from 65-180s → 75-120s.
+    # BTC 5m is 0% WR over 4 observed trades (all lost). Root causes:
+    #   - T>120s: too early, price can still reverse over 2+ minutes
+    #   - T<75s: too late, diffusion uncertainty overwhelms small deltas
+    # New window = 45 seconds (75-120s), with accumulation from 150s
+    # so stability buffer is well-filled before betting opens.
+    # v4.0: raised from 45s → 65s (late-window losses at T=58-68s).
+    time_min_5m: float = _envf("TIME_MIN_5M", 75.0)
+    time_max_5m: float = _envf("TIME_MAX_5M", 120.0)
+    time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 150.0)
     time_min_15m: float = _envf("TIME_MIN_15M", 60.0)
     # v3.8: reduced from 780s → 550s.
     time_max_15m: float = _envf("TIME_MAX_15M", 550.0)

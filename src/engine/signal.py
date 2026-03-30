@@ -1470,8 +1470,15 @@ class SignalEngine:
                 )
             return sig
 
-        # ── v4.1.1: ROUTING (fixed) ──────────────────────────────────────────
+        # ── v4.2.1: ROUTING ────────────────────────────────────────────────────
         is_15m = state.duration_seconds >= 900 or "15m" in (state.slug or "")
+        is_5m = not is_15m
+
+        # v4.2.1: BTC 5m disabled during off-peak (0% WR over 4 trades).
+        # Night/weekends have too little liquidity for 5m BTC to be profitable.
+        # BTCStab 15m and altcoins still trade normally at night.
+        if self.asset_symbol == "BTC" and is_5m and is_offpeak(now):
+            return _blank("BTC_5M_OFFPEAK")
 
         # BTC 15m → Try BTCStabilization first, then fall through to
         # ChainlinkArb multi-strategy if it doesn't fire.
