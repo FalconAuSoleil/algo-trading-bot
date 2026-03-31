@@ -980,6 +980,10 @@ class _MomentumEngine:
 
         if edge < cfg.edge_min * 0.9:
             return None
+        # v4.2.1: add edge_max + longshot filters (were missing — caused
+        # SOL @0.27 edge=30% trades to slip through, losing $468)
+        if edge > cfg.edge_max:
+            return None
         if entry < cfg.min_market_prob_side or entry > cfg.max_market_prob_side:
             return None
 
@@ -1081,6 +1085,10 @@ class _MeanReversionEngine:
         edge = p_true - entry - fee
 
         if edge < cfg.edge_min:
+            return None
+        # v4.2.1: add edge_max filter (was missing — same class of bug
+        # as MomentumEngine that allowed extreme-edge longshots through)
+        if edge > cfg.edge_max:
             return None
         if entry < cfg.min_market_prob_side or entry > cfg.max_market_prob_side:
             return None
