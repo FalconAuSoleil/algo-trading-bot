@@ -184,6 +184,33 @@ def p_brownian(
     return 0.5 * (1.0 + _erf_approx(z / 1.41421356237))
 
 
+# ---- US Eastern time helper ------------------------------------------------
+
+def _to_et(ts: float) -> datetime.datetime:
+    """Convert UNIX timestamp to US Eastern datetime with exact DST handling.
+
+    v4.2.1: replaces the month-based approximation (3<=month<=11).
+    US DST rules (since 2007):
+      - Starts: 2nd Sunday of March at 02:00 EST → 03:00 EDT
+      - Ends:   1st Sunday of November at 02:00 EDT → 01:00 EST
+    """
+    utc_dt = datetime.datetime.utcfromtimestamp(ts)
+    year = utc_dt.year
+
+    # 2nd Sunday of March: find March 1, then offset to 2nd Sunday
+    mar1 = datetime.datetime(year, 3, 1)
+    dst_start = mar1 + datetime.timedelta(days=(6 - mar1.weekday()) % 7 + 7)
+    dst_start = dst_start.replace(hour=7)  # 02:00 EST = 07:00 UTC
+
+    # 1st Sunday of November
+    nov1 = datetime.datetime(year, 11, 1)
+    dst_end = nov1 + datetime.timedelta(days=(6 - nov1.weekday()) % 7)
+    dst_end = dst_end.replace(hour=6)  # 02:00 EDT = 06:00 UTC
+
+    et_offset = -4 if dst_start <= utc_dt < dst_end else -5
+    return utc_dt + datetime.timedelta(hours=et_offset)
+
+
 # ---- peak hours gate -------------------------------------------------------
 
 def is_peak_hours(now: Optional[float] = None) -> bool:
@@ -191,7 +218,7 @@ def is_peak_hours(now: Optional[float] = None) -> bool:
     Returns True during peak Polymarket liquidity hours.
 
     Peak = Monday-Friday, 08:00-18:00 ET.
-    ET offset: UTC-5 (EST, Nov-Mar) or UTC-4 (EDT, Mar-Nov).
+    v4.2.1: exact DST via _to_et() (replaces month approximation).
 
     v4.1.1: disabled by default (peak_hours_enabled=False in config).
     Set PEAK_HOURS_ENABLED=true env var to restore.
@@ -201,13 +228,8 @@ def is_peak_hours(now: Optional[float] = None) -> bool:
         return True  # gate disabled — always active
 
     ts = now if now is not None else time.time()
-    utc_dt = datetime.datetime.utcfromtimestamp(ts)
+    et_dt = _to_et(ts)
 
-    # DST approximation: March–November = EDT (UTC-4), else EST (UTC-5).
-    et_offset = -4 if 3 <= utc_dt.month <= 11 else -5
-    et_dt = utc_dt + datetime.timedelta(hours=et_offset)
-
-    # Weekends: Saturday(5) and Sunday(6)
     if et_dt.weekday() >= 5:
         return False
 
@@ -224,9 +246,7 @@ def is_offpeak(now: Optional[float] = None) -> bool:
     Wider than peak_hours (08-18h) to give a buffer zone.
     """
     ts = now if now is not None else time.time()
-    utc_dt = datetime.datetime.utcfromtimestamp(ts)
-    et_offset = -4 if 3 <= utc_dt.month <= 11 else -5
-    et_dt = utc_dt + datetime.timedelta(hours=et_offset)
+    et_dt = _to_et(ts)
 
     if et_dt.weekday() >= 5:
         return True  # weekends
