@@ -255,7 +255,7 @@ class AppConfig:
             binance_symbol="SOLUSDT",
             polymarket_prefix="sol",
             chainlink_period=90.0,
-            oracle_freshness_max_age_sec=90.0,
+            oracle_freshness_max_age_sec=55.0,  # v4.2.2: was 90.0 (=chainlink_period, no buffer); aligned with BTC/ETH
             delta_min_abs=0.0020,
             sigma_fallback=0.009 / (300 ** 0.5),  # ~5.20e-4
             supported_intervals=(900,),  # 15m only — 5m API not supported for SOL

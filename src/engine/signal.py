@@ -610,11 +610,10 @@ class _ChainlinkArbEngine:
             return sig
 
         # v3.5: Oracle freshness filter
-        oracle_age = (now - self._cl_ts) if self._cl_ts > 0 else 0.0
+        oracle_age = (now - self._cl_ts) if self._cl_ts > 0 else 999.0
         micro.oracle_age_sec = round(oracle_age, 1)
         if (
             cfg.oracle_freshness_max_age_sec > 0
-            and sig.time_remaining_sec < 90.0
             and self._cl_ts > 0
             and oracle_age > cfg.oracle_freshness_max_age_sec
         ):
