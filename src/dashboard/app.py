@@ -54,7 +54,10 @@ class DashboardState:
             except Exception:
                 disconnected.append(ws)
         for ws in disconnected:
-            self._ws_clients.remove(ws)
+            try:
+                self._ws_clients.remove(ws)
+            except ValueError:
+                pass  # already removed by concurrent broadcast
 
     async def update_signal(self, signal_data: dict) -> None:
         self.signal = signal_data
