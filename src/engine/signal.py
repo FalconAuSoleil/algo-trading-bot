@@ -877,10 +877,11 @@ class _MomentumEngine:
     """
     NAME = "momentum"
 
-    def __init__(self, cfg: SignalConfig, sigma_fallback: float = 0.005 / math.sqrt(300)):
+    def __init__(self, cfg: SignalConfig, sigma_fallback: float = 0.005 / math.sqrt(300), delta_min_abs: float = 0.0010):
         self.cfg = cfg
         self.sigma_fallback = sigma_fallback
         self.sigma_floor = sigma_fallback
+        self.delta_min_abs = delta_min_abs
         self._ph: deque = deque(maxlen=200)
 
     def update_price(self, p: float, ts: float) -> None:
@@ -952,8 +953,7 @@ class _MomentumEngine:
         if p_diff < 0.60:
             return None
 
-        delta_abs_floor = getattr(cfg, "delta_min_abs", 0.0010)
-        if abs(delta) < delta_abs_floor:
+        if abs(delta) < self.delta_min_abs:
             return None
 
         side = "YES" if going_up else "NO"
@@ -1434,7 +1434,7 @@ class SignalEngine:
         self.cfg = cfg
         self.asset_symbol = asset_symbol.upper()
         self._cl = _ChainlinkArbEngine(cfg, sigma_fallback, delta_min_abs)
-        self._mom = _MomentumEngine(cfg, sigma_fallback)
+        self._mom = _MomentumEngine(cfg, sigma_fallback, delta_min_abs)
         self._rev = _MeanReversionEngine(cfg, sigma_fallback)
         # v4.1: BTC 15m stabilization engine
         self._btc_stab = _BTCStabilizationEngine(cfg, sigma_fallback)
