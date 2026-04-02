@@ -593,7 +593,7 @@ class _ChainlinkArbEngine:
 
         sig.time_remaining_sec = state.end_time - now
         slug = state.slug or state.market_id[:20]
-        is5 = "-5m-" in slug or (sig.time_remaining_sec < 330 and "-15m-" not in slug)
+        is5 = "5m" in slug or sig.time_remaining_sec < 330
         min_t = cfg.time_min_5m if is5 else cfg.time_min_15m
         max_t = cfg.time_max_5m if is5 else cfg.time_max_15m
         max_a = cfg.time_max_5m_accum if is5 else cfg.time_max_15m
