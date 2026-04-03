@@ -1156,10 +1156,12 @@ class _BTCStabilizationEngine:
         self,
         cfg: SignalConfig,
         sigma_fallback: float = 0.005 / math.sqrt(900),
+        delta_min_abs: float = 0.0010,
     ):
         self.cfg = cfg
         self.sigma_fallback = sigma_fallback
         self.sigma_floor = sigma_fallback
+        self.delta_min_abs = delta_min_abs
         # BTC price history — 10-minute window for 15m vol estimation
         self._ph: deque = deque(maxlen=600)
         # Market price history — tracks YES price stability over ~3min
@@ -1282,7 +1284,7 @@ class _BTCStabilizationEngine:
         # Absolute delta floor: move must be meaningful
         # v4.2.1: off-peak raises delta floor — tiny deltas at night are pure noise
         offpeak = is_offpeak(now)
-        eff_delta_min = cfg.delta_min_abs * (cfg.offpeak_edge_multiplier if offpeak else 1.0)
+        eff_delta_min = self.delta_min_abs * (cfg.offpeak_edge_multiplier if offpeak else 1.0)
         if abs(delta) < eff_delta_min:
             return None
 
@@ -1437,7 +1439,7 @@ class SignalEngine:
         self._mom = _MomentumEngine(cfg, sigma_fallback, delta_min_abs)
         self._rev = _MeanReversionEngine(cfg, sigma_fallback)
         # v4.1: BTC 15m stabilization engine
-        self._btc_stab = _BTCStabilizationEngine(cfg, sigma_fallback)
+        self._btc_stab = _BTCStabilizationEngine(cfg, sigma_fallback, delta_min_abs)
         self.perf = PerformanceTracker(window=30)
         self.cross_market = CrossMarketBooster()
 
