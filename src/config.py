@@ -163,6 +163,25 @@ class SignalConfig:
     # Effective delta_min_abs for 5m = base × this multiplier.
     delta_min_abs_5m_mult: float = _envf("DELTA_MIN_ABS_5M_MULT", 1.5)
 
+    # ── Early exit (v5) ──────────────────────────────────────────────────────
+    # Sell positions when p_true drops significantly mid-market.
+    # Conservative: all 6 conditions must be met before selling.
+    early_exit_enabled: bool = _env("EARLY_EXIT_ENABLED", "true").lower() in ("true", "1")
+    early_exit_min_t_rem: float = _envf("EARLY_EXIT_MIN_T_REM", 30.0)       # don't sell in last 30s
+    early_exit_p_true_floor: float = _envf("EARLY_EXIT_P_FLOOR", 0.35)      # p_true must drop below this
+    early_exit_p_true_drop_pct: float = _envf("EARLY_EXIT_P_DROP", 0.50)    # >50% drop from entry
+    early_exit_min_bid: float = _envf("EARLY_EXIT_MIN_BID", 0.05)           # min liquidity to sell
+
+    # ── Staged entry / double-down on dips (v5) ─────────────────────────────
+    # Split initial bet into 70/30, deploy reserve when confident + price dips.
+    staged_entry_enabled: bool = _env("STAGED_ENTRY_ENABLED", "true").lower() in ("true", "1")
+    staged_initial_fraction: float = _envf("STAGED_INITIAL_FRAC", 0.70)     # 70% upfront
+    staged_topup_fraction: float = _envf("STAGED_TOPUP_FRAC", 0.30)         # 30% reserve
+    staged_min_confidence: float = _envf("STAGED_MIN_CONFIDENCE", 0.70)      # p_true min for eligible
+    staged_dip_threshold: float = _envf("STAGED_DIP_THRESHOLD", 0.08)        # absolute price drop (e.g. 0.50→0.42)
+    staged_topup_min_p_true: float = _envf("STAGED_TOPUP_MIN_P", 0.55)      # p_true still favorable
+    staged_topup_min_t_rem: float = _envf("STAGED_TOPUP_MIN_T", 60.0)       # min time left for topup
+
 
 @dataclass(frozen=True)
 class RiskConfig:

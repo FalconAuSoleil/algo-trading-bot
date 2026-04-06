@@ -88,6 +88,11 @@ class TradeRecord:
     outcome: str = "pending"
     pnl: float = 0.0
     resolved_at: Optional[float] = None
+    exit_price: float = 0.0
+    exit_reason: str = "normal"
+    is_topup: int = 0
+    parent_trade_id: Optional[int] = None
+    token_id: str = ""
     id: Optional[int] = None
 
     def __post_init__(self):
@@ -128,6 +133,22 @@ class Database:
             except Exception:
                 pass  # column already exists — safe to ignore
 
+        # v5 migration: early exit + staged entry support columns.
+        for _col, _default in [
+            ("exit_price REAL", "0.0"),
+            ("exit_reason TEXT", "'normal'"),
+            ("is_topup INTEGER", "0"),
+            ("parent_trade_id INTEGER", "NULL"),
+            ("token_id TEXT", "''"),
+        ]:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE trades ADD COLUMN {_col} DEFAULT {_default}"
+                )
+                await self._db.commit()
+            except Exception:
+                pass  # column already exists
+
         # v3.6: auto-purge signals older than 7 days to prevent unbounded growth.
         # At ~3 signals/s this table accumulates ~1.8M rows/week without cleanup.
         _signals_cutoff = time.time() - 7 * 86400
@@ -159,6 +180,22 @@ class Database:
             "UPDATE trades SET outcome=?, pnl=?, resolved_at=? "
             "WHERE id=?",
             (outcome, pnl, time.time(), trade_id),
+        )
+        await self._db.commit()
+
+    async def resolve_trade_early(
+        self,
+        trade_id: int,
+        outcome: str,
+        pnl: float,
+        exit_price: float,
+        exit_reason: str,
+    ) -> None:
+        """Resolve a trade that was exited early (sold before expiry)."""
+        await self._db.execute(
+            "UPDATE trades SET outcome=?, pnl=?, resolved_at=?, "
+            "exit_price=?, exit_reason=? WHERE id=?",
+            (outcome, pnl, time.time(), exit_price, exit_reason, trade_id),
         )
         await self._db.commit()
 

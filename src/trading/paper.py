@@ -82,6 +82,13 @@ class PaperTrader:
         if signal.size_usd < 1.0:
             return None
 
+        if signal.time_remaining_sec < 45.0:
+            log.warning(
+                "[Paper] Rejected: t_rem=%.0fs < 45s safety guard",
+                signal.time_remaining_sec,
+            )
+            return None
+
         entry_price = signal.entry_price
         if entry_price <= 0 or entry_price >= 1.0:
             log.warning("[Paper] Invalid entry price: %.4f", entry_price)
@@ -118,6 +125,8 @@ class PaperTrader:
             delta_at_entry=signal.delta_chainlink,
             p_true_at_entry=signal.p_true,
             edge_at_entry=signal.edge,
+            slug=signal.slug,
+            duration_seconds=signal.market_duration,
         )
 
         if not self.portfolio.open_position(pos):
@@ -153,6 +162,38 @@ class PaperTrader:
             signal.strategy_used,
         )
         return trade_id
+
+    async def sell_position(
+        self, trade_id: int, exit_price: float, reason: str
+    ) -> Optional[float]:
+        """Sell a position early at the given exit price.
+
+        v5: Early exit feature. In paper mode, we simulate selling
+        at the best_bid price without actually placing an order.
+
+        Returns:
+            PnL if sold, None if position not found.
+        """
+        if trade_id not in self._pending_resolutions:
+            log.warning("[Paper] sell_position: trade %d not pending", trade_id)
+            return None
+
+        outcome, pnl = self.portfolio.close_position_early(
+            trade_id, exit_price
+        )
+        if outcome == "error":
+            return None
+
+        await self.db.resolve_trade_early(
+            trade_id, outcome, pnl, exit_price, reason
+        )
+        del self._pending_resolutions[trade_id]
+
+        log.info(
+            "[Paper] EARLY EXIT trade %d | exit=%.4f | PnL=$%.2f | reason=%s",
+            trade_id, exit_price, pnl, reason,
+        )
+        return pnl
 
     async def check_resolutions(
         self,
