@@ -251,8 +251,11 @@
     .badge-won { background: var(--green-bg); color: var(--green); }
     .badge-lost { background: var(--red-bg); color: var(--red); }
     .badge-pending { background: var(--yellow-bg); color: var(--yellow); }
+    .badge-early-exit { background: rgba(249,115,22,0.15); color: #f97316; }
     .badge-yes { background: var(--green-bg); color: var(--green); }
     .badge-no { background: var(--red-bg); color: var(--red); }
+    .badge-topup { background: var(--purple); color: #fff; font-size: 9px; }
+    .badge-exit { background: rgba(249,115,22,0.2); color: #f97316; font-size: 9px; }
 
     .progress-bar {
       height: 6px;
@@ -475,6 +478,7 @@
               <th>Asset</th>
               <th>Market</th>
               <th>Side</th>
+              <th>Type</th>
               <th>Entry</th>
               <th>Size</th>
               <th>Delta</th>
@@ -487,7 +491,7 @@
           </thead>
           <tbody id="trades-body">
             <tr>
-              <td colspan="12" style="text-align:center;color:var(--text-dim);padding:24px">
+              <td colspan="13" style="text-align:center;color:var(--text-dim);padding:24px">
                 No trades yet. Waiting for signals...
               </td>
             </tr>
@@ -765,7 +769,7 @@ function renderTrades() {
   const trades = state.recent_trades || [];
 
   if (trades.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="12"
+    tbody.innerHTML = `<tr><td colspan="13"
       style="text-align:center;color:var(--text-dim);padding:24px">
       No trades yet. Waiting for signals...</td></tr>`;
     return;
@@ -797,20 +801,45 @@ function renderTrades() {
     const sideBadge = t.side === 'YES'
       ? '<span class="badge badge-yes">UP</span>'
       : '<span class="badge badge-no">DOWN</span>';
-    const outBadge = t.outcome === 'won'
-      ? '<span class="badge badge-won">WON</span>'
-      : t.outcome === 'lost'
-      ? '<span class="badge badge-lost">LOST</span>'
-      : '<span class="badge badge-pending">PENDING</span>';
+
+    // v5: trade type badge (topup, early exit, or normal)
+    const isTopup = t.is_topup === 1;
+    const isEarlyExit = t.outcome === 'early_exit' || (t.exit_reason && t.exit_reason !== 'normal');
+    const typeBadge = isTopup
+      ? '<span class="badge badge-topup">TOPUP</span>'
+      : isEarlyExit
+      ? '<span class="badge badge-exit">EXIT</span>'
+      : '';
+
+    // v5: outcome badge — handle early_exit as distinct state
+    let outBadge;
+    if (t.outcome === 'won') {
+      outBadge = '<span class="badge badge-won">WON</span>';
+    } else if (t.outcome === 'lost') {
+      outBadge = '<span class="badge badge-lost">LOST</span>';
+    } else if (t.outcome === 'early_exit') {
+      outBadge = '<span class="badge badge-early-exit">SOLD</span>';
+    } else if (t.outcome === 'cancelled' || t.outcome === 'rejected' || t.outcome === 'error') {
+      outBadge = '<span class="badge" style="background:var(--surface2);color:var(--text-dim)">' + (t.outcome || '').toUpperCase() + '</span>';
+    } else {
+      outBadge = '<span class="badge badge-pending">PENDING</span>';
+    }
+
     const pnlClass = (t.pnl || 0) > 0 ? 'positive' :
       (t.pnl || 0) < 0 ? 'negative' : '';
+
+    // v5: show exit price for early exits
+    const entryDisplay = isEarlyExit && t.exit_price > 0
+      ? `$${(t.entry_price || 0).toFixed(4)} <span style="color:var(--text-dim)">&rarr;</span> $${(t.exit_price).toFixed(4)}`
+      : `$${(t.entry_price || 0).toFixed(4)}`;
 
     return `<tr>
       <td>${timeStr}</td>
       <td>${assetBadge}</td>
       <td>${marketLabel}</td>
       <td>${sideBadge}</td>
-      <td>$${(t.entry_price || 0).toFixed(4)}</td>
+      <td>${typeBadge}</td>
+      <td>${entryDisplay}</td>
       <td>$${(t.size_usd || 0).toFixed(2)}</td>
       <td>${((t.delta || 0) * 100).toFixed(3)}%</td>
       <td>${((t.p_true || 0) * 100).toFixed(1)}%</td>
