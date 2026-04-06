@@ -49,8 +49,9 @@ except ImportError:
         "Run: pip install py-clob-client>=0.6"
     )
 
-# BUY side constant (avoids importing the enum in the order payload)
+# Side constants (avoids importing the enum in the order payload)
 _BUY = "BUY"
+_SELL = "SELL"
 
 # Seconds after expiry before falling back to BTC price for resolution.
 # Increased from 30s to 120s (v3.6) to reduce incorrect resolutions
@@ -167,6 +168,7 @@ class LiveTrader:
                 "duration": 300,
                 "slug": row.get("slug", ""),
                 "strategy_used": "chainlink_arb",
+                "token_id": row.get("token_id", ""),
             }
             restored += 1
         if restored:
@@ -185,6 +187,12 @@ class LiveTrader:
         if signal.action != "BUY" or not signal.filters_passed:
             return None
         if signal.size_usd < 1.0:
+            return None
+        if signal.time_remaining_sec < 45.0:
+            log.warning(
+                "[Live] Rejected: t_rem=%.0fs < 45s safety guard",
+                signal.time_remaining_sec,
+            )
             return None
         if self._client is None:
             log.error("[Live] Client not initialized — check credentials")
@@ -226,6 +234,7 @@ class LiveTrader:
             time_remaining_sec=signal.time_remaining_sec,
             oracle_age_sec=signal.oracle_age_sec,
             mode="live",
+            token_id=token_id,
         )
         trade_id = await self.db.insert_trade(record)
 
@@ -271,6 +280,8 @@ class LiveTrader:
                     delta_at_entry=signal.delta_chainlink,
                     p_true_at_entry=signal.p_true,
                     edge_at_entry=signal.edge,
+                    slug=signal.slug,
+                    duration_seconds=signal.market_duration,
                 )
 
                 if not self.portfolio.open_position(pos):
@@ -286,6 +297,7 @@ class LiveTrader:
                     "duration": signal.market_duration,
                     "slug": signal.slug,
                     "strategy_used": signal.strategy_used,
+                    "token_id": token_id,
                 }
                 return trade_id
 
@@ -301,6 +313,84 @@ class LiveTrader:
         except Exception as exc:
             log.error("[Live] Order execution error: %s", exc, exc_info=True)
             await self.db.resolve_trade(trade_id, "error", 0.0)
+            return None
+
+    async def sell_position(
+        self, trade_id: int, exit_price: float, reason: str
+    ) -> Optional[float]:
+        """Sell a position early by placing a SELL FOK order on the CLOB.
+
+        v5: Early exit feature. Places a real SELL order to liquidate
+        the position at the current best_bid price.
+
+        Returns:
+            PnL if sold, None if position not found or order rejected.
+        """
+        if trade_id not in self._pending_resolutions:
+            log.warning("[Live] sell_position: trade %d not pending", trade_id)
+            return None
+        if self._client is None or self._loop is None:
+            log.error("[Live] sell_position: client not initialized")
+            return None
+
+        info = self._pending_resolutions[trade_id]
+        token_id = info.get("token_id")
+        if not token_id:
+            log.error("[Live] sell_position: no token_id for trade %d", trade_id)
+            return None
+
+        pos = self.portfolio.open_positions.get(trade_id)
+        if pos is None:
+            log.warning("[Live] sell_position: no open position for trade %d", trade_id)
+            return None
+
+        try:
+            log.info(
+                "[Live] SELL order | trade=%d | shares=%.2f @ %.4f | reason=%s",
+                trade_id, pos.shares, exit_price, reason,
+            )
+
+            def _place_sell():
+                from py_clob_client.clob_types import OrderArgs, OrderType
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=round(exit_price, 4),
+                    size=round(pos.shares, 2),
+                    side=_SELL,
+                )
+                signed = self._client.create_order(order_args)
+                return self._client.post_order(signed, OrderType.FOK)
+
+            resp = await self._loop.run_in_executor(None, _place_sell)
+
+            if resp and resp.get("success"):
+                fill_price = float(resp.get("price", exit_price))
+                outcome, pnl = self.portfolio.close_position_early(
+                    trade_id, fill_price
+                )
+                if outcome == "error":
+                    return None
+
+                await self.db.resolve_trade_early(
+                    trade_id, outcome, pnl, fill_price, reason
+                )
+                del self._pending_resolutions[trade_id]
+
+                log.info(
+                    "[Live] EARLY EXIT FILLED | trade=%d | fill=%.4f | PnL=$%.2f",
+                    trade_id, fill_price, pnl,
+                )
+                return pnl
+            else:
+                err = resp.get("errorMsg", str(resp)) if resp else "no response"
+                log.warning(
+                    "[Live] SELL order REJECTED | trade=%d | %s",
+                    trade_id, err,
+                )
+                return None
+
+        except Exception as exc:
+            log.error("[Live] Sell execution error: %s", exc, exc_info=True)
             return None
 
     async def check_resolutions(

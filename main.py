@@ -32,7 +32,7 @@ from src.utils.db import Database
 from src.feeds.binance import BinanceFeed
 from src.feeds.chainlink import ChainlinkFeed
 from src.feeds.polymarket import PolymarketFeed, MarketInfo
-from src.engine.signal import SignalEngine, MarketState, Signal
+from src.engine.signal import SignalEngine, MarketState, Signal, p_brownian
 from src.engine.trend import market_trend
 from src.trading.portfolio import Portfolio
 from src.trading.paper import PaperTrader
@@ -127,6 +127,7 @@ class Orchestrator:
         self._running = False
         self._snapshot_interval = 60
         self._strategy_by_trade: dict[int, str] = {}
+        self._pending_topups: dict[int, dict] = {}  # v5: staged entry reserves
 
     async def start(self) -> None:
         log.info("=" * 60)
@@ -167,6 +168,7 @@ class Orchestrator:
             asyncio.create_task(self._signal_loop(), name="signal_loop"),
             asyncio.create_task(self._resolution_loop(), name="resolution_loop"),
             asyncio.create_task(self._snapshot_loop(), name="snapshot_loop"),
+            asyncio.create_task(self._monitor_positions(), name="position_monitor"),
             asyncio.create_task(self._dashboard_server(), name="dashboard"),
         ]
         for symbol, cl_feed in self._chainlink_feeds.items():
@@ -393,9 +395,50 @@ class Orchestrator:
             })
 
             if sig.action == "BUY":
+                # v5: staged entry — split bet if very confident
+                original_size = sig.size_usd
+                reserve_usd = 0.0
+                if (
+                    config.signal.staged_entry_enabled
+                    and sig.p_true >= config.signal.staged_min_confidence
+                    and sig.time_remaining_sec > config.signal.staged_topup_min_t_rem
+                ):
+                    sig.size_usd = round(
+                        original_size * config.signal.staged_initial_fraction, 2
+                    )
+                    reserve_usd = round(
+                        original_size * config.signal.staged_topup_fraction, 2
+                    )
+
                 trade_id = await self.trader.execute(sig)
                 if trade_id:
                     self._strategy_by_trade[trade_id] = sig.strategy_used
+
+                    # v5: track staged entry reserve for topup
+                    if reserve_usd > 0:
+                        self._pending_topups[trade_id] = {
+                            "reserve_usd": reserve_usd,
+                            "entry_price": sig.entry_price,
+                            "market_id": cid,
+                            "slug": market.slug,
+                            "symbol": symbol,
+                            "side": sig.side,
+                            "p_true_at_entry": sig.p_true,
+                            "reference_price": sig.reference_price,
+                            "sigma": sig.sigma,
+                            "end_time": time.time() + sig.time_remaining_sec,
+                            "duration": market.duration_seconds,
+                            "token_id_yes": market.token_id_up,
+                            "token_id_no": market.token_id_down,
+                            "topped_up": False,
+                        }
+                        log.info(
+                            "[Staged] Reserved $%.2f topup for trade %d "
+                            "(initial $%.2f, p_true=%.1f%%)",
+                            reserve_usd, trade_id, sig.size_usd,
+                            sig.p_true * 100,
+                        )
+
                     full = await self.db.get_trade(trade_id)
                     if full:
                         await dashboard_state.update_trade(full)
@@ -425,6 +468,8 @@ class Orchestrator:
                         strategy = self._strategy_by_trade.pop(
                             trade_id, r.get("strategy_used", "chainlink_arb")
                         )
+                        # v5: clean up staged entry reserve
+                        self._pending_topups.pop(trade_id, None)
 
                         # Resolve asset symbol from trade slug
                         symbol = "BTC"
@@ -472,6 +517,236 @@ class Orchestrator:
             except Exception as exc:
                 log.error("[Resolution] Loop error: %s", exc)
             await asyncio.sleep(3)
+
+    async def _monitor_positions(self) -> None:
+        """v5: Monitor open positions for early exit and topup opportunities."""
+        while self._running:
+            try:
+                if self.portfolio.open_position_count > 0:
+                    await self._check_early_exits()
+                    await self._check_topups()
+            except Exception as exc:
+                log.error("[Monitor] Loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(4)
+
+    async def _check_early_exits(self) -> None:
+        """Check if any open positions should be sold early.
+
+        Conservative conditions (ALL must be true):
+        1. early_exit_enabled in config
+        2. time_remaining > 30s (don't sell too late)
+        3. In second half of market (elapsed > duration/2)
+        4. p_true_now < 0.35 (probability of winning very low)
+        5. p_true dropped >50% from entry
+        6. best_bid on our side > 0.05 (enough liquidity to sell)
+        7. Position is currently losing
+        """
+        if not config.signal.early_exit_enabled:
+            return
+
+        now = time.time()
+
+        for trade_id, pos in list(self.portfolio.open_positions.items()):
+            t_rem = pos.market_end_time - now
+            if t_rem < config.signal.early_exit_min_t_rem:
+                continue  # too late, let it resolve normally
+
+            elapsed = now - pos.entry_time
+            if elapsed < pos.duration_seconds / 2.0:
+                continue  # still in first half, too early to bail
+
+            # Get current price data for this asset
+            symbol = "BTC"
+            if pos.slug:
+                slug_asset = pos.slug.split("-")[0].upper()
+                for ac in config.assets:
+                    if ac.polymarket_prefix.upper() == slug_asset:
+                        symbol = ac.symbol
+                        break
+
+            prices = self._asset_prices.get(symbol, {})
+            chainlink_now = prices.get("chainlink", 0.0)
+            if chainlink_now <= 0:
+                continue
+
+            # Get reference price from pending resolutions
+            pending_info = None
+            if hasattr(self.trader, '_pending_resolutions'):
+                pending_info = self.trader._pending_resolutions.get(trade_id)
+            if not pending_info:
+                continue
+
+            ref_price = pending_info.get("reference_price", 0.0)
+            if ref_price <= 0:
+                continue
+
+            # Recalculate delta and p_true
+            delta_now = (chainlink_now - ref_price) / ref_price
+            # Adjust delta direction for our side
+            if pos.side == "NO":
+                delta_now = -delta_now
+
+            engine = self._signal_engines.get(symbol)
+            sigma = engine.sigma_fallback if engine else 0.005 / (300 ** 0.5)
+
+            p_true_now = p_brownian(abs(delta_now), t_rem, sigma)
+            # If delta is negative (price moved against us), p_true is for wrong side
+            if delta_now < 0:
+                p_true_now = 1.0 - p_true_now
+
+            # Condition: p_true must be very low
+            if p_true_now >= config.signal.early_exit_p_true_floor:
+                continue
+
+            # Condition: p_true must have dropped >50% from entry
+            if pos.p_true_at_entry > 0 and p_true_now >= pos.p_true_at_entry * (1.0 - config.signal.early_exit_p_true_drop_pct):
+                continue
+
+            # Get best_bid on our side from orderbook
+            ob = self._orderbooks.get(pos.market_id)
+            if not ob:
+                continue
+
+            if pos.side == "YES":
+                best_bid = ob.best_bid_yes if hasattr(ob, 'best_bid_yes') else (ob.best_bid_up if hasattr(ob, 'best_bid_up') else 0.0)
+            else:
+                best_bid = ob.best_bid_no if hasattr(ob, 'best_bid_no') else (ob.best_bid_down if hasattr(ob, 'best_bid_down') else 0.0)
+
+            if best_bid < config.signal.early_exit_min_bid:
+                continue  # not enough liquidity
+
+            # Condition: position must be losing
+            current_value = best_bid * pos.shares
+            if current_value >= pos.size_usd:
+                continue  # position is profitable, don't sell
+
+            # All conditions met — sell
+            log.warning(
+                "[Monitor] EARLY EXIT trade %d | p_true: %.1f%% -> %.1f%% | "
+                "bid=%.4f | loss=$%.2f -> ~$%.2f saved",
+                trade_id, pos.p_true_at_entry * 100, p_true_now * 100,
+                best_bid, pos.size_usd, pos.size_usd - current_value,
+            )
+
+            pnl = await self.trader.sell_position(
+                trade_id, best_bid, "early_exit_p_true_drop"
+            )
+            if pnl is not None:
+                # Clean up topup reserve if any
+                self._pending_topups.pop(trade_id, None)
+                await dashboard_state.update_portfolio(self.portfolio.get_stats())
+
+    async def _check_topups(self) -> None:
+        """Check if any staged entry reserves should be deployed.
+
+        Conditions for topup (ALL must be true):
+        1. staged_entry_enabled in config
+        2. Reserve exists and hasn't been used
+        3. p_true_now >= staged_topup_min_p_true (still favorable)
+        4. Price has dipped: current_ask < entry_price - dip_threshold
+        5. time_remaining > staged_topup_min_t_rem
+        """
+        if not config.signal.staged_entry_enabled:
+            return
+
+        now = time.time()
+
+        for trade_id, topup in list(self._pending_topups.items()):
+            if topup.get("topped_up"):
+                continue
+
+            # Check position still exists
+            if trade_id not in self.portfolio.open_positions:
+                self._pending_topups.pop(trade_id, None)
+                continue
+
+            t_rem = topup["end_time"] - now
+            if t_rem < config.signal.staged_topup_min_t_rem:
+                # Too late for topup, release reserve
+                self._pending_topups.pop(trade_id, None)
+                continue
+
+            symbol = topup["symbol"]
+            prices = self._asset_prices.get(symbol, {})
+            chainlink_now = prices.get("chainlink", 0.0)
+            if chainlink_now <= 0:
+                continue
+
+            ref_price = topup["reference_price"]
+            if ref_price <= 0:
+                continue
+
+            # Recalculate p_true
+            delta_now = (chainlink_now - ref_price) / ref_price
+            if topup["side"] == "NO":
+                delta_now = -delta_now
+
+            engine = self._signal_engines.get(symbol)
+            sigma = engine.sigma_fallback if engine else 0.005 / (300 ** 0.5)
+
+            p_true_now = p_brownian(abs(delta_now), t_rem, sigma)
+            if delta_now < 0:
+                p_true_now = 1.0 - p_true_now
+
+            if p_true_now < config.signal.staged_topup_min_p_true:
+                continue  # not confident enough
+
+            # Check price dip on our side
+            ob = self._orderbooks.get(topup["market_id"])
+            if not ob:
+                continue
+
+            if topup["side"] == "YES":
+                current_ask = ob.best_ask_yes if hasattr(ob, 'best_ask_yes') else (ob.best_ask_up if hasattr(ob, 'best_ask_up') else 1.0)
+            else:
+                current_ask = ob.best_ask_no if hasattr(ob, 'best_ask_no') else (ob.best_ask_down if hasattr(ob, 'best_ask_down') else 1.0)
+
+            price_drop = topup["entry_price"] - current_ask
+            if price_drop < config.signal.staged_dip_threshold:
+                continue  # not enough dip
+
+            # All conditions met — deploy reserve as topup trade
+            reserve = topup["reserve_usd"]
+            log.info(
+                "[Staged] TOPUP trade %d | $%.2f reserve | "
+                "ask=%.4f (dip=%.4f) | p_true=%.1f%%",
+                trade_id, reserve, current_ask, price_drop,
+                p_true_now * 100,
+            )
+
+            # Build a minimal signal for the topup trade
+            topup_sig = Signal(
+                market_id=topup["market_id"],
+                action="BUY",
+                filters_passed=True,
+                side=topup["side"],
+                entry_price=current_ask,
+                size_usd=reserve,
+                slug=topup["slug"],
+                time_remaining_sec=t_rem,
+                delta_chainlink=delta_now,
+                sigma=sigma,
+                p_true=p_true_now,
+                p_market=current_ask,
+                edge=p_true_now - current_ask,
+                reference_price=ref_price,
+                market_start_time=topup["end_time"] - topup["duration"],
+                market_duration=topup["duration"],
+                strategy_used="staged_topup",
+                oracle_age_sec=0.0,
+            )
+            topup_sig.token_id_yes = topup.get("token_id_yes", "")
+            topup_sig.token_id_no = topup.get("token_id_no", "")
+
+            topup_trade_id = await self.trader.execute(topup_sig)
+            if topup_trade_id:
+                self._pending_topups.pop(trade_id, None)
+                self._strategy_by_trade[topup_trade_id] = "staged_topup"
+                log.info(
+                    "[Staged] Topup executed: trade %d (parent %d) | $%.2f @ %.4f",
+                    topup_trade_id, trade_id, reserve, current_ask,
+                )
+                await dashboard_state.update_portfolio(self.portfolio.get_stats())
 
     async def _snapshot_loop(self) -> None:
         while self._running:

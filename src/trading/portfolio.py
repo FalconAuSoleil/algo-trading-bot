@@ -6,15 +6,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from src.engine.signal import calc_fee
 from src.utils.logger import setup_logger
 
 log = setup_logger("trading.portfolio")
 
-# v4.0: Polymarket taker fee deducted from winning payouts.
-# Polymarket charges ~1% on the notional of winning trades.
-# Not deducting this fee caused paper trading to overstate
-# profitability vs live trading by 1-2% per winning trade.
-TAKER_FEE_RATE = 0.01
+# v5: Fee model aligned with signal engine.
+# Uses calc_fee(p, rate=0.02) = 0.02 * (1 - p) instead of flat 1%.
+# At p=0.50: fee=1.0%, at p=0.60: fee=0.8%, at p=0.40: fee=1.2%.
+FEE_RATE = 0.02
 
 
 @dataclass
@@ -32,12 +32,14 @@ class Position:
     delta_at_entry: float = 0.0
     p_true_at_entry: float = 0.0
     edge_at_entry: float = 0.0
+    slug: str = ""
+    duration_seconds: int = 300
 
     @property
     def potential_profit(self) -> float:
         """Max profit if position wins (after fee)."""
         gross = self.shares * (1.0 - self.entry_price)
-        return gross * (1.0 - TAKER_FEE_RATE)
+        return gross * (1.0 - calc_fee(self.entry_price, FEE_RATE))
 
     @property
     def potential_loss(self) -> float:
@@ -150,7 +152,7 @@ class Portfolio:
         if won:
             # Win: receive $1.00 per share, minus Polymarket taker fee
             gross = pos.shares * 1.0
-            fee_amount = gross * TAKER_FEE_RATE
+            fee_amount = gross * calc_fee(pos.entry_price, FEE_RATE)
             payout = gross - fee_amount
             pnl = payout - pos.size_usd
             self.balance += payout
@@ -199,6 +201,62 @@ class Portfolio:
             self.max_drawdown = current_dd
 
         return (outcome, pnl)
+
+    def close_position_early(
+        self, trade_id: int, exit_price: float
+    ) -> tuple[str, float]:
+        """Close a position by selling shares at exit_price before expiry.
+
+        v5: Early exit feature. Sells shares on the CLOB at the current
+        market price instead of waiting for binary resolution.
+
+        PnL = (exit_price * shares) - fee - size_usd
+        """
+        self._check_daily_reset()
+
+        pos = self.open_positions.pop(trade_id, None)
+        if pos is None:
+            return ("error", 0.0)
+
+        self.total_trades += 1
+
+        gross_sale = exit_price * pos.shares
+        fee_amount = gross_sale * calc_fee(exit_price, FEE_RATE)
+        net_sale = gross_sale - fee_amount
+        pnl = net_sale - pos.size_usd
+
+        self.balance += net_sale
+
+        if pnl >= 0:
+            self.wins += 1
+            self.consecutive_losses = 0
+        else:
+            self.losses += 1
+            self.consecutive_losses += 1
+            self._max_consecutive_losses = max(
+                self._max_consecutive_losses,
+                self.consecutive_losses,
+            )
+
+        self.total_pnl += pnl
+        self.daily_pnl += pnl
+
+        if self.balance > self._peak_balance:
+            self._peak_balance = self.balance
+        current_dd = (
+            (self._peak_balance - self.balance) / self._peak_balance
+        )
+        if current_dd > self.max_drawdown:
+            self.max_drawdown = current_dd
+
+        log.info(
+            "[Portfolio] EARLY EXIT %s | sell=%.4f | gross=$%.2f | "
+            "fee=$%.2f | PnL=$%.2f | balance=$%.2f",
+            pos.market_id[:16], exit_price, gross_sale,
+            fee_amount, pnl, self.balance,
+        )
+
+        return ("early_exit", pnl)
 
     def _check_daily_reset(self) -> None:
         """Reset daily PnL at midnight."""
@@ -261,5 +319,5 @@ class Portfolio:
             "open_positions": self.open_position_count,
             "capital_at_risk": round(self.capital_at_risk, 2),
             "peak_balance": round(self._peak_balance, 2),
-            "taker_fee_rate_pct": round(TAKER_FEE_RATE * 100, 1),
+            "fee_rate": FEE_RATE,
         }
