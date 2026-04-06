@@ -175,8 +175,8 @@ class SignalConfig:
     # ── Staged entry / double-down on dips (v5) ─────────────────────────────
     # Split initial bet into 70/30, deploy reserve when confident + price dips.
     staged_entry_enabled: bool = _env("STAGED_ENTRY_ENABLED", "true").lower() in ("true", "1")
-    staged_initial_fraction: float = _envf("STAGED_INITIAL_FRAC", 0.70)     # 70% upfront
-    staged_topup_fraction: float = _envf("STAGED_TOPUP_FRAC", 0.30)         # 30% reserve
+    staged_initial_fraction: float = _envf("STAGED_INITIAL_FRAC", 0.85)     # 85% upfront
+    staged_topup_fraction: float = _envf("STAGED_TOPUP_FRAC", 0.15)         # 15% reserve
     staged_min_confidence: float = _envf("STAGED_MIN_CONFIDENCE", 0.70)      # p_true min for eligible
     staged_dip_threshold: float = _envf("STAGED_DIP_THRESHOLD", 0.08)        # absolute price drop (e.g. 0.50→0.42)
     staged_topup_min_p_true: float = _envf("STAGED_TOPUP_MIN_P", 0.55)      # p_true still favorable
