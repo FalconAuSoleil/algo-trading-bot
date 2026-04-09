@@ -164,13 +164,18 @@ class SignalConfig:
     delta_min_abs_5m_mult: float = _envf("DELTA_MIN_ABS_5M_MULT", 1.5)
 
     # ── Early exit (v5) ──────────────────────────────────────────────────────
-    # Sell positions when p_true drops significantly mid-market.
-    # Conservative: all 6 conditions must be met before selling.
+    # Two modes: (A) p_true collapse, (B) delta erosion.
+    # Mode A: p_true drops drastically (original conservative logic).
+    # Mode B: delta eroding toward zero late in market = likely reversal.
     early_exit_enabled: bool = _env("EARLY_EXIT_ENABLED", "true").lower() in ("true", "1")
     early_exit_min_t_rem: float = _envf("EARLY_EXIT_MIN_T_REM", 30.0)       # don't sell in last 30s
-    early_exit_p_true_floor: float = _envf("EARLY_EXIT_P_FLOOR", 0.35)      # p_true must drop below this
-    early_exit_p_true_drop_pct: float = _envf("EARLY_EXIT_P_DROP", 0.50)    # >50% drop from entry
+    early_exit_p_true_floor: float = _envf("EARLY_EXIT_P_FLOOR", 0.35)      # mode A: p_true below this
+    early_exit_p_true_drop_pct: float = _envf("EARLY_EXIT_P_DROP", 0.50)    # mode A: >50% drop from entry
     early_exit_min_bid: float = _envf("EARLY_EXIT_MIN_BID", 0.05)           # min liquidity to sell
+    # Mode B: delta erosion — delta shrunk >60% from entry AND < 0.15%
+    early_exit_delta_erosion_pct: float = _envf("EARLY_EXIT_DELTA_EROSION", 0.60)  # delta lost 60%+
+    early_exit_delta_abs_floor: float = _envf("EARLY_EXIT_DELTA_FLOOR", 0.0015)    # delta now < 0.15%
+    early_exit_erosion_min_elapsed_pct: float = _envf("EARLY_EXIT_EROSION_ELAPSED", 0.70)  # >70% of market elapsed
 
     # ── Staged entry / double-down on dips (v5) ─────────────────────────────
     # Split initial bet into 70/30, deploy reserve when confident + price dips.

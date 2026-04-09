@@ -532,14 +532,13 @@ class Orchestrator:
     async def _check_early_exits(self) -> None:
         """Check if any open positions should be sold early.
 
-        Conservative conditions (ALL must be true):
-        1. early_exit_enabled in config
-        2. time_remaining > 30s (don't sell too late)
-        3. In second half of market (elapsed > duration/2)
-        4. p_true_now < 0.35 (probability of winning very low)
-        5. p_true dropped >50% from entry
-        6. best_bid on our side > 0.05 (enough liquidity to sell)
-        7. Position is currently losing
+        Two exit modes:
+        Mode A — p_true collapse: p_true drops below 35% AND >50% from entry.
+        Mode B — delta erosion: delta shrunk >60% from entry AND is tiny (<0.15%)
+                 while >70% of market elapsed. Catches trades where the move
+                 is fading and a last-second reversal is likely.
+
+        Shared conditions: t_rem > 30s, best_bid > 0.05, position is losing.
         """
         if not config.signal.early_exit_enabled:
             return
@@ -552,8 +551,6 @@ class Orchestrator:
                 continue  # too late, let it resolve normally
 
             elapsed = now - pos.entry_time
-            if elapsed < pos.duration_seconds / 2.0:
-                continue  # still in first half, too early to bail
 
             # Get current price data for this asset
             symbol = "BTC"
@@ -580,29 +577,46 @@ class Orchestrator:
             if ref_price <= 0:
                 continue
 
-            # Recalculate delta and p_true
-            delta_now = (chainlink_now - ref_price) / ref_price
-            # Adjust delta direction for our side
-            if pos.side == "NO":
-                delta_now = -delta_now
+            # Recalculate delta (direction-adjusted for our side)
+            delta_raw = (chainlink_now - ref_price) / ref_price
+            delta_now = -delta_raw if pos.side == "NO" else delta_raw
 
             engine = self._signal_engines.get(symbol)
             sigma = engine.sigma_fallback if engine else 0.005 / (300 ** 0.5)
 
             p_true_now = p_brownian(abs(delta_now), t_rem, sigma)
-            # If delta is negative (price moved against us), p_true is for wrong side
             if delta_now < 0:
                 p_true_now = 1.0 - p_true_now
 
-            # Condition: p_true must be very low
-            if p_true_now >= config.signal.early_exit_p_true_floor:
+            # ── Check exit modes ────────────────────────────────────────
+            sell_reason = None
+
+            # Mode A: p_true collapse (original conservative logic)
+            if (
+                elapsed > pos.duration_seconds / 2.0
+                and p_true_now < config.signal.early_exit_p_true_floor
+                and (pos.p_true_at_entry <= 0 or p_true_now < pos.p_true_at_entry * (1.0 - config.signal.early_exit_p_true_drop_pct))
+            ):
+                sell_reason = "p_true_collapse"
+
+            # Mode B: delta erosion — move is fading, reversal likely
+            if sell_reason is None and pos.delta_at_entry != 0:
+                delta_entry_abs = abs(pos.delta_at_entry)
+                delta_now_abs = abs(delta_now)
+                erosion = 1.0 - (delta_now_abs / delta_entry_abs) if delta_entry_abs > 0 else 0.0
+                elapsed_pct = elapsed / pos.duration_seconds if pos.duration_seconds > 0 else 0.0
+
+                if (
+                    elapsed_pct >= config.signal.early_exit_erosion_min_elapsed_pct
+                    and erosion >= config.signal.early_exit_delta_erosion_pct
+                    and delta_now_abs < config.signal.early_exit_delta_abs_floor
+                ):
+                    sell_reason = "delta_erosion"
+
+            if sell_reason is None:
                 continue
 
-            # Condition: p_true must have dropped >50% from entry
-            if pos.p_true_at_entry > 0 and p_true_now >= pos.p_true_at_entry * (1.0 - config.signal.early_exit_p_true_drop_pct):
-                continue
-
-            # Get best_bid on our side from orderbook
+            # ── Shared conditions: liquidity + position losing ──────────
             ob = self._orderbooks.get(pos.market_id)
             if not ob:
                 continue
@@ -613,26 +627,29 @@ class Orchestrator:
                 best_bid = ob.best_bid_no if hasattr(ob, 'best_bid_no') else (ob.best_bid_down if hasattr(ob, 'best_bid_down') else 0.0)
 
             if best_bid < config.signal.early_exit_min_bid:
-                continue  # not enough liquidity
+                continue
 
-            # Condition: position must be losing
             current_value = best_bid * pos.shares
             if current_value >= pos.size_usd:
                 continue  # position is profitable, don't sell
 
-            # All conditions met — sell
+            # ── Sell ────────────────────────────────────────────────────
+            delta_entry_abs = abs(pos.delta_at_entry) * 100
+            delta_now_abs = abs(delta_now) * 100
             log.warning(
-                "[Monitor] EARLY EXIT trade %d | p_true: %.1f%% -> %.1f%% | "
-                "bid=%.4f | loss=$%.2f -> ~$%.2f saved",
-                trade_id, pos.p_true_at_entry * 100, p_true_now * 100,
-                best_bid, pos.size_usd, pos.size_usd - current_value,
+                "[Monitor] EARLY EXIT (%s) trade %d | "
+                "delta: %.3f%% -> %.3f%% | p_true: %.1f%% -> %.1f%% | "
+                "bid=%.4f | saving ~$%.2f",
+                sell_reason, trade_id,
+                delta_entry_abs, delta_now_abs,
+                pos.p_true_at_entry * 100, p_true_now * 100,
+                best_bid, pos.size_usd - current_value,
             )
 
             pnl = await self.trader.sell_position(
-                trade_id, best_bid, "early_exit_p_true_drop"
+                trade_id, best_bid, sell_reason
             )
             if pnl is not None:
-                # Clean up topup reserve if any
                 self._pending_topups.pop(trade_id, None)
                 await dashboard_state.update_portfolio(self.portfolio.get_stats())
 
