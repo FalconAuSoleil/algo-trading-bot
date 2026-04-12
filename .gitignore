@@ -15,7 +15,7 @@ env/
 .env
 
 # Data files
-data/
+#data/
 
 # IDE
 .vscode/
