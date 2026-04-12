@@ -285,6 +285,47 @@
     }
 
     .pulsing { animation: pulse 1.5s infinite; }
+
+    .tab-bar {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 12px;
+    }
+
+    .tab-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-dim);
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 14px;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .tab-btn:hover { background: var(--border); }
+
+    .tab-btn.active {
+      background: var(--blue-bg);
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    .tab-btn .tab-count {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.06);
+    }
+
+    .tab-btn.active .tab-count {
+      background: rgba(59,130,246,0.2);
+    }
   </style>
 </head>
 <body>
@@ -469,7 +510,10 @@
   <!-- Trades Table -->
   <div class="trades-section">
     <div class="card">
-      <div class="card-title" style="margin-bottom:12px">Recent Trades</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div class="card-title" style="margin:0">Recent Trades</div>
+      </div>
+      <div class="tab-bar" id="asset-tabs"></div>
       <div style="overflow-x:auto">
         <table class="trades-table">
           <thead>
@@ -523,6 +567,8 @@ const ASSET_COLORS = {
   SOL: '#8b5cf6',
   XRP: '#10b981',
 };
+
+let activeAssetTab = 'ALL';
 
 function assetFromSlug(slug) {
   if (!slug) return 'BTC';
@@ -764,14 +810,49 @@ function renderFeeds() {
     'status-dot ' + (f.polymarket ? 'on' : 'off');
 }
 
+function renderAssetTabs(trades) {
+  const tabContainer = document.getElementById('asset-tabs');
+  const counts = { ALL: trades.length };
+  trades.forEach(t => {
+    const a = assetFromSlug(t.slug);
+    counts[a] = (counts[a] || 0) + 1;
+  });
+
+  const tabs = ['ALL', ...Object.keys(ASSET_COLORS).filter(a => counts[a])];
+  tabContainer.innerHTML = tabs.map(tab => {
+    const isActive = tab === activeAssetTab;
+    const color = tab !== 'ALL' ? ASSET_COLORS[tab] : null;
+    const style = isActive && color
+      ? `background:${color}15;border-color:${color};color:${color}`
+      : !isActive && color ? `color:${color}` : '';
+    return `<button class="tab-btn${isActive ? ' active' : ''}"
+      data-tab="${tab}" ${style ? `style="${style}"` : ''}>
+      ${tab}<span class="tab-count" ${isActive && color ? `style="background:${color}20"` : ''}>${counts[tab] || 0}</span>
+    </button>`;
+  }).join('');
+
+  tabContainer.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.onclick = () => {
+      activeAssetTab = btn.dataset.tab;
+      renderTrades();
+    };
+  });
+}
+
 function renderTrades() {
   const tbody = document.getElementById('trades-body');
-  const trades = state.recent_trades || [];
+  const allTrades = state.recent_trades || [];
+
+  renderAssetTabs(allTrades);
+
+  const trades = activeAssetTab === 'ALL'
+    ? allTrades
+    : allTrades.filter(t => assetFromSlug(t.slug) === activeAssetTab);
 
   if (trades.length === 0) {
     tbody.innerHTML = `<tr><td colspan="13"
       style="text-align:center;color:var(--text-dim);padding:24px">
-      No trades yet. Waiting for signals...</td></tr>`;
+      ${allTrades.length === 0 ? 'No trades yet. Waiting for signals...' : 'No ' + activeAssetTab + ' trades.'}</td></tr>`;
     return;
   }
 
