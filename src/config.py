@@ -66,8 +66,13 @@ class SignalConfig:
     time_max_5m: float = _envf("TIME_MAX_5M", 120.0)
     time_max_5m_accum: float = _envf("TIME_MAX_5M_ACCUM", 150.0)
     time_min_15m: float = _envf("TIME_MIN_15M", 60.0)
-    # v3.8: reduced from 780s → 550s.
-    time_max_15m: float = _envf("TIME_MAX_15M", 550.0)
+    # v3.8: reduced from 780s → 550s. v5.1: raised to 750s (enter earlier).
+    time_max_15m: float = _envf("TIME_MAX_15M", 750.0)
+    # Pre-accumulation window for 15m markets: fills stability buffer before
+    # the betting window opens (like time_max_5m_accum for 5m markets).
+    # Bot accumulates ticks at T=[time_max_15m, time_max_15m_accum] but waits
+    # for stability before placing a bet.
+    time_max_15m_accum: float = _envf("TIME_MAX_15M_ACCUM", 850.0)
 
     # ── Chainlink arb ─────────────────────────────────────────────────────────────────────────────────
     chainlink_period: float = _envf("CHAINLINK_PERIOD", 27.0)

@@ -596,7 +596,7 @@ class _ChainlinkArbEngine:
         is5 = "5m" in slug or sig.time_remaining_sec < 330
         min_t = cfg.time_min_5m if is5 else cfg.time_min_15m
         max_t = cfg.time_max_5m if is5 else cfg.time_max_15m
-        max_a = cfg.time_max_5m_accum if is5 else cfg.time_max_15m
+        max_a = cfg.time_max_5m_accum if is5 else cfg.time_max_15m_accum
 
         if sig.time_remaining_sec < min_t:
             sig.filter_reasons.append(f"late:{sig.time_remaining_sec:.0f}s")
