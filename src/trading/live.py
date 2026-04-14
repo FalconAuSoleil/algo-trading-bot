@@ -154,9 +154,60 @@ class LiveTrader:
                 "[Live] ClobClient ready | wallet=%s",
                 self.cfg.wallet_address[:10] + "...",
             )
+
+            # Fetch real USDC balance from Polymarket and sync portfolio
+            await self._sync_balance_from_wallet()
+
         except Exception as exc:
             log.error("[Live] ClobClient init failed: %s", exc)
             self._client = None
+
+    async def _sync_balance_from_wallet(self) -> None:
+        """Fetch real USDC balance from Polymarket wallet and update portfolio.
+
+        This ensures the bot uses the actual wallet balance instead of
+        the hardcoded LIVE_INITIAL_BALANCE from .env.
+        """
+        if self._client is None or self._loop is None:
+            return
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            def _fetch():
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                return self._client.get_balance_allowance(params)
+
+            resp = await self._loop.run_in_executor(None, _fetch)
+
+            # Response is a dict with 'balance' as a string (in wei, 6 decimals for USDC)
+            raw = resp.get("balance", "0") if isinstance(resp, dict) else "0"
+            usdc_balance = float(raw) / 1e6  # USDC has 6 decimals
+
+            if usdc_balance > 0:
+                # Update portfolio initial_balance and current balance to match wallet
+                old_balance = self.portfolio.balance
+                self.portfolio.initial_balance = usdc_balance
+                self.portfolio.balance = usdc_balance
+                self.portfolio._peak_balance = max(
+                    self.portfolio._peak_balance, usdc_balance
+                )
+                log.info(
+                    "[Live] Wallet balance synced: $%.4f USDC "
+                    "(was $%.2f in config)",
+                    usdc_balance, old_balance,
+                )
+            else:
+                log.warning(
+                    "[Live] Wallet balance is $0 — check Polymarket deposit. "
+                    "Using config value $%.2f",
+                    self.portfolio.balance,
+                )
+        except Exception as exc:
+            log.warning(
+                "[Live] Could not fetch wallet balance: %s. "
+                "Using config value $%.2f",
+                exc, self.portfolio.balance,
+            )
 
     async def stop(self) -> None:
         self._client = None
