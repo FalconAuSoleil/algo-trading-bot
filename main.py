@@ -858,9 +858,36 @@ def main():
         )
 
     if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        # Use ProactorEventLoop (Windows default) instead of SelectorEventLoop.
+        # SelectorEventLoop has a known bug where its internal self-pipe socket
+        # triggers ConnectionResetError [WinError 10054] sporadically.
+        # ProactorEventLoop uses IOCP (I/O Completion Ports) and doesn't
+        # have this issue. It also supports subprocesses on Windows.
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-    asyncio.run(Orchestrator().start())
+    # Custom exception handler to catch any remaining spurious Windows socket errors
+    # instead of crashing the entire event loop.
+    def _win_exception_handler(loop, context):
+        exc = context.get("exception")
+        if (
+            isinstance(exc, (ConnectionResetError, OSError))
+            and sys.platform == "win32"
+        ):
+            # Known Windows asyncio spurious error — safe to ignore
+            log.debug(
+                "[asyncio] Suppressed Windows socket error: %s", exc
+            )
+            return
+        # For all other exceptions, use the default handler
+        loop.default_exception_handler(context)
+
+    loop = asyncio.new_event_loop()
+    loop.set_exception_handler(_win_exception_handler)
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(Orchestrator().start())
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
