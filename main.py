@@ -111,8 +111,12 @@ class Orchestrator:
         )
 
         # Portfolio + Trader
+        initial_bal = (
+            config.live_initial_balance if config.is_live
+            else config.paper_initial_balance
+        )
         self.portfolio = Portfolio(
-            initial_balance=config.paper_initial_balance,
+            initial_balance=initial_bal,
             mode=config.trading_mode,
         )
         if config.is_paper:
@@ -140,7 +144,7 @@ class Orchestrator:
                 "5m+15m" if len(a.supported_intervals) > 1 else "15m only",
                 a.chainlink_address[:10],
             )
-        log.info("  Mode: %s | Capital: $%.2f", config.trading_mode.upper(), config.paper_initial_balance)
+        log.info("  Mode: %s | Capital: $%.2f", config.trading_mode.upper(), self.portfolio.initial_balance)
         log.info("  BTC 15m: BTCStabilization 24/7 (T=60-180s, 63-80¢)")
         log.info("  BTC 5m + ETH/SOL/XRP: ChainlinkArb peak hours only (Mon-Fri 08-18h ET)")
         log.info("=" * 60)
@@ -395,6 +399,29 @@ class Orchestrator:
             })
 
             if sig.action == "BUY":
+                # Live mode: enforce min/max bet and balance reserve
+                if config.is_live:
+                    available = self.portfolio.balance - config.signal.live_balance_reserve
+                    if sig.size_usd < config.signal.live_min_bet_usd:
+                        # Clamp up to minimum if we have enough balance
+                        if available >= config.signal.live_min_bet_usd:
+                            sig.size_usd = config.signal.live_min_bet_usd
+                        else:
+                            log.warning(
+                                "[Live] Skipping: size $%.2f < min $%.2f and "
+                                "insufficient balance ($%.2f available)",
+                                sig.size_usd, config.signal.live_min_bet_usd,
+                                available,
+                            )
+                            continue
+                    sig.size_usd = min(sig.size_usd, config.signal.live_max_bet_usd)
+                    if sig.size_usd > available:
+                        log.warning(
+                            "[Live] Skipping: size $%.2f > available $%.2f",
+                            sig.size_usd, available,
+                        )
+                        continue
+
                 # v5: staged entry — split bet if very confident
                 original_size = sig.size_usd
                 reserve_usd = 0.0
@@ -550,7 +577,12 @@ class Orchestrator:
             if t_rem < config.signal.early_exit_min_t_rem:
                 continue  # too late, let it resolve normally
 
-            elapsed = now - pos.entry_time
+            # FIX: use market-relative elapsed time, not position hold time.
+            # Positions enter with ~290s remaining on a 900s market, so
+            # hold time maxes at ~260s — Mode A (>50%) and Mode B (>70%)
+            # were IMPOSSIBLE to trigger with the old calculation.
+            market_start = pos.market_end_time - pos.duration_seconds
+            elapsed = now - market_start
 
             # Get current price data for this asset
             symbol = "BTC"
@@ -590,10 +622,11 @@ class Orchestrator:
 
             # ── Check exit modes ────────────────────────────────────────
             sell_reason = None
+            elapsed_pct = elapsed / pos.duration_seconds if pos.duration_seconds > 0 else 0.0
 
-            # Mode A: p_true collapse (original conservative logic)
+            # Mode A: p_true collapse
             if (
-                elapsed > pos.duration_seconds / 2.0
+                elapsed_pct > 0.50
                 and p_true_now < config.signal.early_exit_p_true_floor
                 and (pos.p_true_at_entry <= 0 or p_true_now < pos.p_true_at_entry * (1.0 - config.signal.early_exit_p_true_drop_pct))
             ):
@@ -604,7 +637,6 @@ class Orchestrator:
                 delta_entry_abs = abs(pos.delta_at_entry)
                 delta_now_abs = abs(delta_now)
                 erosion = 1.0 - (delta_now_abs / delta_entry_abs) if delta_entry_abs > 0 else 0.0
-                elapsed_pct = elapsed / pos.duration_seconds if pos.duration_seconds > 0 else 0.0
 
                 if (
                     elapsed_pct >= config.signal.early_exit_erosion_min_elapsed_pct
@@ -612,6 +644,21 @@ class Orchestrator:
                     and delta_now_abs < config.signal.early_exit_delta_abs_floor
                 ):
                     sell_reason = "delta_erosion"
+
+            # Mode C: bid-based stop-loss — market moved hard against us
+            # If the bid has dropped to 55% of entry price, cut losses.
+            # Limits loss to ~55% of stake instead of 100%.
+            if sell_reason is None and config.signal.early_exit_bid_stop_enabled:
+                hold_time = now - pos.entry_time
+                if hold_time >= config.signal.early_exit_bid_stop_min_hold:
+                    ob = self._orderbooks.get(pos.market_id)
+                    if ob:
+                        if pos.side == "YES":
+                            bid_now = ob.best_bid_yes if hasattr(ob, 'best_bid_yes') else (ob.best_bid_up if hasattr(ob, 'best_bid_up') else 0.0)
+                        else:
+                            bid_now = ob.best_bid_no if hasattr(ob, 'best_bid_no') else (ob.best_bid_down if hasattr(ob, 'best_bid_down') else 0.0)
+                        if bid_now > 0 and bid_now < pos.entry_price * config.signal.early_exit_bid_stop_ratio:
+                            sell_reason = "bid_stop_loss"
 
             if sell_reason is None:
                 continue

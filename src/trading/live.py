@@ -65,6 +65,11 @@ class LiveTrader:
 
     Uses FOK (Fill-or-Kill) orders for immediate execution.
     Requires valid Polygon wallet private key and USDC balance.
+
+    Error handling policy:
+      - On ANY error (rejected, exception, insufficient funds), enter cooldown.
+      - During cooldown, ALL new trades are skipped (no forced retries).
+      - Cooldown duration: LIVE_ERROR_COOLDOWN (default 300s / 5 minutes).
     """
 
     def __init__(
@@ -79,10 +84,15 @@ class LiveTrader:
         self._client: Optional[object] = None
         self._pending_resolutions: dict[int, dict] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._last_error_time: float = 0.0  # timestamp of last trade error
+        self._error_cooldown_sec: float = 300.0  # overridden from config at start()
 
     async def start(self) -> None:
         """Initialise the CLOB client and derive/set API credentials."""
         self._loop = asyncio.get_event_loop()
+        # Load cooldown from config (imported lazily to avoid circular import)
+        from src.config import config
+        self._error_cooldown_sec = config.signal.live_error_cooldown_sec
 
         if not _HAS_CLOB:
             log.error(
@@ -183,10 +193,15 @@ class LiveTrader:
 
         Returns:
             trade_id if order was filled, None if skipped or rejected.
+
+        Error policy: if a recent error occurred within cooldown window,
+        skip ALL new trades. This prevents cascading failures and forced
+        retries that could drain the wallet.
         """
         if signal.action != "BUY" or not signal.filters_passed:
             return None
-        if signal.size_usd < 1.0:
+        if signal.size_usd < 2.0:
+            log.info("[Live] Skipping: size $%.2f below Polymarket $2 minimum", signal.size_usd)
             return None
         if signal.time_remaining_sec < 45.0:
             log.warning(
@@ -196,6 +211,32 @@ class LiveTrader:
             return None
         if self._client is None:
             log.error("[Live] Client not initialized — check credentials")
+            return None
+
+        # ── Error cooldown: do NOT retry after a recent failure ──────
+        now = time.time()
+        if self._last_error_time > 0:
+            elapsed_since_error = now - self._last_error_time
+            if elapsed_since_error < self._error_cooldown_sec:
+                remaining = self._error_cooldown_sec - elapsed_since_error
+                log.warning(
+                    "[Live] COOLDOWN active — skipping trade. "
+                    "Last error %.0fs ago, %.0fs remaining. "
+                    "Will NOT force retry.",
+                    elapsed_since_error, remaining,
+                )
+                return None
+
+        # ── Balance guard: ensure we have enough after reserve ───────
+        from src.config import config
+        available = self.portfolio.balance - config.signal.live_balance_reserve
+        if signal.size_usd > available:
+            log.warning(
+                "[Live] Insufficient balance: need $%.2f, "
+                "available $%.2f (reserve $%.2f). Skipping.",
+                signal.size_usd, available,
+                config.signal.live_balance_reserve,
+            )
             return None
 
         # Determine the correct outcome token ID
@@ -304,14 +345,21 @@ class LiveTrader:
             else:
                 err = resp.get("errorMsg", str(resp)) if resp else "no response"
                 log.warning(
-                    "[Live] Order REJECTED | trade_id=%d | %s",
-                    trade_id, err,
+                    "[Live] Order REJECTED | trade_id=%d | %s | "
+                    "Entering %.0fs cooldown — will NOT retry.",
+                    trade_id, err, self._error_cooldown_sec,
                 )
+                self._last_error_time = time.time()
                 await self.db.resolve_trade(trade_id, "rejected", 0.0)
                 return None
 
         except Exception as exc:
-            log.error("[Live] Order execution error: %s", exc, exc_info=True)
+            log.error(
+                "[Live] Order execution error: %s | "
+                "Entering %.0fs cooldown — will NOT retry.",
+                exc, self._error_cooldown_sec, exc_info=True,
+            )
+            self._last_error_time = time.time()
             await self.db.resolve_trade(trade_id, "error", 0.0)
             return None
 
@@ -384,13 +432,20 @@ class LiveTrader:
             else:
                 err = resp.get("errorMsg", str(resp)) if resp else "no response"
                 log.warning(
-                    "[Live] SELL order REJECTED | trade=%d | %s",
-                    trade_id, err,
+                    "[Live] SELL order REJECTED | trade=%d | %s | "
+                    "Entering %.0fs cooldown.",
+                    trade_id, err, self._error_cooldown_sec,
                 )
+                self._last_error_time = time.time()
                 return None
 
         except Exception as exc:
-            log.error("[Live] Sell execution error: %s", exc, exc_info=True)
+            log.error(
+                "[Live] Sell execution error: %s | "
+                "Entering %.0fs cooldown.",
+                exc, self._error_cooldown_sec, exc_info=True,
+            )
+            self._last_error_time = time.time()
             return None
 
     async def check_resolutions(

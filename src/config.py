@@ -177,6 +177,19 @@ class SignalConfig:
     early_exit_delta_abs_floor: float = _envf("EARLY_EXIT_DELTA_FLOOR", 0.0015)    # delta now < 0.15%
     early_exit_erosion_min_elapsed_pct: float = _envf("EARLY_EXIT_EROSION_ELAPSED", 0.70)  # >70% of market elapsed
 
+    # Mode C: bid-based stop-loss — market moved hard against us
+    # If bid drops below 55% of entry price, cut losses immediately.
+    # Limits loss to ~55% of stake instead of 100%.
+    early_exit_bid_stop_enabled: bool = _env("EARLY_EXIT_BID_STOP", "true").lower() in ("true", "1")
+    early_exit_bid_stop_ratio: float = _envf("EARLY_EXIT_BID_STOP_RATIO", 0.55)   # sell if bid < 55% of entry
+    early_exit_bid_stop_min_hold: float = _envf("EARLY_EXIT_BID_STOP_HOLD", 45.0)  # min 45s hold before stop
+
+    # ── Live mode sizing (small capital) ──────────────────────────────────
+    live_min_bet_usd: float = _envf("LIVE_MIN_BET_USD", 2.0)        # Polymarket minimum
+    live_max_bet_usd: float = _envf("LIVE_MAX_BET_USD", 4.0)        # Max single bet
+    live_balance_reserve: float = _envf("LIVE_BALANCE_RESERVE", 1.0) # Keep $1 reserve
+    live_error_cooldown_sec: float = _envf("LIVE_ERROR_COOLDOWN", 300.0)  # 5min cooldown after error
+
     # ── Staged entry / double-down on dips (v5) ─────────────────────────────
     # Split initial bet into 70/30, deploy reserve when confident + price dips.
     staged_entry_enabled: bool = _env("STAGED_ENTRY_ENABLED", "true").lower() in ("true", "1")
@@ -231,6 +244,7 @@ class DashboardConfig:
 class AppConfig:
     trading_mode: str = _env("TRADING_MODE", "paper")
     paper_initial_balance: float = _envf("PAPER_INITIAL_BALANCE", 10000)
+    live_initial_balance: float = _envf("LIVE_INITIAL_BALANCE", 9.0)
     db_path: Path = BASE_DIR / _env("DB_PATH", "data/trades.db")
     log_level: str = _env("LOG_LEVEL", "INFO")
 
