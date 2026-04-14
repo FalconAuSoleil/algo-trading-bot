@@ -119,7 +119,7 @@ class LiveTrader:
                     host=self.cfg.clob_url,
                     chain_id=POLYGON,
                     key=self.cfg.private_key,
-                    signature_type=2,       # POLY_GNOSIS_SAFE
+                    signature_type=1,       # POLY_PROXY (Magic.link / Polymarket native)
                     funder=self.cfg.wallet_address,
                 )
                 # Use pre-configured API key if available, else derive it
