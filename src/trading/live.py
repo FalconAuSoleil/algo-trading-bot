@@ -131,7 +131,17 @@ class LiveTrader:
                         api_passphrase=self.cfg.api_passphrase,
                     )
                 else:
-                    creds = client.derive_api_creds()
+                    # py-clob-client API changed: method name varies by version
+                    if hasattr(client, 'create_or_derive_api_creds'):
+                        creds = client.create_or_derive_api_creds()
+                    elif hasattr(client, 'derive_api_creds'):
+                        creds = client.derive_api_creds()
+                    else:
+                        raise RuntimeError(
+                            "py-clob-client has no derive_api_creds or "
+                            "create_or_derive_api_creds method. "
+                            "Set POLYMARKET_API_KEY/SECRET/PASSPHRASE manually in .env"
+                        )
                     log.info(
                         "[Live] Derived API creds from private key "
                         "(no explicit creds in .env)"
