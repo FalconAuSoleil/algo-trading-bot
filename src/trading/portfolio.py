@@ -166,7 +166,7 @@ class Portfolio:
                 gross,
                 fee_amount,
                 pnl,
-                (pnl / pos.size_usd) * 100,
+                (pnl / pos.size_usd * 100) if pos.size_usd > 0 else 0.0,
                 self.balance,
             )
         else:

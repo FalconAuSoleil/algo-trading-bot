@@ -593,7 +593,13 @@ class _ChainlinkArbEngine:
 
         sig.time_remaining_sec = state.end_time - now
         slug = state.slug or state.market_id[:20]
-        is5 = "5m" in slug or sig.time_remaining_sec < 330
+        # v4.3: "5m" in "btc-updown-15m-..." matched the 15m slugs as 5m
+        # (substring of "15m"), squashing the 15m window to 75-150s.
+        # Use duration_seconds (authoritative) with slug fallback.
+        if state.duration_seconds > 0:
+            is5 = state.duration_seconds < 900
+        else:
+            is5 = "-5m-" in slug and "-15m-" not in slug
         min_t = cfg.time_min_5m if is5 else cfg.time_min_15m
         max_t = cfg.time_max_5m if is5 else cfg.time_max_15m
         max_a = cfg.time_max_5m_accum if is5 else cfg.time_max_15m
@@ -789,11 +795,17 @@ class _ChainlinkArbEngine:
 
         if not sok or accum:
             sig.filters_passed = False
-            sig.status = (
-                f"STAB ({nt}/{cfg.stability_min_samples})"
-                if nt < cfg.stability_min_samples
-                else f"UNSTABLE ({dr * 100:.0f}%)"
-            )
+            if accum and sok:
+                sig.filter_reasons.append(f"accum:{sig.time_remaining_sec:.0f}s")
+                sig.status = f"ACCUM (T-{sig.time_remaining_sec:.0f}s)"
+            elif nt < cfg.stability_min_samples:
+                sig.filter_reasons.append(f"stab_warmup:{nt}/{cfg.stability_min_samples}")
+                sig.status = f"STAB ({nt}/{cfg.stability_min_samples})"
+            else:
+                sig.filter_reasons.append(
+                    f"unstable:dr={dr * 100:.0f}%,cv={ecv * 100:.0f}%"
+                )
+                sig.status = f"UNSTABLE ({dr * 100:.0f}%)"
             sig.micro = micro
             return sig
 

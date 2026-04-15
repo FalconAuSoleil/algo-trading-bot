@@ -14,8 +14,29 @@ try:
 except ImportError:
     _HAS_RICH = False
 
-_LOG_FORMAT = "%(message)s"
+_LOG_FORMAT  = "%(message)s"
 _FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+_ERR_FORMAT  = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+
+# Single shared error-file handler, attached once to the root logger
+_error_handler: logging.FileHandler | None = None
+
+
+def _get_error_handler() -> logging.FileHandler | None:
+    """Return (creating if needed) the singleton errors.txt handler."""
+    global _error_handler
+    if _error_handler is not None:
+        return _error_handler
+    try:
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        h = logging.FileHandler(log_dir / "errors.txt", encoding="utf-8")
+        h.setLevel(logging.WARNING)          # WARNING + ERROR + CRITICAL
+        h.setFormatter(logging.Formatter(_ERR_FORMAT))
+        _error_handler = h
+        return h
+    except (OSError, PermissionError):
+        return None
 
 
 def setup_logger(
@@ -40,7 +61,6 @@ def setup_logger(
         rich_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         logger.addHandler(rich_handler)
     else:
-        # Force UTF-8 on Windows to avoid cp1252 UnicodeEncodeError
         if sys.platform == "win32":
             stream = io.TextIOWrapper(
                 sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
@@ -56,17 +76,20 @@ def setup_logger(
         )
         logger.addHandler(handler)
 
-    # File handler with UTF-8 encoding
+    # Full log — all levels
     try:
-        log_dir = Path("data")
+        log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
-        file_handler = logging.FileHandler(
-            log_dir / "sniper.log", encoding="utf-8"
-        )
-        file_handler.setFormatter(logging.Formatter(_FILE_FORMAT))
-        logger.addHandler(file_handler)
+        full_handler = logging.FileHandler(log_dir / "sniper.log", encoding="utf-8")
+        full_handler.setFormatter(logging.Formatter(_FILE_FORMAT))
+        logger.addHandler(full_handler)
     except (OSError, PermissionError):
         pass
+
+    # Error log — WARNING and above only
+    err_handler = _get_error_handler()
+    if err_handler:
+        logger.addHandler(err_handler)
 
     logger.propagate = False
     return logger

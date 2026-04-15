@@ -36,6 +36,9 @@ class DashboardState:
             "chainlink": False,
             "polymarket": False,
         }
+        # Live mode only — real USDC.e balance fetched from CLOB
+        self.wallet_usdc: float = 0.0
+        self.wallet_last_updated: float = 0.0
         self._ws_clients: list[WebSocket] = []
         self._db = None
 
@@ -102,6 +105,15 @@ class DashboardState:
             "data": feeds,
         })
 
+    async def update_wallet_balance(self, usdc: float) -> None:
+        """Update real USDC.e wallet balance (live mode only)."""
+        self.wallet_usdc = usdc
+        self.wallet_last_updated = time.time()
+        await self.broadcast({
+            "type": "wallet_balance",
+            "data": {"usdc": usdc, "ts": self.wallet_last_updated},
+        })
+
     async def refresh_from_db(self) -> None:
         """Load historical data from database."""
         if not self._db:
@@ -122,6 +134,8 @@ class DashboardState:
             "daily_pnl": self.daily_pnl[-30:],
             "market": self.market_state,
             "feeds": self.feeds_status,
+            "wallet_usdc": self.wallet_usdc,
+            "wallet_last_updated": self.wallet_last_updated,
             "server_time": time.time(),
         }
 

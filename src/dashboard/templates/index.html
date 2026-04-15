@@ -256,6 +256,24 @@
     .badge-no { background: var(--red-bg); color: var(--red); }
     .badge-topup { background: var(--purple); color: #fff; font-size: 9px; }
     .badge-exit { background: rgba(249,115,22,0.2); color: #f97316; font-size: 9px; }
+    .badge-rejected { background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.4); }
+    .badge-error { background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+
+    .wallet-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+    }
+    .wallet-card.visible { display: flex; }
+    .wallet-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--green); flex-shrink: 0;
+    }
 
     .progress-bar {
       height: 6px;
@@ -326,6 +344,74 @@
     .tab-btn.active .tab-count {
       background: rgba(59,130,246,0.2);
     }
+
+    .log-section {
+      padding: 0 24px 24px;
+    }
+
+    .log-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .log-badge {
+      background: var(--red-bg);
+      color: var(--red);
+      border: 1px solid rgba(239,68,68,0.4);
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 8px;
+      display: none;
+    }
+
+    .log-badge.visible { display: inline-block; }
+
+    .log-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+
+    .log-entry {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 11px;
+      border-left: 3px solid var(--red);
+      animation: fadeIn 0.2s ease;
+    }
+
+    .log-entry.log-error { border-left-color: #f87171; }
+    .log-entry.log-clamped { border-left-color: var(--yellow); }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .log-time { color: var(--text-dim); flex-shrink: 0; }
+    .log-type { font-weight: 700; flex-shrink: 0; min-width: 64px; }
+    .log-type.rejected { color: var(--red); }
+    .log-type.error    { color: #f87171; }
+    .log-type.clamped  { color: var(--yellow); }
+    .log-msg  { color: var(--text); flex: 1; }
+    .log-meta { color: var(--text-dim); flex-shrink: 0; }
+
+    .log-empty {
+      text-align: center;
+      color: var(--text-dim);
+      padding: 24px;
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
@@ -338,6 +424,12 @@
       <span><span class="status-dot off" id="dot-polymarket"></span>Polymarket</span>
       <span><span class="status-dot off" id="dot-ws"></span>Dashboard</span>
       <span id="mode-badge" style="padding:2px 8px;border-radius:3px;background:var(--yellow-bg);color:var(--yellow);font-weight:600">PAPER</span>
+      <div class="wallet-card" id="wallet-card">
+        <div class="wallet-dot"></div>
+        <span style="color:var(--text-dim)">Wallet USDC.e</span>
+        <span id="wallet-balance" style="font-weight:700;color:var(--green)">$0.00</span>
+        <span id="wallet-age" style="color:var(--text-dim);font-size:10px"></span>
+      </div>
     </div>
   </div>
 
@@ -545,6 +637,22 @@
     </div>
   </div>
 
+  <!-- Rejection Logs -->
+  <div class="log-section">
+    <div class="card">
+      <div class="log-header">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="card-title" style="margin:0">Rejection Logs</div>
+          <span class="log-badge" id="log-badge">0 new</span>
+        </div>
+        <button onclick="clearLogBadge()" style="background:none;border:1px solid var(--border);border-radius:4px;color:var(--text-dim);font-family:inherit;font-size:10px;padding:3px 8px;cursor:pointer">Clear</button>
+      </div>
+      <div class="log-list" id="log-list">
+        <div class="log-empty" id="log-empty">No rejections — all orders passed.</div>
+      </div>
+    </div>
+  </div>
+
 <script>
 // ==================== State ====================
 let state = {
@@ -555,10 +663,14 @@ let state = {
   daily_pnl: [],
   market: {},
   feeds: {},
+  wallet_usdc: 0,
+  wallet_last_updated: 0,
 };
 
 let equityChart = null;
 let dailyChart = null;
+let logEntries = [];       // {time, type, msg, meta}
+let logUnreadCount = 0;
 
 // v3.9: per-asset badge colors
 const ASSET_COLORS = {
@@ -627,6 +739,9 @@ function handleMessage(msg) {
       state.recent_trades.unshift(msg.data);
       state.recent_trades = state.recent_trades.slice(0, 100);
       renderTrades();
+      if (msg.data.outcome === 'rejected' || msg.data.outcome === 'error') {
+        pushLogEntry(msg.data);
+      }
       break;
     case 'market':
       state.market = msg.data;
@@ -634,6 +749,11 @@ function handleMessage(msg) {
     case 'feeds':
       state.feeds = msg.data;
       renderFeeds();
+      break;
+    case 'wallet_balance':
+      state.wallet_usdc = msg.data.usdc;
+      state.wallet_last_updated = msg.data.ts;
+      renderWalletBalance();
       break;
   }
 }
@@ -645,14 +765,24 @@ function renderAll() {
   renderFeeds();
   renderTrades();
   renderCharts();
+  renderWalletBalance();
+  // Load existing rejections from historical trades on init
+  logEntries = [];
+  (state.recent_trades || []).filter(t =>
+    t.outcome === 'rejected' || t.outcome === 'error'
+  ).forEach(t => pushLogEntry(t, false));
+  renderLogs();
 }
 
 function renderPortfolio() {
   const p = state.portfolio;
   if (!p || !p.balance) return;
 
+  // In live mode show real wallet USDC.e balance; fall back to portfolio balance
+  const isLive = p.mode === 'live';
+  const displayBalance = (isLive && state.wallet_usdc > 0) ? state.wallet_usdc : p.balance;
   document.getElementById('kpi-balance').textContent =
-    '$' + p.balance.toLocaleString('en-US', {minimumFractionDigits: 2});
+    '$' + displayBalance.toLocaleString('en-US', {minimumFractionDigits: 2});
   const retEl = document.getElementById('kpi-return');
   retEl.textContent = (p.total_return_pct || 0).toFixed(2) + '% return';
   retEl.className = 'card-sub ' +
@@ -701,6 +831,28 @@ function renderPortfolio() {
     badge.textContent = 'PAPER';
     badge.style.background = 'var(--yellow-bg)';
     badge.style.color = 'var(--yellow)';
+  }
+}
+
+function renderWalletBalance() {
+  const card = document.getElementById('wallet-card');
+  const isLive = state.portfolio && state.portfolio.mode === 'live';
+  const usdc = state.wallet_usdc || 0;
+
+  if (!isLive || usdc === 0) {
+    card.classList.remove('visible');
+    return;
+  }
+
+  card.classList.add('visible');
+  document.getElementById('wallet-balance').textContent =
+    '$' + usdc.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const ts = state.wallet_last_updated || 0;
+  if (ts > 0) {
+    const ageS = Math.round((Date.now() / 1000) - ts);
+    document.getElementById('wallet-age').textContent =
+      ageS < 60 ? `${ageS}s ago` : `${Math.round(ageS/60)}m ago`;
   }
 }
 
@@ -900,8 +1052,12 @@ function renderTrades() {
       outBadge = '<span class="badge badge-lost">LOST</span>';
     } else if (t.outcome === 'early_exit') {
       outBadge = '<span class="badge badge-early-exit">SOLD</span>';
-    } else if (t.outcome === 'cancelled' || t.outcome === 'rejected' || t.outcome === 'error') {
-      outBadge = '<span class="badge" style="background:var(--surface2);color:var(--text-dim)">' + (t.outcome || '').toUpperCase() + '</span>';
+    } else if (t.outcome === 'rejected') {
+      outBadge = '<span class="badge badge-rejected" title="Order rejected by CLOB">REJECTED</span>';
+    } else if (t.outcome === 'error') {
+      outBadge = '<span class="badge badge-error" title="Execution error — check logs">ERROR</span>';
+    } else if (t.outcome === 'cancelled') {
+      outBadge = '<span class="badge" style="background:var(--surface2);color:var(--text-dim)">CANCELLED</span>';
     } else {
       outBadge = '<span class="badge badge-pending">PENDING</span>';
     }
@@ -1026,15 +1182,79 @@ function renderDailyChart() {
   });
 }
 
+// ==================== Rejection Logs ====================
+function pushLogEntry(trade, notify = true) {
+  const outcome = trade.outcome || 'rejected';
+  const ts = new Date((trade.timestamp || Date.now() / 1000) * 1000);
+  const timeStr = ts.toLocaleTimeString();
+  const asset = assetFromSlug(trade.slug || '');
+  const slug = (trade.slug || '').replace(/^[a-z]+-updown-/, '');
+  const side = trade.side || '?';
+  const size = (trade.size_usd || 0).toFixed(2);
+  const price = (trade.entry_price || 0).toFixed(4);
+
+  let type, typeClass, msg;
+  if (outcome === 'error') {
+    type = 'ERROR'; typeClass = 'error';
+    msg = 'Execution error — check server logs';
+  } else {
+    type = 'REJECTED'; typeClass = 'rejected';
+    msg = 'Order rejected by CLOB';
+  }
+
+  logEntries.unshift({ timeStr, type, typeClass, msg, asset, slug, side, size, price });
+  logEntries = logEntries.slice(0, 50);
+
+  if (notify) {
+    logUnreadCount++;
+    const badge = document.getElementById('log-badge');
+    badge.textContent = logUnreadCount + ' new';
+    badge.classList.add('visible');
+  }
+
+  renderLogs();
+}
+
+function renderLogs() {
+  const list = document.getElementById('log-list');
+  const empty = document.getElementById('log-empty');
+
+  if (logEntries.length === 0) {
+    empty.style.display = 'block';
+    list.querySelectorAll('.log-entry').forEach(el => el.remove());
+    return;
+  }
+
+  empty.style.display = 'none';
+  list.innerHTML = logEntries.map(e => `
+    <div class="log-entry log-${e.typeClass}">
+      <span class="log-time">${e.timeStr}</span>
+      <span class="log-type ${e.typeClass}">${e.type}</span>
+      <span class="log-msg">${e.asset} · ${e.side} · ${e.slug}</span>
+      <span class="log-meta">$${e.size} @ ${e.price}</span>
+    </div>
+  `).join('');
+}
+
+function clearLogBadge() {
+  logUnreadCount = 0;
+  const badge = document.getElementById('log-badge');
+  badge.textContent = '0 new';
+  badge.classList.remove('visible');
+}
+
 // ==================== Init ====================
 connectWS();
 
-// Periodic refresh
+// Periodic DB refresh
 setInterval(() => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send('refresh');
   }
 }, 30000);
+
+// Update wallet age display every 10s without a WS round-trip
+setInterval(renderWalletBalance, 10000);
 </script>
 </body>
 </html>

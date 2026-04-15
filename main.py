@@ -128,6 +128,8 @@ class Orchestrator:
         self._snapshot_interval = 60
         self._strategy_by_trade: dict[int, str] = {}
         self._pending_topups: dict[int, dict] = {}  # v5: staged entry reserves
+        # cooldown: market_id → expiry timestamp (no retry before this time)
+        self._market_cooldowns: dict[str, float] = {}
 
     async def start(self) -> None:
         log.info("=" * 60)
@@ -171,6 +173,10 @@ class Orchestrator:
             asyncio.create_task(self._monitor_positions(), name="position_monitor"),
             asyncio.create_task(self._dashboard_server(), name="dashboard"),
         ]
+        if config.is_live:
+            tasks.append(asyncio.create_task(
+                self._wallet_balance_loop(), name="wallet_balance"
+            ))
         for symbol, cl_feed in self._chainlink_feeds.items():
             tasks.append(asyncio.create_task(cl_feed.start(), name=f"chainlink_{symbol}"))
         for symbol, bn_feed in self._binance_feeds.items():
@@ -395,6 +401,11 @@ class Orchestrator:
             })
 
             if sig.action == "BUY":
+                # Cooldown: skip if we already tried this market and it failed
+                cooldown_until = self._market_cooldowns.get(cid, 0)
+                if time.time() < cooldown_until:
+                    continue
+
                 # v5: staged entry — split bet if very confident
                 original_size = sig.size_usd
                 reserve_usd = 0.0
@@ -411,6 +422,24 @@ class Orchestrator:
                     )
 
                 trade_id = await self.trader.execute(sig)
+
+                # Live mode: push rejected/errored trades to dashboard
+                # and set cooldown so we don't spam the same market
+                if config.is_live and hasattr(self.trader, "pop_rejected_trades"):
+                    rejected_ids = self.trader.pop_rejected_trades()
+                    if rejected_ids:
+                        # Cooldown = rest of the market window (min 60s)
+                        cooldown = time.time() + max(60.0, sig.time_remaining_sec)
+                        self._market_cooldowns[cid] = cooldown
+                        log.info(
+                            "[Cooldown] Market %s cooling down for %.0fs after rejection",
+                            cid[:12], max(60.0, sig.time_remaining_sec),
+                        )
+                    for rejected_id in rejected_ids:
+                        rejected_row = await self.db.get_trade(rejected_id)
+                        if rejected_row:
+                            await dashboard_state.update_trade(rejected_row)
+
                 if trade_id:
                     self._strategy_by_trade[trade_id] = sig.strategy_used
 
@@ -764,6 +793,27 @@ class Orchestrator:
                     topup_trade_id, trade_id, reserve, current_ask,
                 )
                 await dashboard_state.update_portfolio(self.portfolio.get_stats())
+
+    async def _wallet_balance_loop(self) -> None:
+        """Live mode only — poll real USDC.e balance from CLOB every 30s."""
+        await asyncio.sleep(5)  # let client finish init first
+        while self._running:
+            try:
+                client = getattr(self.trader, "_client", None)
+                loop = getattr(self.trader, "_loop", None)
+                if client and loop:
+                    def _fetch():
+                        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                        return client.get_balance_allowance(
+                            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                        )
+                    bal = await loop.run_in_executor(None, _fetch)
+                    usdc = float(bal.get("balance", 0.0)) / 1_000_000
+                    await dashboard_state.update_wallet_balance(usdc)
+                    log.debug("[Wallet] USDC.e balance: $%.2f", usdc)
+            except Exception as exc:
+                log.debug("[Wallet] Balance fetch error: %s", exc)
+            await asyncio.sleep(30)
 
     async def _snapshot_loop(self) -> None:
         while self._running:

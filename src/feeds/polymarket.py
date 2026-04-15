@@ -292,17 +292,27 @@ class PolymarketFeed:
                 return None
 
             clob_tokens = market.get("clobTokenIds", "")
-            if isinstance(clob_tokens, str) and clob_tokens:
-                clob_tokens = json.loads(clob_tokens)
+            try:
+                if isinstance(clob_tokens, str) and clob_tokens:
+                    clob_tokens = json.loads(clob_tokens)
+                if not isinstance(clob_tokens, list):
+                    clob_tokens = []
+            except (json.JSONDecodeError, ValueError):
+                clob_tokens = []
             token_up = clob_tokens[0] if len(clob_tokens) > 0 else ""
             token_down = clob_tokens[1] if len(clob_tokens) > 1 else ""
 
             prices_raw = market.get("outcomePrices", "[]")
-            if isinstance(prices_raw, str):
-                prices = json.loads(prices_raw)
-            else:
-                prices = prices_raw
-            p_up = float(prices[0]) if prices else 0.5
+            try:
+                if isinstance(prices_raw, str):
+                    prices = json.loads(prices_raw)
+                else:
+                    prices = prices_raw
+                if not isinstance(prices, list):
+                    prices = []
+            except (json.JSONDecodeError, ValueError):
+                prices = []
+            p_up = float(prices[0]) if len(prices) > 0 else 0.5
             p_down = float(prices[1]) if len(prices) > 1 else 0.5
 
             end_ts = self._parse_iso(market.get("endDate", ""))

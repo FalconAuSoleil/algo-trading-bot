@@ -1,7 +1,7 @@
 """Live trading engine — executes real orders on Polymarket CLOB.
 
 Uses py-clob-client for proper EIP-712 / HMAC order signing.
-Requires POLYMARKET_PRIVATE_KEY and POLYMARKET_WALLET_ADDRESS in .env.
+Requires POLYMARKET_PRIVATE_KEY in .env (EOA mode — address derived from key).
 
 Trade flow:
   1. Receive Signal with action="BUY" and filters_passed=True
@@ -25,6 +25,7 @@ silent TypeError and trades never resolving.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Callable, Optional
 
@@ -79,6 +80,9 @@ class LiveTrader:
         self._client: Optional[object] = None
         self._pending_resolutions: dict[int, dict] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Trade IDs rejected/errored since last pop — consumed by main.py
+        # to push rejected rows to the dashboard.
+        self._rejected_trade_ids: list[int] = []
 
     async def start(self) -> None:
         """Initialise the CLOB client and derive/set API credentials."""
@@ -96,12 +100,6 @@ class LiveTrader:
             )
             return
 
-        if not self.cfg.wallet_address:
-            log.error(
-                "[Live] Cannot start: POLYMARKET_WALLET_ADDRESS not set in .env"
-            )
-            return
-
         try:
             # Run synchronous ClobClient init in executor to avoid blocking
             def _init_client():
@@ -109,8 +107,7 @@ class LiveTrader:
                     host=self.cfg.clob_url,
                     chain_id=POLYGON,
                     key=self.cfg.private_key,
-                    signature_type=2,       # POLY_GNOSIS_SAFE
-                    funder=self.cfg.wallet_address,
+                    signature_type=0,       # EOA — raw private key (Phantom/MetaMask new wallet)
                 )
                 # Use pre-configured API key if available, else derive it
                 if self.cfg.api_key and self.cfg.api_secret and self.cfg.api_passphrase:
@@ -121,7 +118,7 @@ class LiveTrader:
                         api_passphrase=self.cfg.api_passphrase,
                     )
                 else:
-                    creds = client.derive_api_creds()
+                    creds = client.create_or_derive_api_creds()
                     log.info(
                         "[Live] Derived API creds from private key "
                         "(no explicit creds in .env)"
@@ -130,10 +127,92 @@ class LiveTrader:
                 return client
 
             self._client = await self._loop.run_in_executor(None, _init_client)
-            log.info(
-                "[Live] ClobClient ready | wallet=%s",
-                self.cfg.wallet_address[:10] + "...",
-            )
+
+            # Set USDC + CTF token allowances for the Exchange contract.
+            # Required once per wallet — allows the CLOB to debit USDC on BUY
+            # and move conditional tokens on SELL (early exit).
+            # Only submits the on-chain transaction if not already approved.
+            # py-clob-client v0.34.6 removed set_allowances() — allowances must
+            # be approved directly via the USDC.e / CTF ERC-20 contracts on
+            # Polygon. We only check and warn here; if a BUY order fails with
+            # an allowance error, surface it clearly instead of crashing.
+            try:
+                def _check_allowances_onchain():
+                    from web3 import Web3
+                    from eth_account import Account
+                    rpc = os.getenv("POLYGON_RPC", "https://polygon.drpc.org")
+                    w3 = Web3(Web3.HTTPProvider(rpc))
+                    owner = Account.from_key(self.cfg.private_key).address
+                    usdce = Web3.to_checksum_address(
+                        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+                    )
+                    ops = [
+                        ("CTF Exchange", "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
+                        ("NegRisk CTF", "0xC5d563A36AE78145C45a50134d48A1215220f80a"),
+                        ("NegRisk Adapter", "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"),
+                    ]
+                    abi = [{
+                        "inputs": [
+                            {"name": "owner", "type": "address"},
+                            {"name": "spender", "type": "address"},
+                        ],
+                        "name": "allowance",
+                        "outputs": [{"name": "", "type": "uint256"}],
+                        "stateMutability": "view", "type": "function",
+                    }]
+                    c = w3.eth.contract(address=usdce, abi=abi)
+                    return [
+                        (name, c.functions.allowance(
+                            owner, Web3.to_checksum_address(op)
+                        ).call())
+                        for name, op in ops
+                    ]
+                results = await self._loop.run_in_executor(
+                    None, _check_allowances_onchain
+                )
+                missing = [name for name, a in results if a < 10**20]
+                if missing:
+                    log.warning(
+                        "[Live] USDC.e allowance not set for: %s — run "
+                        "approve_allowances.py before trading",
+                        ", ".join(missing),
+                    )
+                else:
+                    log.info(
+                        "[Live] USDC.e UNLIMITED allowance verified "
+                        "on-chain for all 3 Polymarket operators — ready to trade"
+                    )
+            except Exception as exc:
+                log.warning("[Live] On-chain allowance check failed: %s", exc)
+
+            # Sync portfolio balance with real wallet USDC.e balance
+            try:
+                def _fetch_balance():
+                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                    bal = self._client.get_balance_allowance(
+                        params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                    )
+                    return float(bal.get("balance", 0)) / 1_000_000
+                real_usdc = await self._loop.run_in_executor(None, _fetch_balance)
+                if real_usdc > 0:
+                    self.portfolio.balance = real_usdc
+                    self.portfolio.initial_balance = real_usdc
+                    self.portfolio._peak_balance = real_usdc
+                    log.info(
+                        "[Live] Portfolio synced to real wallet balance: $%.2f",
+                        real_usdc,
+                    )
+                else:
+                    log.warning("[Live] Wallet balance is $0 — cannot trade")
+            except Exception as exc:
+                log.warning("[Live] Balance sync failed: %s", exc, exc_info=True)
+
+            try:
+                from eth_account import Account
+                wallet_addr = Account.from_key(self.cfg.private_key).address
+            except Exception:
+                wallet_addr = "unknown"
+            log.info("[Live] ClobClient ready | wallet=%s", wallet_addr)
         except Exception as exc:
             log.error("[Live] ClobClient init failed: %s", exc)
             self._client = None
@@ -186,8 +265,16 @@ class LiveTrader:
         """
         if signal.action != "BUY" or not signal.filters_passed:
             return None
-        if signal.size_usd < 1.0:
-            return None
+        # Polymarket minimum: $2 notional OR 5 shares, whichever is larger
+        POLY_MIN_SHARES = 5
+        poly_min_usd = max(2.0, POLY_MIN_SHARES * signal.entry_price)
+        size_usd = signal.size_usd
+        if size_usd < poly_min_usd:
+            log.info(
+                "[Live] Size clamped $%.2f → $%.2f (min %d shares @ %.4f)",
+                size_usd, poly_min_usd, POLY_MIN_SHARES, signal.entry_price,
+            )
+            size_usd = poly_min_usd
         if signal.time_remaining_sec < 45.0:
             log.warning(
                 "[Live] Rejected: t_rem=%.0fs < 45s safety guard",
@@ -217,7 +304,16 @@ class LiveTrader:
             log.error("[Live] Invalid entry price: %.4f", entry_price)
             return None
 
-        shares = round(signal.size_usd / entry_price, 2)
+        # Never bet more than available portfolio balance (safety cap)
+        max_size = round(self.portfolio.balance * 0.95, 2)
+        if size_usd > max_size:
+            log.info(
+                "[Live] Size capped $%.2f → $%.2f (95%% of balance $%.2f)",
+                size_usd, max_size, self.portfolio.balance,
+            )
+            size_usd = max(POLY_MIN_USD, max_size)
+
+        shares = round(size_usd / entry_price, 2)
 
         # Record as pending in DB before submitting (idempotent crash safety)
         record = TradeRecord(
@@ -225,7 +321,7 @@ class LiveTrader:
             slug=signal.slug,
             side=signal.side,
             entry_price=entry_price,
-            size_usd=signal.size_usd,
+            size_usd=size_usd,
             delta=signal.delta_chainlink,
             sigma=signal.sigma,
             p_true=signal.p_true,
@@ -243,7 +339,7 @@ class LiveTrader:
             log.info(
                 "[Live] Submitting FOK | %s %s | shares=%.2f @ %.4f | $%.2f | CL_age=%.0fs",
                 signal.side, signal.market_id[:16], shares,
-                entry_price, signal.size_usd, signal.oracle_age_sec,
+                entry_price, size_usd, signal.oracle_age_sec,
             )
 
             def _place_order():
@@ -261,7 +357,9 @@ class LiveTrader:
 
             if resp and resp.get("success"):
                 fill_price = float(resp.get("price", entry_price))
-                actual_shares = signal.size_usd / fill_price
+                if fill_price <= 0:
+                    fill_price = entry_price
+                actual_shares = size_usd / fill_price
 
                 log.info(
                     "[Live] FILLED | trade_id=%d | fill=%.4f | shares=%.2f",
@@ -273,7 +371,7 @@ class LiveTrader:
                     market_id=signal.market_id,
                     side=signal.side,
                     entry_price=fill_price,
-                    size_usd=signal.size_usd,
+                    size_usd=size_usd,
                     shares=actual_shares,
                     entry_time=time.time(),
                     market_end_time=time.time() + signal.time_remaining_sec,
@@ -302,17 +400,26 @@ class LiveTrader:
                 return trade_id
 
             else:
-                err = resp.get("errorMsg", str(resp)) if resp else "no response"
-                log.warning(
-                    "[Live] Order REJECTED | trade_id=%d | %s",
-                    trade_id, err,
-                )
+                err_msg = resp.get("errorMsg", str(resp)) if resp else "no response"
+                err_lower = err_msg.lower()
+                if "minimum" in err_lower or "size" in err_lower:
+                    log.warning("[Live] REJECTED (size too small) | trade_id=%d | %s", trade_id, err_msg)
+                elif "insufficient" in err_lower or "balance" in err_lower or "fund" in err_lower:
+                    log.warning("[Live] REJECTED (insufficient funds) | trade_id=%d | %s", trade_id, err_msg)
+                elif "not found" in err_lower or "market" in err_lower:
+                    log.warning("[Live] REJECTED (market closed/not found) | trade_id=%d | %s", trade_id, err_msg)
+                elif "fok" in err_lower or "fill" in err_lower:
+                    log.info("[Live] FOK not filled (no matching ask) | trade_id=%d", trade_id)
+                else:
+                    log.warning("[Live] Order REJECTED | trade_id=%d | %s", trade_id, err_msg)
                 await self.db.resolve_trade(trade_id, "rejected", 0.0)
+                self._rejected_trade_ids.append(trade_id)
                 return None
 
         except Exception as exc:
             log.error("[Live] Order execution error: %s", exc, exc_info=True)
             await self.db.resolve_trade(trade_id, "error", 0.0)
+            self._rejected_trade_ids.append(trade_id)
             return None
 
     async def sell_position(
@@ -430,8 +537,8 @@ class LiveTrader:
                         info.get("start_time", 0),
                         info.get("duration", 300),
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("[Live] fetch_outcome error for trade %d: %s", trade_id, exc)
 
             if real_outcome in ("up", "down"):
                 won = (real_outcome == "up") if side == "YES" else (real_outcome == "down")
@@ -472,6 +579,16 @@ class LiveTrader:
             })
 
         return resolved
+
+    def pop_rejected_trades(self) -> list[int]:
+        """Return and clear the list of recently rejected/errored trade IDs.
+
+        Called by main.py after each execute() to push rejections to the
+        dashboard. Safe to call even if no rejections occurred.
+        """
+        result = self._rejected_trade_ids[:]
+        self._rejected_trade_ids.clear()
+        return result
 
     @property
     def pending_count(self) -> int:
