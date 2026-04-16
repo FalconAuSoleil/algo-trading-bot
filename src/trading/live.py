@@ -377,12 +377,6 @@ class LiveTrader:
         #   valid orders the moment any part of the requested size was missing
         #   at the exact limit price).
         try:
-            log.info(
-                "[Live] Submitting FAK BUY | %s %s | amount=$%.2f @ <=%.4f | CL_age=%.0fs",
-                signal.side, signal.market_id[:16], size_usd,
-                entry_price, signal.oracle_age_sec,
-            )
-
             def _place_order():
                 from py_clob_client.clob_types import (
                     MarketOrderArgs, OrderType, PartialCreateOrderOptions,
@@ -395,13 +389,19 @@ class LiveTrader:
                 if neg_risk is None:
                     neg_risk = self._client.get_neg_risk(token_id)
                     self._neg_risk_cache[token_id] = neg_risk
-                # Snap to tick grid + add 1 tick of upward buffer on BUY.
-                # This tolerates the 100-300ms of network flight where the
-                # best_ask can tick up between signal and submission. Without
-                # this, FAK often returns "no orders found to match" because
-                # the price we signed vanished in transit.
+                # Snap to tick grid + add 2 ticks of upward buffer on BUY.
+                # On fast markets (high-edge arb targets), best_ask can drift
+                # by multiple ticks during the ~1s signature+HTTP flight. A
+                # single-tick buffer was insufficient (observed trade_id=9).
                 step = float(tick_size)
-                limit_price = round(round(entry_price / step) * step + step, 4)
+                limit_price = round(round(entry_price / step) * step + 2 * step, 4)
+                log.info(
+                    "[Live] Submitting FAK BUY | %s %s | amount=$%.2f "
+                    "entry=%.4f limit=%.4f (tick=%s) | CL_age=%.0fs",
+                    signal.side, signal.market_id[:16], size_usd,
+                    entry_price, limit_price, tick_size,
+                    signal.oracle_age_sec,
+                )
                 order_args = MarketOrderArgs(
                     token_id=token_id,
                     amount=round(size_usd, 2),

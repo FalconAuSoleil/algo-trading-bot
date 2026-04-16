@@ -511,14 +511,19 @@ class _ChainlinkArbEngine:
         self._cp = p
         self._cl_ts = ts
 
-    def _momentum(self, window: float = 15.0) -> float:
+    def _momentum(self, window: float | None = None) -> float:
+        if window is None:
+            window = self.cfg.momentum_short_window_sec
         if len(self._ph) < 3:
             return 0.0
         now = time.time()
         r = [(t, p) for t, p in self._ph if t >= now - window]
         if len(r) < 2:
             return 0.0
-        return clamp((r[-1][1] - r[0][1]) / r[0][1] / 0.002, -1, 1)
+        return clamp(
+            (r[-1][1] - r[0][1]) / r[0][1] / self.cfg.momentum_normalizer,
+            -1, 1,
+        )
 
     def _cl_boost(self, now: float) -> tuple:
         if self._cl_ts <= 0 or self._cp <= 0:
@@ -527,9 +532,13 @@ class _ChainlinkArbEngine:
         ttn = self._cl_period - (lag % self._cl_period)
         gap = (self._bp - self._cp) / self._cp if self._cp > 0 else 0.0
         prox = clamp(1 - ttn / self.cfg.chainlink_edge_window, 0, 1)
-        return lag, clamp(prox * gap * 1500, -1.5, 1.5)
+        g = self.cfg.chainlink_boost_gain
+        c = self.cfg.chainlink_boost_clamp
+        return lag, clamp(prox * gap * g, -c, c)
 
-    def _realized_vol_per_sec(self, window_sec: float = 300.0) -> float:
+    def _realized_vol_per_sec(self, window_sec: float | None = None) -> float:
+        if window_sec is None:
+            window_sec = self.cfg.vol_window_chainlink_sec
         now = time.time()
         r = [(t, p) for t, p in self._ph if t >= now - window_sec]
         if len(r) < 6:
@@ -650,8 +659,10 @@ class _ChainlinkArbEngine:
         # already be closer to the strike than the frozen CL delta suggests.
         # Penalise by inflating effective time so the diffusion threshold
         # stays higher when data is old.
-        t_eff = t_rem + oracle_age * 0.5
-        min_viable_delta = 1.0 * sigma_ps * math.sqrt(max(t_eff, 1))
+        t_eff = t_rem + oracle_age * cfg.oracle_age_penalty_weight
+        min_viable_delta = (
+            cfg.min_viable_delta_sigma_mult * sigma_ps * math.sqrt(max(t_eff, 1))
+        )
         micro.realized_sigma_pct = round(sigma_ps * math.sqrt(300) * 100, 4)
         micro.min_viable_delta_pct = round(min_viable_delta * 100, 4)
 
@@ -674,7 +685,10 @@ class _ChainlinkArbEngine:
             return sig
 
         # ---- Bayesian pipeline ---------------------------------------------
-        z = cfg.momentum_factor * pd + 0.2 * self._momentum(15)
+        z = (
+            cfg.momentum_factor * pd
+            + cfg.momentum_inner_weight * self._momentum(cfg.momentum_short_window_sec)
+        )
         pp = sigmoid(z)
         micro.base_prob_up = pp
         ls = logit(pp)
@@ -713,7 +727,9 @@ class _ChainlinkArbEngine:
         # ---- Blend Bayesian + Diffusion ------------------------------------
         p_diff = p_brownian(pd, t_rem, sigma_ps)
         micro.p_diffusion = round(p_diff, 4)
-        blend_w = clamp(t_rem / max(max_t, 1), 0.15, 0.55)
+        blend_w = clamp(
+            t_rem / max(max_t, 1), cfg.blend_weight_min, cfg.blend_weight_max,
+        )
 
         if pd > 0:
             p_bayes = pu
@@ -761,7 +777,7 @@ class _ChainlinkArbEngine:
             sig.status = f"SUSPICIOUS_EDGE ({edge * 100:.1f}%)"
             sig.micro = micro
             return sig
-        if prob < entry + 0.02:
+        if prob < entry + cfg.overpaying_margin:
             self.stab.record(slug, side, max(edge, 0.001), now)
             sig.filter_reasons.append("overpaying")
             sig.micro = micro
@@ -838,8 +854,8 @@ class _ChainlinkArbEngine:
             return sig
 
         frac = clamp(kelly * 0.25, 0, cfg.max_bet_fraction)
-        if hi < cfg.hawkes_mu * 1.5:
-            frac *= 0.7
+        if hi < cfg.hawkes_mu * cfg.hawkes_weak_threshold_mult:
+            frac *= cfg.hawkes_weak_size_mult
         # v4.2: shrink sizing at night/weekends (lower signal quality)
         if is_offpeak(now):
             frac *= cfg.offpeak_sizing_multiplier
@@ -848,8 +864,8 @@ class _ChainlinkArbEngine:
         size = min(size, capital * cfg.max_bet_fraction)
         depth = state.depth_yes if side == "YES" else state.depth_no
         if depth > 0:
-            size = min(size, depth * 0.3)
-        if size < 1.0:
+            size = min(size, depth * cfg.depth_size_cap_ratio)
+        if size < cfg.min_trade_size_usd:
             sig.filter_reasons.append("tiny")
             sig.micro = micro
             return sig
@@ -857,7 +873,11 @@ class _ChainlinkArbEngine:
         sig.size_usd = size
         sig.kelly_pct = frac
         cs = edge * 0.4 + kq * 0.2 + hb * 0.2 + (dr if sok else 0) * 0.2
-        sig.confidence = "HIGH" if cs >= 0.10 else "MEDIUM" if cs >= 0.06 else "LOW"
+        sig.confidence = (
+            "HIGH" if cs >= cfg.confidence_high_score
+            else "MEDIUM" if cs >= cfg.confidence_med_score
+            else "LOW"
+        )
         sig.action = "BUY"
         sig.status = "BETTING"
         sig.filters_passed = True
@@ -908,7 +928,7 @@ class _MomentumEngine:
 
     def _sigma_ps(self) -> float:
         now = time.time()
-        r = [(t, p) for t, p in self._ph if t >= now - 300]
+        r = [(t, p) for t, p in self._ph if t >= now - self.cfg.vol_window_chainlink_sec]
         if len(r) < 6:
             return self.sigma_floor
         sq = []
@@ -930,16 +950,16 @@ class _MomentumEngine:
         now = time.time()
         time_remaining = state.end_time - now
 
-        if time_remaining < 60 or time_remaining > 150:
+        if time_remaining < cfg.momentum_time_min or time_remaining > cfg.momentum_time_max:
             return None
         if state.reference_price <= 0 or state.btc_chainlink <= 0:
             return None
         if has_position_on_market:
             return None
 
-        m60 = self._mom_window(60)
-        m120 = self._mom_window(120)
-        m240 = self._mom_window(240)  # v4.2: longer confirmation window
+        m60 = self._mom_window(cfg.momentum_window_short_sec)
+        m120 = self._mom_window(cfg.momentum_window_mid_sec)
+        m240 = self._mom_window(cfg.momentum_window_long_sec)  # v4.2: longer confirmation
         threshold = cfg.momentum_min_threshold
 
         if abs(m60) < threshold or abs(m120) < threshold:
@@ -955,14 +975,14 @@ class _MomentumEngine:
             (state.btc_chainlink - state.reference_price) / state.reference_price
         )
 
-        if going_up and delta < -0.0005:
+        if going_up and delta < -cfg.momentum_direction_min_delta:
             return None
-        if not going_up and delta > 0.0005:
+        if not going_up and delta > cfg.momentum_direction_min_delta:
             return None
 
         sigma_ps = self._sigma_ps()
         p_diff = p_brownian(delta, time_remaining, sigma_ps)
-        if p_diff < 0.60:
+        if p_diff < cfg.momentum_pdiff_min:
             return None
 
         if abs(delta) < self.delta_min_abs:
@@ -981,15 +1001,21 @@ class _MomentumEngine:
         if abs(m240) >= threshold * 0.5:
             mom_vals.append(abs(m240))
         momentum_strength = sum(mom_vals) / len(mom_vals)
-        p_bayes = clamp(0.53 + momentum_strength * 20, 0.53, 0.67)
-        blend_w = clamp(time_remaining / 150, 0.2, 0.45)
+        p_bayes = clamp(
+            cfg.momentum_pbayes_floor + momentum_strength * cfg.momentum_strength_mult,
+            cfg.momentum_pbayes_floor, cfg.momentum_pbayes_ceil,
+        )
+        blend_w = clamp(
+            time_remaining / cfg.momentum_time_max,
+            cfg.momentum_blend_min, cfg.momentum_blend_max,
+        )
         prob = blend_w * p_diff + (1 - blend_w) * p_bayes
         prob = clamp(prob, 0.50, 0.98)
 
-        fee = calc_fee(entry)  # uses new linear model
+        fee = calc_fee(entry, cfg.fee_rate)  # uses new linear model
         edge = prob - entry - fee
 
-        if edge < cfg.edge_min * 0.9:
+        if edge < cfg.edge_min * cfg.momentum_edge_min_mult:
             return None
         # v4.2.1: add edge_max + longshot filters (were missing — caused
         # SOL @0.27 edge=30% trades to slip through, losing $468)
@@ -998,7 +1024,7 @@ class _MomentumEngine:
         if entry < cfg.min_market_prob_side or entry > cfg.max_market_prob_side:
             return None
 
-        max_frac = cfg.max_bet_fraction * 0.5
+        max_frac = cfg.max_bet_fraction * cfg.momentum_size_mult
         c_eff = entry + fee
         if c_eff >= 1:
             return None
@@ -1007,7 +1033,7 @@ class _MomentumEngine:
             return None
         frac = clamp(kelly * 0.25, 0, max_frac)
         size = round(capital * frac, 2)
-        if size < 1.0:
+        if size < cfg.min_trade_size_usd:
             return None
 
         slug = state.slug or state.market_id[:20]
@@ -1069,16 +1095,16 @@ class _MeanReversionEngine:
             return None
 
         time_remaining = state.end_time - now
-        if time_remaining < 90 or time_remaining > 180:
+        if time_remaining < cfg.meanrev_time_min or time_remaining > cfg.meanrev_time_max:
             return None
-        if consecutive_losses >= 2:
+        if consecutive_losses >= cfg.meanrev_max_consec_losses:
             return None
         if has_position_on_market:
             return None
 
-        sigma_ps = self.sigma_fallback * 1.5
+        sigma_ps = self.sigma_fallback * cfg.meanrev_sigma_boost
         one_sigma = sigma_ps * math.sqrt(max(time_remaining, 1))
-        if abs_delta < 1.5 * one_sigma:
+        if abs_delta < cfg.meanrev_sigma_threshold_mult * one_sigma:
             return None
 
         if delta > 0:
@@ -1091,8 +1117,11 @@ class _MeanReversionEngine:
             side = "YES"
             entry = state.best_ask_yes if state.best_ask_yes > 0 else state.p_market_yes
 
-        p_true = clamp(0.52 + (abs_delta - thresh) * 8, 0.52, 0.62)
-        fee = calc_fee(entry)  # uses new linear model
+        p_true = clamp(
+            cfg.meanrev_ptrue_floor + (abs_delta - thresh) * cfg.meanrev_ptrue_mult,
+            cfg.meanrev_ptrue_floor, cfg.meanrev_ptrue_ceil,
+        )
+        fee = calc_fee(entry, cfg.fee_rate)  # uses new linear model
         edge = p_true - entry - fee
 
         if edge < cfg.edge_min:
@@ -1104,7 +1133,7 @@ class _MeanReversionEngine:
         if entry < cfg.min_market_prob_side or entry > cfg.max_market_prob_side:
             return None
 
-        max_frac = cfg.max_bet_fraction * 0.4
+        max_frac = cfg.max_bet_fraction * cfg.meanrev_size_mult
         c_eff = entry + fee
         if c_eff >= 1:
             return None
@@ -1113,7 +1142,7 @@ class _MeanReversionEngine:
             return None
         frac = clamp(kelly * 0.20, 0, max_frac)
         size = round(capital * frac, 2)
-        if size < 1.0:
+        if size < cfg.min_trade_size_usd:
             return None
 
         slug = state.slug or state.market_id[:20]
@@ -1189,9 +1218,10 @@ class _BTCStabilizationEngine:
         self._cl_ts = ts
 
     def _sigma_ps(self) -> float:
-        """Realized vol per second from last 10 minutes of BTC price data."""
+        """Realized vol per second from last N seconds of BTC price data."""
         now = time.time()
-        r = [(t, p) for t, p in self._ph if t >= now - 600]
+        window = self.cfg.btc_stab_vol_window_sec
+        r = [(t, p) for t, p in self._ph if t >= now - window]
         if len(r) < 6:
             return self.sigma_floor
         sq = []
@@ -1230,10 +1260,17 @@ class _BTCStabilizationEngine:
         swing = max(prices) - min(prices)
         # v4.2: volatility-adaptive swing tolerance
         sigma_ps = self._sigma_ps()
-        # 2-sigma band in "market price cents" (sigma_ps is in price-fraction/sec)
+        # N-sigma band in "market price cents" (sigma_ps is in price-fraction/sec)
         # Market price moves ~proportionally to BTC, so scale by 100¢
-        dynamic_swing = 2.0 * sigma_ps * math.sqrt(cfg.btc_stab_window_sec) * 100
-        max_swing = clamp(dynamic_swing, 0.03, cfg.btc_stab_max_swing)
+        dynamic_swing = (
+            cfg.btc_stab_sigma_band_mult
+            * sigma_ps
+            * math.sqrt(cfg.btc_stab_window_sec)
+            * 100
+        )
+        max_swing = clamp(
+            dynamic_swing, cfg.btc_stab_min_swing_floor, cfg.btc_stab_max_swing,
+        )
         return swing <= max_swing
 
     def evaluate(
@@ -1303,7 +1340,7 @@ class _BTCStabilizationEngine:
         # Brownian reversal probability
         sigma_ps = self._sigma_ps()
         # v4.2.1: stale CL penalty (same as ChainlinkArb v4.1.2)
-        t_eff = t_rem + oracle_age * 0.5
+        t_eff = t_rem + oracle_age * cfg.oracle_age_penalty_weight
         p_diff = p_brownian(delta, t_eff, sigma_ps)
 
         # v4.2: order book imbalance — penalize if opposing side has deeper book
@@ -1312,12 +1349,12 @@ class _BTCStabilizationEngine:
             own_depth = state.depth_yes if side == "YES" else state.depth_no
             opp_depth = state.depth_no if side == "YES" else state.depth_yes
             imbalance = (opp_depth - own_depth) / total_depth  # >0 means opposition deeper
-            if imbalance > 0.5:
+            if imbalance > cfg.btc_stab_imbalance_penalty_th:
                 # Heavy opposing book = market expects reversal, penalize
-                p_diff -= 0.02 * imbalance  # up to -2% at extreme imbalance
-            elif imbalance < -0.3:
+                p_diff -= cfg.btc_stab_imbalance_penalty_mag * imbalance
+            elif imbalance < cfg.btc_stab_imbalance_boost_th:
                 # Opposing side thin = exhausted sellers, slight boost
-                p_diff += 0.01
+                p_diff += cfg.btc_stab_imbalance_boost_mag
             p_diff = clamp(p_diff, 0.50, 0.98)
 
         # v4.0 linear fee model
@@ -1364,8 +1401,8 @@ class _BTCStabilizationEngine:
         size = round(capital * frac, 2)
         depth = state.depth_yes if side == "YES" else state.depth_no
         if depth > 0:
-            size = min(size, depth * 0.25)
-        if size < 1.0:
+            size = min(size, depth * cfg.btc_stab_depth_cap_ratio)
+        if size < cfg.min_trade_size_usd:
             return None
 
         slug = state.slug or state.market_id[:20]
@@ -1447,6 +1484,7 @@ class SignalEngine:
     ):
         self.cfg = cfg
         self.asset_symbol = asset_symbol.upper()
+        self.sigma_fallback = sigma_fallback
         self._cl = _ChainlinkArbEngine(cfg, sigma_fallback, delta_min_abs)
         self._mom = _MomentumEngine(cfg, sigma_fallback, delta_min_abs)
         self._rev = _MeanReversionEngine(cfg, sigma_fallback)

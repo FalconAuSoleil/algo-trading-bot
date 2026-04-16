@@ -118,9 +118,67 @@ class SignalConfig:
     # ── Fee model ──────────────────────────────────────────────────────────────────────────────────────────
     delta_min: float = _envf("DELTA_MIN", 0.0012)
     volatility_max: float = _envf("VOLATILITY_MAX", 0.0015)
-    volatility_window_minutes: int = 30
-    fee_rate: float = 0.02   # v4.0: corrected from 0.25 to match linear fee model
-    fee_exponent: int = 2
+    volatility_window_minutes: int = _envi("VOLATILITY_WINDOW_MINUTES", 30)
+    fee_rate: float = _envf("FEE_RATE", 0.02)   # v4.0: corrected from 0.25 to match linear fee model
+    fee_exponent: int = 2  # legacy, unused since v4.0 linear fee model
+
+    # ── ChainlinkArb engine internals (v4.3: exposed for optimization) ──────
+    # These were previously hardcoded magic numbers in _ChainlinkArbEngine.
+    # Defaults preserve v4.2.x behavior exactly.
+    momentum_short_window_sec: float = _envf("MOMENTUM_SHORT_WINDOW_SEC", 15.0)
+    momentum_inner_weight: float = _envf("MOMENTUM_INNER_WEIGHT", 0.2)
+    momentum_normalizer: float = _envf("MOMENTUM_NORMALIZER", 0.002)
+    chainlink_boost_gain: float = _envf("CHAINLINK_BOOST_GAIN", 1500.0)
+    chainlink_boost_clamp: float = _envf("CHAINLINK_BOOST_CLAMP", 1.5)
+    vol_window_chainlink_sec: float = _envf("VOL_WINDOW_CHAINLINK_SEC", 300.0)
+    oracle_age_penalty_weight: float = _envf("ORACLE_AGE_PENALTY_WEIGHT", 0.5)
+    min_viable_delta_sigma_mult: float = _envf("MIN_VIABLE_DELTA_SIGMA_MULT", 1.0)
+    blend_weight_min: float = _envf("BLEND_WEIGHT_MIN", 0.15)
+    blend_weight_max: float = _envf("BLEND_WEIGHT_MAX", 0.55)
+    overpaying_margin: float = _envf("OVERPAYING_MARGIN", 0.02)
+    hawkes_weak_threshold_mult: float = _envf("HAWKES_WEAK_THRESHOLD_MULT", 1.5)
+    hawkes_weak_size_mult: float = _envf("HAWKES_WEAK_SIZE_MULT", 0.7)
+    depth_size_cap_ratio: float = _envf("DEPTH_SIZE_CAP_RATIO", 0.3)
+    min_trade_size_usd: float = _envf("MIN_TRADE_SIZE_USD", 1.0)
+    confidence_high_score: float = _envf("CONFIDENCE_HIGH_SCORE", 0.10)
+    confidence_med_score: float = _envf("CONFIDENCE_MED_SCORE", 0.06)
+
+    # ── Momentum engine internals (v4.3) ────────────────────────────────────
+    momentum_time_min: float = _envf("MOMENTUM_TIME_MIN", 60.0)
+    momentum_time_max: float = _envf("MOMENTUM_TIME_MAX", 150.0)
+    momentum_window_short_sec: float = _envf("MOMENTUM_WINDOW_SHORT_SEC", 60.0)
+    momentum_window_mid_sec: float = _envf("MOMENTUM_WINDOW_MID_SEC", 120.0)
+    momentum_window_long_sec: float = _envf("MOMENTUM_WINDOW_LONG_SEC", 240.0)
+    momentum_direction_min_delta: float = _envf("MOMENTUM_DIRECTION_MIN_DELTA", 0.0005)
+    momentum_pdiff_min: float = _envf("MOMENTUM_PDIFF_MIN", 0.60)
+    momentum_pbayes_floor: float = _envf("MOMENTUM_PBAYES_FLOOR", 0.53)
+    momentum_pbayes_ceil: float = _envf("MOMENTUM_PBAYES_CEIL", 0.67)
+    momentum_strength_mult: float = _envf("MOMENTUM_STRENGTH_MULT", 20.0)
+    momentum_blend_min: float = _envf("MOMENTUM_BLEND_MIN", 0.2)
+    momentum_blend_max: float = _envf("MOMENTUM_BLEND_MAX", 0.45)
+    momentum_edge_min_mult: float = _envf("MOMENTUM_EDGE_MIN_MULT", 0.9)
+    momentum_size_mult: float = _envf("MOMENTUM_SIZE_MULT", 0.5)
+
+    # ── Mean Reversion engine internals (v4.3) ──────────────────────────────
+    meanrev_time_min: float = _envf("MEANREV_TIME_MIN", 90.0)
+    meanrev_time_max: float = _envf("MEANREV_TIME_MAX", 180.0)
+    meanrev_max_consec_losses: int = _envi("MEANREV_MAX_CONSEC_LOSSES", 2)
+    meanrev_sigma_boost: float = _envf("MEANREV_SIGMA_BOOST", 1.5)
+    meanrev_sigma_threshold_mult: float = _envf("MEANREV_SIGMA_THRESHOLD_MULT", 1.5)
+    meanrev_ptrue_floor: float = _envf("MEANREV_PTRUE_FLOOR", 0.52)
+    meanrev_ptrue_ceil: float = _envf("MEANREV_PTRUE_CEIL", 0.62)
+    meanrev_ptrue_mult: float = _envf("MEANREV_PTRUE_MULT", 8.0)
+    meanrev_size_mult: float = _envf("MEANREV_SIZE_MULT", 0.4)
+
+    # ── BTCStabilization engine internals (v4.3) ────────────────────────────
+    btc_stab_sigma_band_mult: float = _envf("BTC_STAB_SIGMA_BAND_MULT", 2.0)
+    btc_stab_min_swing_floor: float = _envf("BTC_STAB_MIN_SWING_FLOOR", 0.03)
+    btc_stab_imbalance_penalty_th: float = _envf("BTC_STAB_IMBALANCE_PENALTY_TH", 0.5)
+    btc_stab_imbalance_penalty_mag: float = _envf("BTC_STAB_IMBALANCE_PENALTY_MAG", 0.02)
+    btc_stab_imbalance_boost_th: float = _envf("BTC_STAB_IMBALANCE_BOOST_TH", -0.3)
+    btc_stab_imbalance_boost_mag: float = _envf("BTC_STAB_IMBALANCE_BOOST_MAG", 0.01)
+    btc_stab_depth_cap_ratio: float = _envf("BTC_STAB_DEPTH_CAP_RATIO", 0.25)
+    btc_stab_vol_window_sec: float = _envf("BTC_STAB_VOL_WINDOW_SEC", 600.0)
 
     # ── BTC 15m Stabilization strategy (v4.1) ─────────────────────────────────────────────────────
     # v4.1.1: relaxed thresholds to fire more often when one side has
@@ -136,7 +194,7 @@ class SignalConfig:
     btc_stab_price_max: float = _envf("BTC_STAB_PRICE_MAX", 0.85)
     btc_stab_time_min: float = _envf("BTC_STAB_TIME_MIN", 45.0)
     btc_stab_time_max: float = _envf("BTC_STAB_TIME_MAX", 300.0)
-    btc_stab_window_sec: float = 20.0
+    btc_stab_window_sec: float = _envf("BTC_STAB_WINDOW_SEC", 20.0)
     btc_stab_max_swing: float = _envf("BTC_STAB_MAX_SWING", 0.08)
     btc_stab_min_obs: int = _envi("BTC_STAB_MIN_OBS", 3)
     btc_stab_edge_min: float = _envf("BTC_STAB_EDGE_MIN", 0.020)
