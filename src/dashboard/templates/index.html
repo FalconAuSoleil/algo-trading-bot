@@ -251,13 +251,26 @@
     .badge-won { background: var(--green-bg); color: var(--green); }
     .badge-lost { background: var(--red-bg); color: var(--red); }
     .badge-pending { background: var(--yellow-bg); color: var(--yellow); }
+    .btn-sell {
+      margin-left: 6px;
+      padding: 2px 8px;
+      background: #dc2626;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-sell:hover { background: #b91c1c; }
+    .btn-sell:disabled { background: #4b5563; cursor: not-allowed; }
     .badge-early-exit { background: rgba(249,115,22,0.15); color: #f97316; }
     .badge-yes { background: var(--green-bg); color: var(--green); }
     .badge-no { background: var(--red-bg); color: var(--red); }
     .badge-topup { background: var(--purple); color: #fff; font-size: 9px; }
     .badge-exit { background: rgba(249,115,22,0.2); color: #f97316; font-size: 9px; }
-    .badge-rejected { background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.4); }
-    .badge-error { background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+    .badge-rejected { background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .badge-error { background: rgba(236, 72, 153, 0.12); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.4); }
 
     .wallet-card {
       background: var(--surface2);
@@ -1059,7 +1072,11 @@ function renderTrades() {
     } else if (t.outcome === 'cancelled') {
       outBadge = '<span class="badge" style="background:var(--surface2);color:var(--text-dim)">CANCELLED</span>';
     } else {
-      outBadge = '<span class="badge badge-pending">PENDING</span>';
+      // Add a manual Sell button for pending live trades
+      const sellBtn = (t.mode === 'live' && t.id)
+        ? ` <button class="btn-sell" onclick="sellPosition(${t.id})" title="Close this position at market">Sell</button>`
+        : '';
+      outBadge = '<span class="badge badge-pending">PENDING</span>' + sellBtn;
     }
 
     const pnlClass = (t.pnl || 0) > 0 ? 'positive' :
@@ -1086,6 +1103,32 @@ function renderTrades() {
       <td class="${pnlClass}">$${(t.pnl || 0).toFixed(2)}</td>
     </tr>`;
   }).join('');
+}
+
+async function sellPosition(tradeId) {
+  if (!confirm(`Close trade ${tradeId} at market (best_bid − 2%)?`)) return;
+  // Disable every Sell button for this trade row to prevent double-clicks
+  document.querySelectorAll(`button[onclick="sellPosition(${tradeId})"]`)
+    .forEach(b => { b.disabled = true; b.textContent = '…'; });
+  try {
+    const r = await fetch(`/api/positions/${tradeId}/sell`, { method: 'POST' });
+    const body = await r.json();
+    if (!r.ok) {
+      alert(`Sell failed: ${body.detail || r.statusText}`);
+      return;
+    }
+    alert(
+      `Sold trade ${tradeId}\n` +
+      `best_bid: ${body.best_bid.toFixed(4)}\n` +
+      `limit:    ${body.limit_price.toFixed(4)}\n` +
+      `PnL:      $${body.pnl.toFixed(2)}`
+    );
+  } catch (exc) {
+    alert(`Sell error: ${exc}`);
+  } finally {
+    document.querySelectorAll(`button[onclick="sellPosition(${tradeId})"]`)
+      .forEach(b => { b.disabled = false; b.textContent = 'Sell'; });
+  }
 }
 
 function renderCharts() {

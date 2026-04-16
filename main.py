@@ -162,6 +162,7 @@ class Orchestrator:
 
         if config.is_live and hasattr(self.trader, "start"):
             await self.trader.start()
+            dashboard_state.set_trader(self.trader)
 
         self._running = True
 

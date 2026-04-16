@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import requests
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -41,9 +42,13 @@ class DashboardState:
         self.wallet_last_updated: float = 0.0
         self._ws_clients: list[WebSocket] = []
         self._db = None
+        self._trader = None
 
     def set_db(self, db) -> None:
         self._db = db
+
+    def set_trader(self, trader) -> None:
+        self._trader = trader
 
     async def broadcast(self, data: dict) -> None:
         """Send update to all connected WebSocket clients."""
@@ -170,6 +175,60 @@ async def get_stats():
     if dashboard_state._db:
         return await dashboard_state._db.get_trade_stats()
     return dashboard_state.portfolio_stats
+
+
+@app.post("/api/positions/{trade_id}/sell")
+async def sell_position(trade_id: int, slippage_pct: float = 2.0):
+    """Manually close an open position by placing a SELL FAK at best_bid.
+
+    slippage_pct: accept fill up to N% below current best_bid (default 2%).
+    """
+    trader = dashboard_state._trader
+    if trader is None:
+        raise HTTPException(503, "trader not initialized (paper mode or startup)")
+
+    pending = getattr(trader, "_pending_resolutions", {})
+    info = pending.get(trade_id)
+    if not info:
+        raise HTTPException(404, f"trade {trade_id} not in pending resolutions")
+
+    token_id = info.get("token_id")
+    if not token_id:
+        raise HTTPException(400, f"trade {trade_id} has no token_id")
+
+    # Fetch current best_bid from CLOB
+    try:
+        loop = asyncio.get_event_loop()
+        def _fetch_book():
+            r = requests.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": token_id}, timeout=8,
+            )
+            r.raise_for_status()
+            return r.json()
+        book = await loop.run_in_executor(None, _fetch_book)
+    except Exception as exc:
+        raise HTTPException(502, f"orderbook fetch failed: {exc}")
+
+    bids = sorted(
+        book.get("bids", []),
+        key=lambda x: float(x["price"]), reverse=True,
+    )
+    if not bids:
+        raise HTTPException(409, "no resting bids — cannot sell")
+    best_bid = float(bids[0]["price"])
+    limit_price = round(best_bid * (1.0 - slippage_pct / 100.0), 4)
+
+    pnl = await trader.sell_position(trade_id, limit_price, "manual")
+    if pnl is None:
+        raise HTTPException(500, "sell order rejected — see bot logs")
+    return {
+        "ok": True,
+        "trade_id": trade_id,
+        "best_bid": best_bid,
+        "limit_price": limit_price,
+        "pnl": pnl,
+    }
 
 
 @app.websocket("/ws")
