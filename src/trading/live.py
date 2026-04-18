@@ -109,16 +109,50 @@ class LiveTrader:
             )
             return
 
+        if not self.cfg.wallet_address:
+            log.error(
+                "[Live] Cannot start: POLYMARKET_WALLET_ADDRESS not set in .env"
+            )
+            return
+
+        # Log credential summary at startup
+        wallet_short = self.cfg.wallet_address[:6] + "..." + self.cfg.wallet_address[-4:]
+        sig_labels = {0: "EOA direct", 1: "Email/Magic proxy", 2: "Polymarket Proxy (MetaMask)"}
+        log.info(f"[Live] Wallet EOA      : {wallet_short}")
+        log.info(f"[Live] Signature type  : {self.cfg.signature_type} ({sig_labels.get(self.cfg.signature_type, '?')})")
+        if self.cfg.signature_type != 0:
+            if not self.cfg.funder:
+                log.error(
+                    "[Live] signature_type=%d mais POLYMARKET_FUNDER vide — "
+                    "remplis l'adresse du proxy qui détient les USDC dans .env",
+                    self.cfg.signature_type,
+                )
+                return
+            funder_short = self.cfg.funder[:6] + "..." + self.cfg.funder[-4:]
+            log.info(f"[Live] Funder (proxy)  : {funder_short}  (adresse qui détient les USDC)")
+        if self.cfg.relayer_api_key:
+            rk_short = self.cfg.relayer_api_key[:8] + "..."
+            log.info(f"[Live] Relayer API key : {rk_short}  (stocké, dérivation auto depuis clé privée)")
+        if self.cfg.api_key and self.cfg.api_secret and self.cfg.api_passphrase:
+            log.info("[Live] Auth mode       : L2 explicite (api_key + secret + passphrase)")
+        else:
+            log.info("[Live] Auth mode       : dérivation depuis clé privée (create_or_derive_api_creds)")
+
         try:
             # Run synchronous ClobClient init in executor to avoid blocking
             def _init_client():
-                client = ClobClient(
+                kwargs = dict(
                     host=self.cfg.clob_url,
                     chain_id=POLYGON,
                     key=self.cfg.private_key,
-                    signature_type=0,       # EOA — raw private key (Phantom/MetaMask new wallet)
+                    signature_type=self.cfg.signature_type,
                 )
-                # Use pre-configured API key if available, else derive it
+                if self.cfg.signature_type != 0 and self.cfg.funder:
+                    kwargs["funder"] = self.cfg.funder
+                client = ClobClient(**kwargs)
+                # Priorité : creds explicites dans .env → sinon dérivation depuis private_key.
+                # RELAYER_API_KEY (UUID) seul ne suffit pas : il faut aussi api_secret
+                # et api_passphrase. Sans les 3, on dérive — même résultat, juste plus lent.
                 if self.cfg.api_key and self.cfg.api_secret and self.cfg.api_passphrase:
                     from py_clob_client.clob_types import ApiCreds
                     creds = ApiCreds(
@@ -126,11 +160,12 @@ class LiveTrader:
                         api_secret=self.cfg.api_secret,
                         api_passphrase=self.cfg.api_passphrase,
                     )
+                    log.info("[Live] Credentials chargées depuis .env")
                 else:
                     creds = client.create_or_derive_api_creds()
                     log.info(
-                        "[Live] Derived API creds from private key "
-                        "(no explicit creds in .env)"
+                        f"[Live] Credentials dérivées depuis clé privée "
+                        f"(api_key={creds.api_key[:8]}...)"
                     )
                 client.set_api_creds(creds)
                 return client
@@ -207,12 +242,21 @@ class LiveTrader:
                     self.portfolio.balance = real_usdc
                     self.portfolio.initial_balance = real_usdc
                     self.portfolio._peak_balance = real_usdc
-                    log.info(
-                        "[Live] Portfolio synced to real wallet balance: $%.2f",
-                        real_usdc,
-                    )
-                else:
-                    log.warning("[Live] Wallet balance is $0 — cannot trade")
+                    log.info("=" * 50)
+                    log.info("  WALLET BALANCE LIVE")
+                    log.info("  USDC.e dispo  : $%.2f", real_usdc)
+                    log.info("  Wallet        : %s", self.cfg.wallet_address)
+                    log.info("  Capital actif : $%.2f  (100%% du wallet)", real_usdc)
+                    log.info("  Max par pari  : $%.2f  (%.0f%% Kelly × %.0f%% cap)",
+                             real_usdc * 0.04 * 0.25,
+                             0.25 * 100, 0.04 * 100)
+                    log.info("=" * 50)
+                elif real_usdc == 0:
+                    log.warning("=" * 50)
+                    log.warning("  WALLET BALANCE = $0.00")
+                    log.warning("  Verifie le wallet %s", self.cfg.wallet_address)
+                    log.warning("  ou lance approve_allowances.py")
+                    log.warning("=" * 50)
             except Exception as exc:
                 log.warning("[Live] Balance sync failed: %s", exc, exc_info=True)
 
@@ -301,14 +345,18 @@ class LiveTrader:
         """
         if signal.action != "BUY" or not signal.filters_passed:
             return None
-        # Polymarket minimum: $2 notional OR 5 shares, whichever is larger
+
+        # Polymarket minimum: $1 notional OR 5 shares, whichever is larger.
+        # On clamp TOUJOURS vers le minimum Polymarket — même si Kelly dit moins,
+        # c'est préférable à un ordre rejeté. Le sizing reste borné par la balance.
         POLY_MIN_SHARES = 5
-        poly_min_usd = max(2.0, POLY_MIN_SHARES * signal.entry_price)
+        POLY_MIN_USD = 1.0
+        poly_min_usd = max(POLY_MIN_USD, POLY_MIN_SHARES * signal.entry_price)
         size_usd = signal.size_usd
         if size_usd < poly_min_usd:
             log.info(
-                "[Live] Size clamped $%.2f → $%.2f (min %d shares @ %.4f)",
-                size_usd, poly_min_usd, POLY_MIN_SHARES, signal.entry_price,
+                "[Live] Size clamped $%.2f -> $%.2f (min Polymarket: $%.1f ou %d shares @ %.4f)",
+                size_usd, poly_min_usd, POLY_MIN_USD, POLY_MIN_SHARES, signal.entry_price,
             )
             size_usd = poly_min_usd
         if signal.time_remaining_sec < 45.0:
@@ -340,14 +388,21 @@ class LiveTrader:
             log.error("[Live] Invalid entry price: %.4f", entry_price)
             return None
 
-        # Never bet more than available portfolio balance (safety cap)
+        # Never bet more than available portfolio balance (safety cap).
+        # Vérification AVANT l'insert DB pour éviter des lignes "rejected" inutiles.
         max_size = round(self.portfolio.balance * 0.95, 2)
+        if max_size < poly_min_usd:
+            log.warning(
+                "[Live] Balance $%.2f insuffisante pour le minimum Polymarket $%.2f -> skip",
+                self.portfolio.balance, poly_min_usd,
+            )
+            return None
         if size_usd > max_size:
             log.info(
-                "[Live] Size capped $%.2f → $%.2f (95%% of balance $%.2f)",
+                "[Live] Size capped $%.2f -> $%.2f (95%% of balance $%.2f)",
                 size_usd, max_size, self.portfolio.balance,
             )
-            size_usd = max(POLY_MIN_USD, max_size)
+            size_usd = max(poly_min_usd, max_size)
 
         shares = round(size_usd / entry_price, 2)
 

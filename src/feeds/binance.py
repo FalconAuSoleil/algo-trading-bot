@@ -44,6 +44,9 @@ class BinanceFeed:
 
     async def start(self) -> None:
         self._running = True
+        _backoff = 2.0   # délai initial de reconnect
+        _backoff_max = 60.0
+        _connected_once = False
         while self._running:
             try:
                 log.info("[Binance] %s: Connecting to %s", self.symbol, self.url)
@@ -52,6 +55,8 @@ class BinanceFeed:
                 ) as ws:
                     self._ws = ws
                     log.info("[Binance] %s: Connected", self.symbol)
+                    _backoff = 2.0   # reset backoff après connexion réussie
+                    _connected_once = True
                     async for message in ws:
                         if not self._running:
                             break
@@ -59,14 +64,24 @@ class BinanceFeed:
             except ConnectionClosed:
                 if self._running:
                     log.warning(
-                        "[Binance] %s: Connection closed, reconnecting...",
-                        self.symbol,
+                        "[Binance] %s: Connection closed, reconnect dans %.0fs...",
+                        self.symbol, _backoff,
                     )
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(_backoff)
+                    _backoff = min(_backoff * 1.5, _backoff_max)
+            except OSError as e:
+                # DNS/réseau temporairement indisponible (gaierror errno 11001)
+                if self._running:
+                    lvl = log.debug if not _connected_once else log.warning
+                    lvl("[Binance] %s: Réseau indispo (%s), retry dans %.0fs...",
+                        self.symbol, e, _backoff)
+                    await asyncio.sleep(_backoff)
+                    _backoff = min(_backoff * 2, _backoff_max)
             except Exception as e:
                 if self._running:
-                    log.error("[Binance] %s: Error: %s", self.symbol, e)
-                    await asyncio.sleep(5)
+                    log.error("[Binance] %s: Erreur inattendue: %s", self.symbol, e)
+                    await asyncio.sleep(_backoff)
+                    _backoff = min(_backoff * 1.5, _backoff_max)
 
     async def _handle_message(self, raw: str) -> None:
         try:

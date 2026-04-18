@@ -209,6 +209,37 @@ class SignalConfig:
     peak_start_hour_et: int = _envi("PEAK_START_HOUR_ET", 8)
     peak_end_hour_et: int = _envi("PEAK_END_HOUR_ET", 18)
 
+    # ── Circuit breaker (v5.1) ───────────────────────────────────────────────────
+    # Hard market-knowledge rules encoded as time gates.
+    # All times expressed in CB_TIMEZONE (default: Europe/Paris).
+    #   Saturday          → fully blocked (dead spreads, no participants)
+    #   03:30–05:00       → dead zone (near-zero activity)
+    #   00:45–01:30       → volatile window (Polymarket market-close spike, allow)
+    #   Mon–Wed 14:00–1h  → peak hours (best liquidity & signal quality)
+    cb_timezone: str = _env("CB_TIMEZONE", "Europe/Paris")
+    cb_block_saturday: bool = _env("CB_BLOCK_SATURDAY", "true").lower() in ("true", "1")
+    cb_dead_zone_start_h: int = _envi("CB_DEAD_ZONE_START_H", 3)
+    cb_dead_zone_start_m: int = _envi("CB_DEAD_ZONE_START_M", 30)
+    cb_dead_zone_end_h: int   = _envi("CB_DEAD_ZONE_END_H",   5)
+    cb_dead_zone_end_m: int   = _envi("CB_DEAD_ZONE_END_M",   0)
+    # Volatile window: AFTER the Polymarket refresh delay (~5 min after close).
+    # Polymarket closes markets at 01:00 Paris and takes ~5 min to publish
+    # new ones. Start at 01:05 to avoid betting on stale/incomplete orderbooks.
+    cb_volatile_start_h: int  = _envi("CB_VOLATILE_START_H",  1)
+    cb_volatile_start_m: int  = _envi("CB_VOLATILE_START_M",  5)
+    cb_volatile_end_h: int    = _envi("CB_VOLATILE_END_H",    1)
+    cb_volatile_end_m: int    = _envi("CB_VOLATILE_END_M",   35)
+
+    # ── BTC-specific parameter overrides (v5.1) ──────────────────────────────────
+    # When set (> 0), these override the GLOBAL values for BTC engines ONLY.
+    # ETH / SOL / XRP always use the global EDGE_MIN, OFFPEAK_EDGE_MULT etc.
+    # above — those assets are performing well and must not be disrupted.
+    # Set via optimize.py grid search output. Leave at 0.0 / 0 to use globals.
+    btc_edge_min:              float = _envf("BTC_EDGE_MIN",              0.0)
+    btc_offpeak_edge_mult:     float = _envf("BTC_OFFPEAK_EDGE_MULT",     0.0)
+    btc_stability_min_samples: int   = _envi("BTC_STABILITY_MIN_SAMPLES", 0)
+    btc_volatility_max:        float = _envf("BTC_VOLATILITY_MAX",        0.0)
+
     # ── Off-peak adaptive mode (v4.2) ────────────────────────────────────────────
     # Bot still trades 24/7 but is MORE CONSERVATIVE at night/weekends:
     # higher edge floor, smaller bets. Lower vol + fewer participants + staler
@@ -262,14 +293,42 @@ class RiskConfig:
 
 @dataclass(frozen=True)
 class PolymarketConfig:
-    api_key: str = _env("POLYMARKET_API_KEY")
-    api_secret: str = _env("POLYMARKET_API_SECRET")
+    # ── L2 API credentials (optionnel — dérivés automatiquement si absents) ──
+    # Si api_key + api_secret + api_passphrase sont tous remplis → utilisés directement.
+    # Sinon → dérivés depuis private_key via create_or_derive_api_creds() au démarrage.
+    api_key:        str = _env("POLYMARKET_API_KEY")
+    api_secret:     str = _env("POLYMARKET_API_SECRET")
     api_passphrase: str = _env("POLYMARKET_API_PASSPHRASE")
+
+    # ── Wallet principal (requis en live) ────────────────────────────────────
     wallet_address: str = _env("POLYMARKET_WALLET_ADDRESS")
-    private_key: str = _env("POLYMARKET_PRIVATE_KEY")
-    clob_url: str = "https://clob.polymarket.com"
-    gamma_url: str = "https://gamma-api.polymarket.com"
-    rtds_url: str = "wss://ws-live-data.polymarket.com"
+    private_key:    str = _env("POLYMARKET_PRIVATE_KEY")
+
+    # ── Relayer API (v5.1) ──────────────────────────────────────────────────
+    # RELAYER_API_KEY est le UUID de la L2 API key Polymarket (même format
+    # que api_key). Stocké ici pour référence et logs. Le code dérive les
+    # credentials complets (key+secret+passphrase) depuis private_key au
+    # démarrage — le relayer key seul ne suffit pas sans son secret.
+    relayer_api_key:         str = _env("RELAYER_API_KEY")
+    relayer_api_key_address: str = _env("RELAYER_API_KEY_ADDRESS")
+
+    # ── Proxy wallet (pour comptes Polymarket web — MetaMask/Magic) ────────
+    # Polymarket stocke souvent les fonds sur un Safe-proxy contrôlé par
+    # l'EOA, pas directement sur l'EOA. Si le solde de l'EOA est $0 mais
+    # que tu as des fonds visibles sur polymarket.com, c'est ça.
+    #
+    # - POLYMARKET_SIGNATURE_TYPE=0  → EOA (fonds sur la clé privée)         [défaut]
+    # - POLYMARKET_SIGNATURE_TYPE=1  → Email/Magic login proxy
+    # - POLYMARKET_SIGNATURE_TYPE=2  → Polymarket Proxy (MetaMask browser)
+    #
+    # POLYMARKET_FUNDER = adresse du proxy qui détient les USDC
+    # (obligatoire si signature_type != 0).
+    signature_type: int = _envi("POLYMARKET_SIGNATURE_TYPE", 0)
+    funder:         str = _env("POLYMARKET_FUNDER")
+
+    clob_url:    str = "https://clob.polymarket.com"
+    gamma_url:   str = "https://gamma-api.polymarket.com"
+    rtds_url:    str = "wss://ws-live-data.polymarket.com"
     clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
 
 

@@ -142,7 +142,10 @@ class Orchestrator:
                 "5m+15m" if len(a.supported_intervals) > 1 else "15m only",
                 a.chainlink_address[:10],
             )
-        log.info("  Mode: %s | Capital: $%.2f", config.trading_mode.upper(), config.paper_initial_balance)
+        if config.is_live:
+            log.info("  Mode: LIVE | Capital: syncing depuis wallet on-chain...")
+        else:
+            log.info("  Mode: PAPER | Capital: $%.2f", config.paper_initial_balance)
         log.info("  BTC 15m: BTCStabilization 24/7 (T=60-180s, 63-80¢)")
         log.info("  BTC 5m + ETH/SOL/XRP: ChainlinkArb peak hours only (Mon-Fri 08-18h ET)")
         log.info("=" * 60)
@@ -796,22 +799,31 @@ class Orchestrator:
                 await dashboard_state.update_portfolio(self.portfolio.get_stats())
 
     async def _wallet_balance_loop(self) -> None:
-        """Live mode only — poll real USDC.e balance from CLOB every 30s."""
-        await asyncio.sleep(5)  # let client finish init first
+        """Live mode only — poll real USDC.e balance from CLOB every 30s.
+        Log au niveau INFO uniquement quand le solde change de plus de $1
+        (evite le spam en logs, mais reste visible apres chaque trade).
+        """
+        await asyncio.sleep(5)  # laisser le client finir l'init d'abord
+        _last_logged_balance: float = -1.0
         while self._running:
             try:
                 client = getattr(self.trader, "_client", None)
-                loop = getattr(self.trader, "_loop", None)
+                loop   = getattr(self.trader, "_loop", None)
                 if client and loop:
                     def _fetch():
                         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
                         return client.get_balance_allowance(
                             params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
                         )
-                    bal = await loop.run_in_executor(None, _fetch)
+                    bal  = await loop.run_in_executor(None, _fetch)
                     usdc = float(bal.get("balance", 0.0)) / 1_000_000
                     await dashboard_state.update_wallet_balance(usdc)
-                    log.debug("[Wallet] USDC.e balance: $%.2f", usdc)
+                    # Log INFO si le solde a change de plus de $1 depuis le dernier log
+                    if abs(usdc - _last_logged_balance) >= 1.0:
+                        log.info("[Wallet] USDC.e : $%.2f", usdc)
+                        _last_logged_balance = usdc
+                    else:
+                        log.debug("[Wallet] USDC.e : $%.2f (inchange)", usdc)
             except Exception as exc:
                 log.debug("[Wallet] Balance fetch error: %s", exc)
             await asyncio.sleep(30)
@@ -864,7 +876,35 @@ def main():
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    asyncio.run(Orchestrator().start())
+    async def _run():
+        # Supprime les tracebacks internes d'aiohttp sur gaierror (DNS flap) :
+        # ces erreurs viennent de tâches "shielded" qu'on ne peut pas catch
+        # normalement. On les downgrade en WARNING propre sans stacktrace.
+        loop = asyncio.get_event_loop()
+
+        def _asyncio_exception_handler(loop, context):
+            exc = context.get("exception")
+            msg = context.get("message", "")
+            # gaierror = DNS lookup échoué pendant reconnect — transitoire, pas fatal
+            if isinstance(exc, OSError) and getattr(exc, "errno", None) == 11001:
+                log.debug("[Net] DNS lookup échoué (reconnect en cours) — transitoire")
+                return
+            # Filtre les "Future exception was never retrieved" liés aux WS
+            if "Future exception was never retrieved" in msg:
+                inner = exc or context.get("future")
+                if isinstance(inner, OSError):
+                    log.debug("[Net] WS future ignoré: %s", inner)
+                    return
+            # Tout le reste → log WARNING propre sans spammer le terminal
+            if exc:
+                log.warning("[Asyncio] Exception non rattrapée: %s — %s", type(exc).__name__, exc)
+            else:
+                log.warning("[Asyncio] %s", msg)
+
+        loop.set_exception_handler(_asyncio_exception_handler)
+        await Orchestrator().start()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

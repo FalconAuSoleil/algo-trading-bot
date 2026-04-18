@@ -97,9 +97,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import dataclasses
+
 from src.config import SignalConfig, config as _global_cfg
 from src.engine.performance import PerformanceTracker
 from src.engine.cross_market import CrossMarketBooster
+from src.engine.circuit_breaker import should_trade as _cb_should_trade
 from src.utils.logger import setup_logger
 
 log = setup_logger("engine.signal")
@@ -1485,11 +1488,28 @@ class SignalEngine:
         self.cfg = cfg
         self.asset_symbol = asset_symbol.upper()
         self.sigma_fallback = sigma_fallback
-        self._cl = _ChainlinkArbEngine(cfg, sigma_fallback, delta_min_abs)
-        self._mom = _MomentumEngine(cfg, sigma_fallback, delta_min_abs)
-        self._rev = _MeanReversionEngine(cfg, sigma_fallback)
+
+        # v5.1: BTC gets its own cfg with per-asset overrides so ETH/SOL/XRP
+        # are never affected by BTC-specific grid-search tuning.
+        if self.asset_symbol == "BTC":
+            _ov: dict = {}
+            if cfg.btc_edge_min > 0:
+                _ov["edge_min"] = cfg.btc_edge_min
+            if cfg.btc_offpeak_edge_mult > 0:
+                _ov["offpeak_edge_multiplier"] = cfg.btc_offpeak_edge_mult
+            if cfg.btc_stability_min_samples > 0:
+                _ov["stability_min_samples"] = cfg.btc_stability_min_samples
+            if cfg.btc_volatility_max > 0:
+                _ov["volatility_max"] = cfg.btc_volatility_max
+            _engine_cfg = dataclasses.replace(cfg, **_ov) if _ov else cfg
+        else:
+            _engine_cfg = cfg   # ETH/SOL/XRP: global params, untouched
+
+        self._cl = _ChainlinkArbEngine(_engine_cfg, sigma_fallback, delta_min_abs)
+        self._mom = _MomentumEngine(_engine_cfg, sigma_fallback, delta_min_abs)
+        self._rev = _MeanReversionEngine(_engine_cfg, sigma_fallback)
         # v4.1: BTC 15m stabilization engine
-        self._btc_stab = _BTCStabilizationEngine(cfg, sigma_fallback, delta_min_abs)
+        self._btc_stab = _BTCStabilizationEngine(_engine_cfg, sigma_fallback, delta_min_abs)
         self.perf = PerformanceTracker(window=30)
         self.cross_market = CrossMarketBooster()
 
@@ -1548,6 +1568,16 @@ class SignalEngine:
                     / state.reference_price
                 )
             return sig
+
+        # ── v5.1: CIRCUIT BREAKER ────────────────────────────────────────────────
+        # Hard market-knowledge gate (Saturday, dead zone 03:30-05:00, etc.)
+        # before any strategy routing. Uses self.cfg (original, unmodified)
+        # because CB rules (timezone, blocked windows) are GLOBAL by design —
+        # same rules apply to BTC, ETH, SOL, XRP. Do not replace with the
+        # BTC-overridden _engine_cfg.
+        _cb_ok, _cb_reason = _cb_should_trade(now, self.cfg)
+        if not _cb_ok:
+            return _blank(f"CB_{_cb_reason}")
 
         # ── v4.2.1: ROUTING ────────────────────────────────────────────────────
         is_15m = state.duration_seconds >= 900 or "15m" in (state.slug or "")
@@ -1694,6 +1724,7 @@ class SignalEngine:
                     # Progressive penalty: 3→0.7x, 4→0.5x, 5+→0.35x sizing
                     exhaust_mult = max(0.35, 1.0 - 0.15 * streak_n)
                     best.size_usd = round(best.size_usd * exhaust_mult, 2)
+                    # Seuil Polymarket minimum $1 — en dessous c'est inutile d'envoyer
                     if best.size_usd < 1.0:
                         best.action = "HOLD"
                         best.filters_passed = False

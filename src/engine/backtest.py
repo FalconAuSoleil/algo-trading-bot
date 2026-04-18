@@ -202,8 +202,28 @@ class Backtester:
         self.verbose = verbose
 
         asset_cfg = config.get_asset_config("BTC")
+
+        # v5.1: Apply BTC-specific overrides identically to SignalEngine.__init__.
+        # Without this, grid search (optimize.py) would silently test the global
+        # EDGE_MIN / OFFPEAK_EDGE_MULT etc. instead of the BTC_* overrides.
+        import dataclasses as _dc
+        _scfg = config.signal
+        _ov: dict = {}
+        if _scfg.btc_edge_min > 0:
+            _ov["edge_min"] = _scfg.btc_edge_min
+        if _scfg.btc_offpeak_edge_mult > 0:
+            _ov["offpeak_edge_multiplier"] = _scfg.btc_offpeak_edge_mult
+        if _scfg.btc_stability_min_samples > 0:
+            _ov["stability_min_samples"] = _scfg.btc_stability_min_samples
+        if _scfg.btc_volatility_max > 0:
+            _ov["volatility_max"] = _scfg.btc_volatility_max
+        _bt_cfg = _dc.replace(_scfg, **_ov) if _ov else _scfg
+
+        if verbose and _ov:
+            print(f"[Backtest] BTC overrides active: {_ov}")
+
         self.engine = _ChainlinkArbEngine(
-            cfg=config.signal,
+            cfg=_bt_cfg,
             sigma_fallback=asset_cfg.sigma_fallback,
             delta_min_abs=asset_cfg.delta_min_abs,
         )
