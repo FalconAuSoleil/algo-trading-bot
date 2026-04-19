@@ -127,7 +127,7 @@ class Orchestrator:
         self._running = False
         self._snapshot_interval = 60
         self._strategy_by_trade: dict[int, str] = {}
-        self._pending_topups: dict[int, dict] = {}  # v5: staged entry reserves
+        # v5.2: staged entry retired — kept as empty dict for back-compat
         # cooldown: market_id → expiry timestamp (no retry before this time)
         self._market_cooldowns: dict[str, float] = {}
 
@@ -410,21 +410,8 @@ class Orchestrator:
                 if time.time() < cooldown_until:
                     continue
 
-                # v5: staged entry — split bet if very confident
-                original_size = sig.size_usd
-                reserve_usd = 0.0
-                if (
-                    config.signal.staged_entry_enabled
-                    and sig.p_true >= config.signal.staged_min_confidence
-                    and sig.time_remaining_sec > config.signal.staged_topup_min_t_rem
-                ):
-                    sig.size_usd = round(
-                        original_size * config.signal.staged_initial_fraction, 2
-                    )
-                    reserve_usd = round(
-                        original_size * config.signal.staged_topup_fraction, 2
-                    )
-
+                # v5.2: staged entry retire. Early exit gere les trades qui
+                # tournent mal au lieu de doubler dessus.
                 trade_id = await self.trader.execute(sig)
 
                 # Live mode: push rejected/errored trades to dashboard
@@ -446,31 +433,6 @@ class Orchestrator:
 
                 if trade_id:
                     self._strategy_by_trade[trade_id] = sig.strategy_used
-
-                    # v5: track staged entry reserve for topup
-                    if reserve_usd > 0:
-                        self._pending_topups[trade_id] = {
-                            "reserve_usd": reserve_usd,
-                            "entry_price": sig.entry_price,
-                            "market_id": cid,
-                            "slug": market.slug,
-                            "symbol": symbol,
-                            "side": sig.side,
-                            "p_true_at_entry": sig.p_true,
-                            "reference_price": sig.reference_price,
-                            "sigma": sig.sigma,
-                            "end_time": time.time() + sig.time_remaining_sec,
-                            "duration": market.duration_seconds,
-                            "token_id_yes": market.token_id_up,
-                            "token_id_no": market.token_id_down,
-                            "topped_up": False,
-                        }
-                        log.info(
-                            "[Staged] Reserved $%.2f topup for trade %d "
-                            "(initial $%.2f, p_true=%.1f%%)",
-                            reserve_usd, trade_id, sig.size_usd,
-                            sig.p_true * 100,
-                        )
 
                     full = await self.db.get_trade(trade_id)
                     if full:
@@ -501,8 +463,6 @@ class Orchestrator:
                         strategy = self._strategy_by_trade.pop(
                             trade_id, r.get("strategy_used", "chainlink_arb")
                         )
-                        # v5: clean up staged entry reserve
-                        self._pending_topups.pop(trade_id, None)
 
                         # Resolve asset symbol from trade slug
                         symbol = "BTC"
@@ -552,12 +512,11 @@ class Orchestrator:
             await asyncio.sleep(3)
 
     async def _monitor_positions(self) -> None:
-        """v5: Monitor open positions for early exit and topup opportunities."""
+        """v5.2: Monitor open positions for early exit. Staged topup retired."""
         while self._running:
             try:
                 if self.portfolio.open_position_count > 0:
                     await self._check_early_exits()
-                    await self._check_topups()
             except Exception as exc:
                 log.error("[Monitor] Loop error: %s", exc, exc_info=True)
             await asyncio.sleep(4)
@@ -624,11 +583,31 @@ class Orchestrator:
             # ── Check exit modes ────────────────────────────────────────
             sell_reason = None
 
-            # Mode A: p_true collapse (original conservative logic)
+            # Mode C (v5.2): delta FLIP — le signal s'est inverse par rapport
+            # a notre bet. Si on est UP et que delta est devenu negatif (BTC
+            # est passe sous le strike), c'est un signal fort que le marche
+            # a bouge contre nous. On vend tres vite (juste apres 20% ecoule).
+            # Remplace le role pervers que staged-topup jouait : au lieu de
+            # doubler quand l'ask plonge, on coupe.
             if (
-                elapsed > pos.duration_seconds / 2.0
+                pos.delta_at_entry != 0
+                and delta_now * pos.delta_at_entry < 0  # signe oppose
+                and elapsed > pos.duration_seconds * 0.15
+            ):
+                sell_reason = "delta_flip"
+
+            # Mode A: p_true collapse. Seuils assouplis pour couper plus tot.
+            # On coupe des que :
+            #   - >30% du market ecoule (avant : 50%)
+            #   - p_true_now < early_exit_p_true_floor (0.45 par defaut v5.2)
+            #   - p_true_now < p_true_entree x (1 - drop_pct)  (0.35 par defaut)
+            if sell_reason is None and (
+                elapsed > pos.duration_seconds * 0.30
                 and p_true_now < config.signal.early_exit_p_true_floor
-                and (pos.p_true_at_entry <= 0 or p_true_now < pos.p_true_at_entry * (1.0 - config.signal.early_exit_p_true_drop_pct))
+                and (
+                    pos.p_true_at_entry <= 0
+                    or p_true_now < pos.p_true_at_entry * (1.0 - config.signal.early_exit_p_true_drop_pct)
+                )
             ):
                 sell_reason = "p_true_collapse"
 
@@ -683,119 +662,6 @@ class Orchestrator:
                 trade_id, best_bid, sell_reason
             )
             if pnl is not None:
-                self._pending_topups.pop(trade_id, None)
-                await dashboard_state.update_portfolio(self.portfolio.get_stats())
-
-    async def _check_topups(self) -> None:
-        """Check if any staged entry reserves should be deployed.
-
-        Conditions for topup (ALL must be true):
-        1. staged_entry_enabled in config
-        2. Reserve exists and hasn't been used
-        3. p_true_now >= staged_topup_min_p_true (still favorable)
-        4. Price has dipped: current_ask < entry_price - dip_threshold
-        5. time_remaining > staged_topup_min_t_rem
-        """
-        if not config.signal.staged_entry_enabled:
-            return
-
-        now = time.time()
-
-        for trade_id, topup in list(self._pending_topups.items()):
-            if topup.get("topped_up"):
-                continue
-
-            # Check position still exists
-            if trade_id not in self.portfolio.open_positions:
-                self._pending_topups.pop(trade_id, None)
-                continue
-
-            t_rem = topup["end_time"] - now
-            if t_rem < config.signal.staged_topup_min_t_rem:
-                # Too late for topup, release reserve
-                self._pending_topups.pop(trade_id, None)
-                continue
-
-            symbol = topup["symbol"]
-            prices = self._asset_prices.get(symbol, {})
-            chainlink_now = prices.get("chainlink", 0.0)
-            if chainlink_now <= 0:
-                continue
-
-            ref_price = topup["reference_price"]
-            if ref_price <= 0:
-                continue
-
-            # Recalculate p_true
-            delta_now = (chainlink_now - ref_price) / ref_price
-            if topup["side"] == "NO":
-                delta_now = -delta_now
-
-            engine = self._signal_engines.get(symbol)
-            sigma = engine.sigma_fallback if engine else 0.005 / (300 ** 0.5)
-
-            p_true_now = p_brownian(abs(delta_now), t_rem, sigma)
-            if delta_now < 0:
-                p_true_now = 1.0 - p_true_now
-
-            if p_true_now < config.signal.staged_topup_min_p_true:
-                continue  # not confident enough
-
-            # Check price dip on our side
-            ob = self._orderbooks.get(topup["market_id"])
-            if not ob:
-                continue
-
-            if topup["side"] == "YES":
-                current_ask = ob.best_ask_yes if hasattr(ob, 'best_ask_yes') else (ob.best_ask_up if hasattr(ob, 'best_ask_up') else 1.0)
-            else:
-                current_ask = ob.best_ask_no if hasattr(ob, 'best_ask_no') else (ob.best_ask_down if hasattr(ob, 'best_ask_down') else 1.0)
-
-            price_drop = topup["entry_price"] - current_ask
-            if price_drop < config.signal.staged_dip_threshold:
-                continue  # not enough dip
-
-            # All conditions met — deploy reserve as topup trade
-            reserve = topup["reserve_usd"]
-            log.info(
-                "[Staged] TOPUP trade %d | $%.2f reserve | "
-                "ask=%.4f (dip=%.4f) | p_true=%.1f%%",
-                trade_id, reserve, current_ask, price_drop,
-                p_true_now * 100,
-            )
-
-            # Build a minimal signal for the topup trade
-            topup_sig = Signal(
-                market_id=topup["market_id"],
-                action="BUY",
-                filters_passed=True,
-                side=topup["side"],
-                entry_price=current_ask,
-                size_usd=reserve,
-                slug=topup["slug"],
-                time_remaining_sec=t_rem,
-                delta_chainlink=delta_now,
-                sigma=sigma,
-                p_true=p_true_now,
-                p_market=current_ask,
-                edge=p_true_now - current_ask,
-                reference_price=ref_price,
-                market_start_time=topup["end_time"] - topup["duration"],
-                market_duration=topup["duration"],
-                strategy_used="staged_topup",
-                oracle_age_sec=0.0,
-            )
-            topup_sig.token_id_yes = topup.get("token_id_yes", "")
-            topup_sig.token_id_no = topup.get("token_id_no", "")
-
-            topup_trade_id = await self.trader.execute(topup_sig)
-            if topup_trade_id:
-                self._pending_topups.pop(trade_id, None)
-                self._strategy_by_trade[topup_trade_id] = "staged_topup"
-                log.info(
-                    "[Staged] Topup executed: trade %d (parent %d) | $%.2f @ %.4f",
-                    topup_trade_id, trade_id, reserve, current_ask,
-                )
                 await dashboard_state.update_portfolio(self.portfolio.get_stats())
 
     async def _wallet_balance_loop(self) -> None:
