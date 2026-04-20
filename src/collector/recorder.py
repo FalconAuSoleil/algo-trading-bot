@@ -13,6 +13,7 @@ All timestamps are float unix seconds. All prices are USD floats.
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -28,6 +29,24 @@ log = setup_logger("collector.recorder")
 
 
 FLUSH_INTERVAL = 3.0  # seconds between batch writes
+
+# ── Firehose throttles (disk-blowout guards) ──────────────────────────────
+# The Polymarket market-channel WS pumps thousands of events/s; without
+# throttling the DB grows ~5 GB/day. Defaults are tuned to keep it at
+# ~500 MB/day while still providing enough data for replay.
+#
+# Knobs (env vars, all optional):
+#   COLLECTOR_WS_RAW_ENABLED     "0" to drop the ws_events firehose entirely
+#                                (default: "0" — you rarely need raw bytes).
+#   COLLECTOR_DELTAS_SAMPLE_N    Keep 1 of every N price_change deltas per
+#                                asset. Default: 10.
+#   COLLECTOR_MAX_DB_MB          If the DB file exceeds this many MB, stop
+#                                writing deltas/ws_events (keep the "clean"
+#                                tables: markets/snapshots/trades/signals).
+#                                Default: 4000 (~4 GB).
+WS_RAW_ENABLED = os.environ.get("COLLECTOR_WS_RAW_ENABLED", "0") in ("1", "true", "True")
+DELTAS_SAMPLE_N = max(1, int(os.environ.get("COLLECTOR_DELTAS_SAMPLE_N", "10")))
+MAX_DB_MB = float(os.environ.get("COLLECTOR_MAX_DB_MB", "4000"))
 
 
 @dataclass
@@ -56,6 +75,13 @@ class CollectorRecorder:
 
     _running: bool = False
     _flush_task: asyncio.Task | None = None
+
+    # Per-asset counter for delta sampling (1 in N keeps index % N == 0).
+    _delta_counter: dict[str, int] = field(default_factory=dict)
+    # Cached "DB too big, stop firehosing" flag — refreshed by the flush
+    # loop (cheap) to avoid stat()ing the file on every hot-path call.
+    _firehose_blocked: bool = False
+    _firehose_warned: bool = False
 
     # ─── Lifecycle ────────────────────────────────────────────────────
 
@@ -204,6 +230,18 @@ class CollectorRecorder:
         mid_outcome = self._asset_to_market.get(asset_id)
         if not mid_outcome:
             return
+        # Disk-guard: drop firehose writes when the DB is past the cap.
+        if self._firehose_blocked:
+            return
+        # Sample 1 of every N per asset — deltas are ~2 800/s, we don't
+        # need every single level cancel for replay. Snapshots still go
+        # through every trade event (book channel) so the book stays
+        # reconstructable.
+        if DELTAS_SAMPLE_N > 1:
+            n = self._delta_counter.get(asset_id, 0)
+            self._delta_counter[asset_id] = n + 1
+            if n % DELTAS_SAMPLE_N != 0:
+                return
         market_id, outcome = mid_outcome
         self._deltas_q.append((
             market_id, asset_id, outcome, float(timestamp),
@@ -264,8 +302,11 @@ class CollectorRecorder:
     def record_ws_event(
         self, event_type: str, timestamp: float, payload: dict[str, Any],
     ) -> None:
-        """Catch-all raw WS event log. Use for unknown event types or to
-        keep a full replayable trace alongside the parsed tables."""
+        """Catch-all raw WS event log. Disabled by default (COLLECTOR_WS_RAW_ENABLED=1
+        to turn it back on) — the parsed tables (book/deltas/trades) already
+        cover replay; the raw log mainly doubles the disk footprint."""
+        if not WS_RAW_ENABLED or self._firehose_blocked:
+            return
         asset_id = payload.get("asset_id", "") or ""
         market_id = payload.get("market", "") or ""
         self._ws_raw_q.append((
@@ -430,12 +471,40 @@ class CollectorRecorder:
             base["db_size_mb"] = round(db_size_mb(self._conn), 1)
         return base
 
+    # ─── Internal: disk guard ─────────────────────────────────────────
+
+    def _check_disk_guard(self) -> None:
+        """Flip _firehose_blocked if the DB is past MAX_DB_MB. Runs every
+        FLUSH_INTERVAL so we don't stat() on every record_* call."""
+        if self._conn is None:
+            return
+        try:
+            size_mb = db_size_mb(self._conn)
+        except Exception:
+            return
+        if size_mb >= MAX_DB_MB:
+            if not self._firehose_blocked:
+                self._firehose_blocked = True
+                log.warning(
+                    "[Recorder] DB %.0f MB >= cap %.0f MB -> pausing "
+                    "deltas/ws_raw writes (snapshots/trades/signals continue)",
+                    size_mb, MAX_DB_MB,
+                )
+        else:
+            if self._firehose_blocked:
+                self._firehose_blocked = False
+                log.info(
+                    "[Recorder] DB back under cap (%.0f < %.0f MB) -> "
+                    "firehose resumed", size_mb, MAX_DB_MB,
+                )
+
     # ─── Internal: flush loop ─────────────────────────────────────────
 
     async def _flush_loop(self) -> None:
         while self._running:
             try:
                 await asyncio.sleep(FLUSH_INTERVAL)
+                self._check_disk_guard()
                 self._flush_sync()
             except asyncio.CancelledError:
                 raise
