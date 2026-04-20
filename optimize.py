@@ -50,6 +50,43 @@ GRID = {
     "BTC_VOLATILITY_MAX":        [0.0010, 0.0015, 0.0020],
 }
 
+# ── Extended grid — v5.3 filter tuning ───────────────────────────────────────
+# Swap this in for GRID (or combine axes manually) to search the new
+# counter-trend / mid-market filters.
+#
+# WARNING: combining all 6 axes = 4×3×3×3×3×3 = 972 combos × 2 intervals
+# = 1944 runs (~40 min on 12 workers). Use --interval 15m to halve it.
+#
+# Usage:
+#   # To search only the new filter axes (keep BTC overrides fixed at default):
+#   python optimize.py --grid filters
+#   # or temporarily swap GRID = GRID_FILTERS at the top of _all_combos()
+#
+GRID_FILTERS = {
+    # MeanReversionEngine market-confirmation threshold
+    # Low = more mean-rev trades (riskier); High = fewer but cleaner
+    "MEANREV_MARKET_CONFIRM_THRESH": [0.52, 0.55, 0.57, 0.60],
+
+    # Mid-market edge guard — edge ceiling before we block mid-book bets
+    # Lower = stricter (blocks more bets in mid zone)
+    "MID_MARKET_EDGE_THRESHOLD":     [0.07, 0.10, 0.13],
+
+    # Mid-market zone width — how far from 0.50 is "too close"
+    # LO/HI must be symmetric around 0.5
+    "MID_MARKET_LO":                 [0.42, 0.45, 0.48],
+    "MID_MARKET_HI":                 [0.52, 0.55, 0.58],   # keep LO+HI in sync!
+
+    # Early exit soft floor in USD — below = position too small to protect
+    "EARLY_EXIT_VALUE_FLOOR_USD":    [20.0, 30.0, 40.0, 50.0],
+}
+
+# ── Combined grid — BTC overrides + v5.3 filters ─────────────────────────────
+# 4×3×3×3 × 4×3 = 108 × 12 = 1296 combos. Use --workers 24 and --interval 15m.
+GRID_COMBINED = {**GRID, **{
+    "MEANREV_MARKET_CONFIRM_THRESH": [0.52, 0.57, 0.62],
+    "MID_MARKET_EDGE_THRESHOLD":     [0.07, 0.10, 0.13],
+}}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -152,13 +189,24 @@ def main():
     parser.add_argument("--workers",  type=int,   default=12)
     parser.add_argument("--capital",  type=float, default=1000.0)
     parser.add_argument("--symbol",   default="BTCUSDT")
+    parser.add_argument(
+        "--grid",
+        choices=["base", "filters", "combined"],
+        default="base",
+        help=(
+            "base     = BTC-specific overrides (108 combos, default)\n"
+            "filters  = v5.3 filter tuning: MeanRev confirm + mid-market (144 combos)\n"
+            "combined = base + filters merged (324 combos, use --interval 15m)"
+        ),
+    )
     args = parser.parse_args()
 
+    active_grid = {"base": GRID, "filters": GRID_FILTERS, "combined": GRID_COMBINED}[args.grid]
     intervals = ["5m", "15m"] if args.interval == "both" else [args.interval]
-    combos    = _all_combos()
-    total     = len(combos) * len(intervals)
+    combos    = [dict(zip(active_grid, vals)) for vals in product(*active_grid.values())]
+    total = len(combos) * len(intervals)
 
-    print(f"[optimize] Grid: {len(combos)} combos × {len(intervals)} interval(s) = {total} runs")
+    print(f"[optimize] Grid: {args.grid!r} — {len(combos)} combos × {len(intervals)} interval(s) = {total} runs")
     print(f"[optimize] Workers: {args.workers}  |  Days: {args.days}")
 
     # Download price data once, reuse for all runs
