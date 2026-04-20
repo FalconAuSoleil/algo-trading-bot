@@ -169,6 +169,21 @@ class SignalConfig:
     meanrev_ptrue_ceil: float = _envf("MEANREV_PTRUE_CEIL", 0.62)
     meanrev_ptrue_mult: float = _envf("MEANREV_PTRUE_MULT", 8.0)
     meanrev_size_mult: float = _envf("MEANREV_SIZE_MULT", 0.4)
+    # Market-confirmation guard: for a NO mean-rev bet (delta>0 → we fade UP),
+    # the market's YES price must already be above this threshold — i.e. the
+    # book has priced in the move to some extent. Fading a 50/50 book on a
+    # strong delta = fighting a trend on a stale book (historical 25% WR).
+    # Symmetric for YES bets (p_yes must be < 1 - threshold).
+    meanrev_market_confirm_thresh: float = _envf("MEANREV_MARKET_CONFIRM_THRESH", 0.57)
+
+    # ── Mid-market edge guard (ChainlinkArb) ───────────────────────────────
+    # When p_market is 0.45-0.55 (mid-zone) but edge is large (>10%), the
+    # book hasn't caught up to the delta → the "edge" is illusory.
+    # Historical: mid-zone = 56% WR vs 80% for extreme markets.
+    mid_market_edge_guard: bool = _env("MID_MARKET_EDGE_GUARD", "true").lower() in ("true","1")
+    mid_market_lo: float = _envf("MID_MARKET_LO", 0.45)
+    mid_market_hi: float = _envf("MID_MARKET_HI", 0.55)
+    mid_market_edge_threshold: float = _envf("MID_MARKET_EDGE_THRESHOLD", 0.10)
 
     # ── BTCStabilization engine internals (v4.3) ────────────────────────────
     btc_stab_sigma_band_mult: float = _envf("BTC_STAB_SIGMA_BAND_MULT", 2.0)

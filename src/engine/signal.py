@@ -805,6 +805,22 @@ class _ChainlinkArbEngine:
             sig.micro = micro
             return sig
 
+        # Mid-market guard: when p_market is near 50/50 (0.45-0.55) but the
+        # model edge is large (>10%), the book hasn't priced in the delta yet.
+        # Empirically this bucket has 56% WR vs 80% for extreme markets — the
+        # "edge" is fake, coming from a stale or thin book.
+        p_mkt_yes = state.p_market_yes
+        if cfg.mid_market_edge_guard and (
+            cfg.mid_market_lo <= p_mkt_yes <= cfg.mid_market_hi
+            and edge > cfg.mid_market_edge_threshold
+        ):
+            sig.filter_reasons.append(
+                f"mid_mkt:{p_mkt_yes:.2f}+edge:{edge*100:.1f}%"
+            )
+            sig.status = "MID_MARKET_SUSPICIOUS"
+            sig.micro = micro
+            return sig
+
         self.stab.record(slug, side, edge, now)
         sok, dr, ecv, nt = self.stab.evaluate(slug, side)
         micro.stability_ratio = dr
@@ -1116,9 +1132,21 @@ class _MeanReversionEngine:
                 state.best_ask_no if state.best_ask_no > 0
                 else (1 - state.p_market_yes)
             )
+            # Market-confirmation guard: if the book is still near 50/50 while
+            # delta is strongly positive, the book hasn't caught up yet — we'd
+            # be fading a move the market hasn't even priced in. That's not
+            # mean-reversion; it's fighting a trend on a stale book.
+            # Require YES already above cfg.meanrev_market_confirm_thresh
+            # (default 0.57) before we fade it.
+            if state.p_market_yes < cfg.meanrev_market_confirm_thresh:
+                return None
         else:
             side = "YES"
             entry = state.best_ask_yes if state.best_ask_yes > 0 else state.p_market_yes
+            # Symmetric: for delta-negative YES bets, market must already
+            # lean NO (p_yes < 1 - thresh) to confirm a genuine fade.
+            if state.p_market_yes > (1.0 - cfg.meanrev_market_confirm_thresh):
+                return None
 
         p_true = clamp(
             cfg.meanrev_ptrue_floor + (abs_delta - thresh) * cfg.meanrev_ptrue_mult,
