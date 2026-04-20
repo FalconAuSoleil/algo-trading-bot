@@ -38,15 +38,52 @@ from src.trading.portfolio import Portfolio
 from src.trading.paper import PaperTrader
 from src.trading.live import LiveTrader
 from src.dashboard.app import app as dashboard_app, dashboard_state
+from src.collector.recorder import CollectorRecorder
+from src.collector.polymarket_ws import PolymarketMarketWS
+
+import aiohttp
 
 log = setup_logger("main", config.log_level)
 
+# Default collector DB path — separate from the bot's trade DB so the
+# collector's firehose doesn't bloat the clean trade history.
+DEFAULT_COLLECTOR_DB = "data/collector.db"
+GAMMA_POLL_INTERVAL = 30.0
+
 
 class Orchestrator:
-    """Main system coordinator with multi-asset support."""
+    """Main system coordinator with multi-asset support.
 
-    def __init__(self):
+    v5.3: embeds the data collector so a single `python main.py` run
+    both trades AND records everything to data/collector.db in the
+    background (unless --no-collect is passed).
+    """
+
+    def __init__(
+        self,
+        collect_enabled: bool = True,
+        collector_db_path: str = DEFAULT_COLLECTOR_DB,
+    ):
         self.db = Database(config.db_path)
+
+        # ── Collector (shadow-mode recorder) ─────────────────────────────
+        # Runs in parallel with trading, listening on the same feeds.
+        # Writes to an independent SQLite so the bot's DB stays clean.
+        self._collect_enabled = collect_enabled
+        if collect_enabled:
+            self.recorder: CollectorRecorder | None = CollectorRecorder(
+                db_path=collector_db_path
+            )
+            self.poly_ws: PolymarketMarketWS | None = PolymarketMarketWS(
+                recorder=self.recorder
+            )
+            self._last_tick_log: dict[str, int] = {}
+            self._gamma_session: aiohttp.ClientSession | None = None
+        else:
+            self.recorder = None
+            self.poly_ws = None
+            self._last_tick_log = {}
+            self._gamma_session = None
 
         # ── Multi-asset feeds ────────────────────────────────────────────────
         self._chainlink_feeds: dict[str, ChainlinkFeed] = {}
@@ -153,6 +190,26 @@ class Orchestrator:
         Path("data").mkdir(exist_ok=True)
         await self.db.connect()
 
+        # Start the embedded collector if enabled — non-blocking, won't
+        # impact trading if it fails (guarded below).
+        if self.recorder is not None:
+            try:
+                await self.recorder.start()
+                self._gamma_session = aiohttp.ClientSession()
+                log.info(
+                    "  Collector: ENABLED -> %s (unlimited retention)",
+                    self.recorder.db_path,
+                )
+            except Exception as exc:
+                log.error(
+                    "  Collector: FAILED to start (%s) — trading will "
+                    "continue without data collection.", exc,
+                )
+                self.recorder = None
+                self.poly_ws = None
+        else:
+            log.info("  Collector: DISABLED (--no-collect)")
+
         db_state = await self.db.load_portfolio_state(config.trading_mode)
         self.portfolio.restore_from_db(db_state)
 
@@ -186,6 +243,23 @@ class Orchestrator:
         for symbol, bn_feed in self._binance_feeds.items():
             tasks.append(asyncio.create_task(bn_feed.start(), name=f"binance_{symbol}"))
 
+        # Collector background tasks (piggyback on the same feeds — no
+        # duplicate Binance/Chainlink connections). Only the Polymarket
+        # WebSocket and the Gamma snapshot poller are extra.
+        if self.recorder is not None and self.poly_ws is not None:
+            tasks.append(asyncio.create_task(
+                self.poly_ws.run(), name="collector_poly_ws"
+            ))
+            tasks.append(asyncio.create_task(
+                self._collector_gamma_poll_loop(), name="collector_gamma_poll"
+            ))
+            tasks.append(asyncio.create_task(
+                self._collector_resolution_loop(), name="collector_resolution"
+            ))
+            tasks.append(asyncio.create_task(
+                self._collector_stats_loop(), name="collector_stats"
+            ))
+
         if sys.platform != "win32":
             import signal
             loop = asyncio.get_event_loop()
@@ -205,6 +279,8 @@ class Orchestrator:
             return
         self._running = False
         log.info("[Main] Shutting down...")
+        if self.poly_ws is not None:
+            await self.poly_ws.stop()
         await self.polymarket_feed.stop()
         for cl_feed in self._chainlink_feeds.values():
             await cl_feed.stop()
@@ -213,6 +289,10 @@ class Orchestrator:
         if config.is_live and hasattr(self.trader, "stop"):
             await self.trader.stop()
         await self._save_snapshot()
+        if self._gamma_session is not None:
+            await self._gamma_session.close()
+        if self.recorder is not None:
+            await self.recorder.stop()
         await self.db.close()
         log.info("[Main] Shutdown complete")
         for task in asyncio.all_tasks():
@@ -224,15 +304,29 @@ class Orchestrator:
     ) -> None:
         if symbol not in self._asset_prices:
             return
+        bucket = self._asset_prices[symbol]
         if source == "binance":
-            self._asset_prices[symbol]["binance"] = price
+            bucket["binance"] = price
             if symbol in self._signal_engines:
                 self._signal_engines[symbol].update_price(price, timestamp)
         elif source in ("chainlink", "chainlink_binance_fallback"):
-            self._asset_prices[symbol]["chainlink"] = price
-            self._asset_prices[symbol]["chainlink_ts"] = timestamp
+            bucket["chainlink"] = price
+            bucket["chainlink_ts"] = timestamp
             if symbol in self._signal_engines:
                 self._signal_engines[symbol].update_chainlink_price(price, timestamp)
+
+        # Collector: downsample to 1 row per (asset, whole second)
+        if self.recorder is not None:
+            sec = int(time.time())
+            if self._last_tick_log.get(symbol, 0) != sec:
+                self._last_tick_log[symbol] = sec
+                self.recorder.record_price_tick(
+                    asset=symbol,
+                    timestamp=float(sec),
+                    binance_price=bucket["binance"],
+                    chainlink_price=bucket["chainlink"],
+                    chainlink_ts=bucket["chainlink_ts"],
+                )
 
         await dashboard_state.update_feeds({
             "binance": any(p["binance"] > 0 for p in self._asset_prices.values()),
@@ -242,6 +336,16 @@ class Orchestrator:
 
     async def _on_market_update(self, markets: dict[str, MarketInfo]) -> None:
         self._active_markets = markets
+        if self.recorder is not None and self.poly_ws is not None:
+            for m in markets.values():
+                self.recorder.record_market(m)
+            asset_ids: set[str] = set()
+            for m in markets.values():
+                if m.token_id_up:
+                    asset_ids.add(m.token_id_up)
+                if m.token_id_down:
+                    asset_ids.add(m.token_id_down)
+            self.poly_ws.set_assets(asset_ids)
         await dashboard_state.update_feeds({
             "binance": any(p["binance"] > 0 for p in self._asset_prices.values()),
             "chainlink": any(p["chainlink"] > 0 for p in self._asset_prices.values()),
@@ -250,6 +354,8 @@ class Orchestrator:
 
     async def _on_orderbook_update(self, cid: str, ob) -> None:
         self._orderbooks[cid] = ob
+        if self.recorder is not None:
+            self.recorder.record_orderbook(cid, ob)
 
     async def _signal_loop(self) -> None:
         while self._running:
@@ -335,6 +441,14 @@ class Orchestrator:
             sig.market_duration = market.duration_seconds
             sig.token_id_yes = market.token_id_up
             sig.token_id_no = market.token_id_down
+
+            if self.recorder is not None:
+                self.recorder.record_signal(
+                    sig,
+                    chainlink_price=chainlink_price,
+                    binance_price=prices.get("binance", 0.0),
+                    ob=ob,
+                )
 
             filters = ",".join(sig.filter_reasons) if sig.filter_reasons else "ALL_PASS"
             log.info(
@@ -645,6 +759,12 @@ class Orchestrator:
             if current_value >= pos.size_usd:
                 continue  # position is profitable, don't sell
 
+            # Soft exit: if the position is worth a lot ($40+), we have plenty
+            # of room and the resolution is likely to pay out ~$2/share anyway.
+            # Let it ride instead of panic-selling at best_bid.
+            if current_value >= config.signal.early_exit_value_floor_usd:
+                continue
+
             # ── Sell ────────────────────────────────────────────────────
             delta_entry_abs = abs(pos.delta_at_entry) * 100
             delta_now_abs = abs(delta_now) * 100
@@ -663,6 +783,154 @@ class Orchestrator:
             )
             if pnl is not None:
                 await dashboard_state.update_portfolio(self.portfolio.get_stats())
+
+    # ─── Embedded collector loops ────────────────────────────────────────
+    async def _collector_resolution_loop(self) -> None:
+        while self._running:
+            try:
+                if self.recorder is None:
+                    return
+                now = time.time()
+                pending = self.recorder.unresolved_markets(now - 30)
+                for m in pending:
+                    try:
+                        outcome = await self.polymarket_feed.fetch_market_outcome(
+                            slug=m["slug"],
+                            start_time=m["start_time"],
+                            duration=m["duration_seconds"],
+                        )
+                    except Exception as exc:
+                        log.debug("[Collector][Res] fetch error %s: %s", m["slug"], exc)
+                        continue
+                    if outcome not in ("up", "down"):
+                        continue
+                    try:
+                        next_start = m["start_time"] + m["duration_seconds"]
+                        resolved_price = await self.polymarket_feed._fetch_price_to_beat(
+                            slug=m["slug"],
+                            start_time=next_start,
+                            duration=m["duration_seconds"],
+                        )
+                    except Exception:
+                        resolved_price = 0.0
+                    self.recorder.mark_resolved(
+                        market_id=m["market_id"],
+                        outcome=outcome,
+                        resolved_price=resolved_price,
+                    )
+            except Exception as exc:
+                log.error("[Collector][Res] Loop error: %s", exc)
+            await asyncio.sleep(30)
+
+    async def _collector_gamma_poll_loop(self) -> None:
+        await asyncio.sleep(15)
+        while self._running:
+            try:
+                if self.recorder is None or self._gamma_session is None:
+                    await asyncio.sleep(GAMMA_POLL_INTERVAL)
+                    continue
+                for m in list(self._active_markets.values()):
+                    if m.is_expired:
+                        continue
+                    await self._collector_fetch_gamma_state(m)
+                    await asyncio.sleep(0.25)
+            except Exception as exc:
+                log.error("[Collector][Gamma] Loop error: %s", exc)
+            await asyncio.sleep(GAMMA_POLL_INTERVAL)
+
+    async def _collector_fetch_gamma_state(self, m: MarketInfo) -> None:
+        if self._gamma_session is None or self.recorder is None:
+            return
+        try:
+            async with self._gamma_session.get(
+                f"{config.polymarket.gamma_url}/events",
+                params={"slug": m.slug},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                events = await resp.json()
+        except Exception:
+            return
+        if not events:
+            return
+        event = events[0]
+        mkts = event.get("markets", []) or []
+        if not mkts:
+            return
+        g = mkts[0]
+
+        def _f(key):
+            v = g.get(key)
+            if v in (None, "", "null"):
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        def _parse_iso(s: str):
+            if not s:
+                return None
+            try:
+                from datetime import datetime
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+
+        fields = {
+            "best_bid":          _f("bestBid"),
+            "best_ask":          _f("bestAsk"),
+            "last_trade_price":  _f("lastTradePrice"),
+            "spread":            _f("spread"),
+            "volume_clob":       _f("volumeClob"),
+            "volume_24h_clob":   _f("volume24hrClob"),
+            "liquidity_clob":    _f("liquidityClob"),
+            "open_interest":     _f("openInterest") or _f("openInterestAmount"),
+            "one_hour_change":   _f("oneHourPriceChange"),
+            "one_day_change":    _f("oneDayPriceChange"),
+            "accepting_orders":  bool(g.get("acceptingOrders", False)),
+            "uma_status":        g.get("umaResolutionStatus"),
+            "closed_time":       _parse_iso(g.get("closedTime", "")),
+            "rewards_min_size":  _f("rewardsMinSize"),
+            "rewards_max_spread": _f("rewardsMaxSpread"),
+            "min_tick_size":     _f("orderPriceMinTickSize"),
+            "min_order_size":    _f("orderMinSize"),
+            "maker_fee_bps":     _f("makerBaseFee"),
+            "taker_fee_bps":     _f("takerBaseFee"),
+            "neg_risk":          bool(g.get("negRisk", False)
+                                       or event.get("negRisk", False)),
+        }
+        self.recorder.record_market_state(
+            market_id=m.condition_id, timestamp=time.time(), fields=fields,
+        )
+
+    async def _collector_stats_loop(self) -> None:
+        await asyncio.sleep(30)
+        while self._running:
+            try:
+                if self.recorder is None:
+                    return
+                s = self.recorder.stats()
+                log.info(
+                    "[Collector][Stats] markets=%d ob=%d deltas=%d trades=%d "
+                    "mstates=%d ticks=%d signals=%d ws_raw=%d | active=%d "
+                    "ws_msgs=%d db=%.1fMB",
+                    s.get("markets", 0),
+                    s.get("orderbook_snapshots", 0),
+                    s.get("orderbook_deltas", 0),
+                    s.get("trades", 0),
+                    s.get("market_states", 0),
+                    s.get("price_ticks", 0),
+                    s.get("shadow_signals", 0),
+                    s.get("ws_events", 0),
+                    len(self._active_markets),
+                    self.poly_ws.messages_received if self.poly_ws else 0,
+                    s.get("db_size_mb", 0.0),
+                )
+            except Exception as exc:
+                log.debug("[Collector][Stats] error: %s", exc)
+            await asyncio.sleep(300)
 
     async def _wallet_balance_loop(self) -> None:
         """Live mode only — poll real USDC.e balance from CLOB every 30s.
@@ -728,6 +996,10 @@ def main():
     parser.add_argument("--mode", choices=["paper", "live", "collect"], default=None)
     parser.add_argument("--balance", type=float, default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--no-collect", action="store_true",
+                        help="Disable the embedded background data collector")
+    parser.add_argument("--collector-db", type=str, default=DEFAULT_COLLECTOR_DB,
+                        help=f"Collector SQLite path (default: {DEFAULT_COLLECTOR_DB})")
     args = parser.parse_args()
 
     if args.mode:
@@ -768,7 +1040,10 @@ def main():
                 log.warning("[Asyncio] %s", msg)
 
         loop.set_exception_handler(_asyncio_exception_handler)
-        await Orchestrator().start()
+        await Orchestrator(
+            collect_enabled=not args.no_collect,
+            collector_db_path=args.collector_db,
+        ).start()
 
     asyncio.run(_run())
 

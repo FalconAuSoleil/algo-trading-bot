@@ -265,6 +265,10 @@ class SignalConfig:
     early_exit_delta_erosion_pct: float = _envf("EARLY_EXIT_DELTA_EROSION", 0.60)  # delta lost 60%+
     early_exit_delta_abs_floor: float = _envf("EARLY_EXIT_DELTA_FLOOR", 0.0015)    # delta now < 0.15%
     early_exit_erosion_min_elapsed_pct: float = _envf("EARLY_EXIT_EROSION_ELAPSED", 0.70)  # >70% of market elapsed
+    # Soft exit: skip early exit entirely if position value >= this floor.
+    # Above this level the trade is comfortable and the resolution upside
+    # (~$2/share) beats any panic-sell haircut at best_bid.
+    early_exit_value_floor_usd: float = _envf("EARLY_EXIT_VALUE_FLOOR_USD", 40.0)
 
     # ── Staged entry / double-down on dips (v5) ─────────────────────────────
     # Split initial bet into 70/30, deploy reserve when confident + price dips.

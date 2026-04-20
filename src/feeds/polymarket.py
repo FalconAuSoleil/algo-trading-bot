@@ -72,7 +72,12 @@ class MarketInfo:
 
 @dataclass
 class OrderbookState:
-    """Current state of the orderbook for a market."""
+    """Current state of the orderbook for a market.
+
+    Extra fields (tick_size, last_trade_price, etc) are populated from
+    the CLOB /book response; they default to sensible values so code that
+    doesn't care about them keeps working unchanged.
+    """
 
     best_bid_up: float = 0.0
     best_ask_up: float = 0.0
@@ -86,6 +91,18 @@ class OrderbookState:
     spread_up: float = 1.0
     spread_down: float = 1.0
     timestamp: float = 0.0
+    # v5.3: extra fields from /book REST (preserved, not dropped).
+    # Per-side because Polymarket's /book is queried token_id at a time —
+    # up-side and down-side can report different tick_sizes near 0/1 flips.
+    tick_size_up: float = 0.01
+    tick_size_down: float = 0.01
+    last_trade_price_up: float = 0.0
+    last_trade_price_down: float = 0.0
+    min_order_size_up: float = 0.0
+    min_order_size_down: float = 0.0
+    neg_risk: bool = False
+    book_hash_up: str = ""
+    book_hash_down: str = ""
 
     @property
     def mid_down(self) -> float:
@@ -411,6 +428,23 @@ class PolymarketFeed:
                     for a in asks[:10]
                 )
 
+                # v5.3: pull extra metadata fields too (tick_size etc).
+                # They might be missing on some markets — degrade gracefully.
+                try:
+                    tick_size = float(book.get("tick_size", 0.01) or 0.01)
+                except (TypeError, ValueError):
+                    tick_size = 0.01
+                try:
+                    min_size = float(book.get("min_order_size", 0) or 0)
+                except (TypeError, ValueError):
+                    min_size = 0.0
+                try:
+                    ltp = float(book.get("last_trade_price", 0) or 0)
+                except (TypeError, ValueError):
+                    ltp = 0.0
+                neg_risk = bool(book.get("neg_risk", False))
+                book_hash = str(book.get("hash", "") or "")
+
                 if side == "up":
                     ob.best_bid_up = best_bid
                     ob.best_ask_up = best_ask
@@ -419,6 +453,10 @@ class PolymarketFeed:
                     if best_bid and best_ask:
                         ob.mid_up = (best_bid + best_ask) / 2
                         ob.spread_up = best_ask - best_bid
+                    ob.tick_size_up = tick_size
+                    ob.last_trade_price_up = ltp
+                    ob.min_order_size_up = min_size
+                    ob.book_hash_up = book_hash
                 else:
                     ob.best_bid_down = best_bid
                     ob.best_ask_down = best_ask
@@ -426,6 +464,13 @@ class PolymarketFeed:
                     ob.depth_ask_down = depth_ask
                     if best_bid and best_ask:
                         ob.spread_down = best_ask - best_bid
+                    ob.tick_size_down = tick_size
+                    ob.last_trade_price_down = ltp
+                    ob.min_order_size_down = min_size
+                    ob.book_hash_down = book_hash
+                # neg_risk is per-market not per-side, but /book returns it
+                # on either query — last one wins.
+                ob.neg_risk = neg_risk
 
             except (aiohttp.ClientError, KeyError, ValueError):
                 pass
