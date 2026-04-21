@@ -308,6 +308,9 @@ class RiskConfig:
     max_consecutive_losses: int = _envi("MAX_CONSECUTIVE_LOSSES", 3)
     max_open_positions: int = _envi("MAX_OPEN_POSITIONS", 2)
     max_daily_risk: float = _envf("MAX_DAILY_RISK", 0.12)
+    # Taille minimale d'un pari en USD — si Kelly donne moins, on monte à ce seuil.
+    # Polymarket rejette les ordres < ~$1. Augmenter si wallet petit (ex: MIN_BET_USD=2).
+    min_bet_usd: float = _envf("MIN_BET_USD", 1.0)
 
 
 @dataclass(frozen=True)

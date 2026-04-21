@@ -346,17 +346,18 @@ class LiveTrader:
         if signal.action != "BUY" or not signal.filters_passed:
             return None
 
-        # Polymarket minimum: $1 notional OR 5 shares, whichever is larger.
-        # On clamp TOUJOURS vers le minimum Polymarket — même si Kelly dit moins,
-        # c'est préférable à un ordre rejeté. Le sizing reste borné par la balance.
+        # Plancher minimum : MAX(MIN_BET_USD config, 5 shares au prix d'entrée).
+        # - Polymarket rejette les ordres < ~$1 notional OU < 5 shares.
+        # - MIN_BET_USD est configurable via .env (défaut 1.0).
+        # - On clamp toujours — un ordre à $1 vaut mieux qu'un ordre rejeté.
         POLY_MIN_SHARES = 5
-        POLY_MIN_USD = 1.0
-        poly_min_usd = max(POLY_MIN_USD, POLY_MIN_SHARES * signal.entry_price)
+        cfg_min = float(os.environ.get("MIN_BET_USD", "1.0"))
+        poly_min_usd = max(cfg_min, POLY_MIN_SHARES * signal.entry_price)
         size_usd = signal.size_usd
         if size_usd < poly_min_usd:
             log.info(
-                "[Live] Size clamped $%.2f -> $%.2f (min Polymarket: $%.1f ou %d shares @ %.4f)",
-                size_usd, poly_min_usd, POLY_MIN_USD, POLY_MIN_SHARES, signal.entry_price,
+                "[Live] Size clamped $%.2f -> $%.2f (MIN_BET_USD=%.1f ou %d shares @ %.4f)",
+                size_usd, poly_min_usd, cfg_min, POLY_MIN_SHARES, signal.entry_price,
             )
             size_usd = poly_min_usd
         if signal.time_remaining_sec < 45.0:
