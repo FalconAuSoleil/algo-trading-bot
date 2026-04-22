@@ -57,7 +57,10 @@ _SELL = "SELL"
 # Seconds after expiry before falling back to BTC price for resolution.
 # Increased from 30s to 120s (v3.6) to reduce incorrect resolutions
 # when the Polymarket API is temporarily slow to publish outcomes.
-_FALLBACK_DELAY_SEC = 120
+_FALLBACK_DELAY_SEC = 600  # v5.3: était 120s, mais BTC fallback après 2min
+                           # produisait des fake wins (prix BTC bouge entre la
+                           # fin du marché et le fallback). On attend 10 min —
+                           # l'API past-results finit toujours par répondre.
 
 
 class LiveTrader:
@@ -186,7 +189,12 @@ class LiveTrader:
                     from eth_account import Account
                     rpc = os.getenv("POLYGON_RPC", "https://polygon.drpc.org")
                     w3 = Web3(Web3.HTTPProvider(rpc))
-                    owner = Account.from_key(self.cfg.private_key).address
+                    # En mode proxy (signature_type != 0), les fonds et les
+                    # allowances sont sur le funder, pas sur l'EOA.
+                    if self.cfg.signature_type != 0 and self.cfg.funder:
+                        owner = Web3.to_checksum_address(self.cfg.funder)
+                    else:
+                        owner = Account.from_key(self.cfg.private_key).address
                     usdce = Web3.to_checksum_address(
                         "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
                     )
@@ -349,14 +357,18 @@ class LiveTrader:
         # Plancher minimum : MAX(MIN_BET_USD config, 5 shares au prix d'entrée).
         # - Polymarket rejette les ordres < ~$1 notional OU < 5 shares.
         # - MIN_BET_USD est configurable via .env (défaut 1.0).
-        # - On clamp toujours — un ordre à $1 vaut mieux qu'un ordre rejeté.
+        # - On clamp vers le haut SEULEMENT si ça ne dépasse pas MAX_BET_FRACTION
+        #   du vrai solde on-chain (sinon Kelly dit $0.10 mais on forcerait 40%
+        #   du wallet — absurde). Cette vérif est faite plus bas après fetch.
         POLY_MIN_SHARES = 5
         cfg_min = float(os.environ.get("MIN_BET_USD", "1.0"))
         poly_min_usd = max(cfg_min, POLY_MIN_SHARES * signal.entry_price)
         size_usd = signal.size_usd
-        if size_usd < poly_min_usd:
+        kelly_was_below_min = size_usd < poly_min_usd
+        if kelly_was_below_min:
             log.info(
-                "[Live] Size clamped $%.2f -> $%.2f (MIN_BET_USD=%.1f ou %d shares @ %.4f)",
+                "[Live] Kelly $%.2f < Polymarket min $%.2f (MIN_BET_USD=%.1f ou %d shares @ %.4f) — "
+                "clamp candidat, vérification ratio vs balance après fetch",
                 size_usd, poly_min_usd, cfg_min, POLY_MIN_SHARES, signal.entry_price,
             )
             size_usd = poly_min_usd
@@ -389,19 +401,53 @@ class LiveTrader:
             log.error("[Live] Invalid entry price: %.4f", entry_price)
             return None
 
-        # Never bet more than available portfolio balance (safety cap).
-        # Vérification AVANT l'insert DB pour éviter des lignes "rejected" inutiles.
-        max_size = round(self.portfolio.balance * 0.95, 2)
+        # Fetch la balance USDC réelle on-chain — le portfolio.balance local
+        # peut être désynchronisé si des tokens winning ne sont pas encore
+        # redeem (ils comptent en PnL côté DB mais les USDC sont bloqués).
+        try:
+            def _fetch_real_balance():
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                bal = self._client.get_balance_allowance(
+                    params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+                return float(bal.get("balance", 0)) / 1_000_000
+            real_balance = await self._loop.run_in_executor(None, _fetch_real_balance)
+        except Exception as exc:
+            log.warning("[Live] Real balance fetch failed, using local: %s", exc)
+            real_balance = self.portfolio.balance
+
+        # Never bet more than the real on-chain balance (safety cap).
+        # 0.98 au lieu de 0.95 : le buffer de 2% couvre les fees + arrondis.
+        max_size = round(real_balance * 0.98, 2)
         if max_size < poly_min_usd:
             log.warning(
-                "[Live] Balance $%.2f insuffisante pour le minimum Polymarket $%.2f -> skip",
-                self.portfolio.balance, poly_min_usd,
+                "[Live] Balance on-chain $%.2f insuffisante pour le minimum Polymarket $%.2f -> skip",
+                real_balance, poly_min_usd,
+            )
+            return None
+
+        # Garde-fou anti-sur-exposition : si Kelly disait "trop petit" et que le
+        # clamp forcé nous ferait miser > MAX_BET_FRACTION du wallet, on skip.
+        # Adaptatif selon la bankroll :
+        #   - < $20  : cap 50% (sinon la règle des 5 shares × ~0.65 = $3.25
+        #              bloque TOUT trade sous un cap de 25%)
+        #   - >= $20 : cap 25% (sizing sain une fois la bankroll décente)
+        # Override via env MAX_BET_FRACTION_OF_BALANCE si besoin.
+        default_cap = 0.50 if real_balance < 20.0 else 0.25
+        MAX_BET_FRACTION = float(os.environ.get("MAX_BET_FRACTION_OF_BALANCE", str(default_cap)))
+        if kelly_was_below_min and real_balance > 0 and poly_min_usd > real_balance * MAX_BET_FRACTION:
+            log.warning(
+                "[Live] Skip: Kelly $%.2f était trop petit, clamp à $%.2f = %.0f%% du solde $%.2f "
+                "(> cap %.0f%%). Pas assez de bankroll pour ce marché — on passe.",
+                signal.size_usd, poly_min_usd,
+                (poly_min_usd / real_balance * 100), real_balance,
+                MAX_BET_FRACTION * 100,
             )
             return None
         if size_usd > max_size:
             log.info(
-                "[Live] Size capped $%.2f -> $%.2f (95%% of balance $%.2f)",
-                size_usd, max_size, self.portfolio.balance,
+                "[Live] Size capped $%.2f -> $%.2f (98%% of real balance $%.2f)",
+                size_usd, max_size, real_balance,
             )
             size_usd = max(poly_min_usd, max_size)
 

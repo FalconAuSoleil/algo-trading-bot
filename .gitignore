@@ -14,8 +14,11 @@ env/
 # Environment variables
 .env
 
-# Data files
-#data/
+# Data files — never commit SQLite DBs or logs (can easily hit GBs)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.log
 
 # IDE
 .vscode/

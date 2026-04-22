@@ -1,7 +1,15 @@
 """One-time script to approve Polymarket operators to spend your USDC.e + CTF.
 
-Run once after funding the wallet. Requires POL (MATIC) for gas (~$0.05 total).
-Reads POLYMARKET_PRIVATE_KEY from .env.
+Modes:
+  - EOA direct (POLYMARKET_SIGNATURE_TYPE=0 ou non défini) :
+      approuve via la clé privée. Requiert POL (MATIC) sur l'EOA pour le gas.
+  - Proxy Magic.link (POLYMARKET_SIGNATURE_TYPE=1) ou MetaMask (=2) :
+      le wallet on-chain est POLYMARKET_FUNDER. On ne peut PAS approuver depuis
+      l'EOA — il faut passer par l'UI Polymarket (un seul clic "Enable trading"
+      sur polymarket.com après connexion). Le script va juste VÉRIFIER l'état
+      des allowances sur le funder et te dire quoi faire.
+
+Reads POLYMARKET_PRIVATE_KEY, POLYMARKET_SIGNATURE_TYPE, POLYMARKET_FUNDER from .env.
 """
 from __future__ import annotations
 
@@ -14,6 +22,9 @@ from web3 import Web3
 load_dotenv()
 
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
+SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0").strip() or "0")
+FUNDER = os.getenv("POLYMARKET_FUNDER", "").strip()
+
 if not PRIVATE_KEY:
     sys.exit("ERROR: POLYMARKET_PRIVATE_KEY missing from .env")
 
@@ -40,6 +51,11 @@ ERC20_ABI = [{
     "name": "allowance",
     "outputs": [{"name": "", "type": "uint256"}],
     "stateMutability": "view", "type": "function",
+}, {
+    "inputs": [{"name": "account", "type": "address"}],
+    "name": "balanceOf",
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view", "type": "function",
 }]
 
 ERC1155_ABI = [{
@@ -59,12 +75,56 @@ ERC1155_ABI = [{
 MAX_UINT = 2**256 - 1
 
 
-def main() -> None:
-    w3 = Web3(Web3.HTTPProvider(RPC))
-    acct = w3.eth.account.from_key(PRIVATE_KEY)
+def check_only(w3: Web3, owner: str) -> None:
+    """Read-only audit for proxy mode : aucune tx envoyée, pas besoin de gas."""
+    usdc = w3.eth.contract(address=USDC_E, abi=ERC20_ABI)
+    ctf = w3.eth.contract(address=CTF, abi=ERC1155_ABI)
+
+    pol_bal = w3.from_wei(w3.eth.get_balance(owner), "ether")
+    try:
+        usdc_bal = usdc.functions.balanceOf(owner).call() / 1e6
+    except Exception:
+        usdc_bal = 0.0
+    print(f"Owner (funder/proxy): {owner}")
+    print(f"  POL:  {pol_bal:.4f}  (non requis en mode proxy)")
+    print(f"  USDC.e: {usdc_bal:.4f}")
+    print()
+
+    all_ok = True
+    for name, spender_str in OPERATORS.items():
+        spender = Web3.to_checksum_address(spender_str)
+        print(f"--- {name} ({spender[:10]}...) ---")
+        usdc_allow = usdc.functions.allowance(owner, spender).call()
+        ctf_allow = ctf.functions.isApprovedForAll(owner, spender).call()
+        usdc_ok = usdc_allow > 10**20
+        print(f"  USDC.e allowance: {'OK (' + str(usdc_allow // 10**6) + '+ USDC)' if usdc_ok else 'MISSING'}")
+        print(f"  CTF approval:     {'OK' if ctf_allow else 'MISSING'}")
+        if not (usdc_ok and ctf_allow):
+            all_ok = False
+        print()
+
+    if all_ok:
+        print("[OK] Toutes les allowances sont OK. Tu peux trader.")
+    else:
+        print("[MISSING] Allowances manquantes sur le proxy. Fix :")
+        print("   1. Va sur polymarket.com, connecte-toi avec ton compte Magic.link")
+        print("   2. Dépose >= $1, lance un petit pari manuel (Buy sur n'importe")
+        print("      quel marché). Polymarket signe automatiquement les approvals")
+        print("      via meta-tx (gasless côté toi).")
+        print("   3. Relance ce script pour vérifier.")
+
+
+def approve_eoa(w3: Web3, acct) -> None:
+    """Mode EOA direct : signe les tx depuis la clé privée. Requiert POL."""
     addr = acct.address
-    print(f"Wallet: {addr}")
-    print(f"POL balance: {w3.from_wei(w3.eth.get_balance(addr), 'ether'):.4f}")
+    pol_bal = w3.from_wei(w3.eth.get_balance(addr), "ether")
+    print(f"EOA Wallet: {addr}")
+    print(f"  POL balance: {pol_bal:.4f}")
+    if pol_bal < 0.05:
+        print()
+        print("[FAIL] POL insuffisant pour le gas (~0.05 POL requis pour 6 tx).")
+        print("   Envoie au moins 0.1 POL sur l'EOA avant de relancer.")
+        sys.exit(1)
     print()
 
     usdc = w3.eth.contract(address=USDC_E, abi=ERC20_ABI)
@@ -106,6 +166,32 @@ def main() -> None:
         print()
 
     print("Done. Restart the bot.")
+
+
+def main() -> None:
+    w3 = Web3(Web3.HTTPProvider(RPC))
+    acct = w3.eth.account.from_key(PRIVATE_KEY)
+
+    print(f"Signature type: {SIGNATURE_TYPE} "
+          f"({'EOA direct' if SIGNATURE_TYPE == 0 else 'Magic.link proxy' if SIGNATURE_TYPE == 1 else 'MetaMask proxy'})")
+    print(f"EOA (signer): {acct.address}")
+    if FUNDER:
+        print(f"Funder (proxy): {Web3.to_checksum_address(FUNDER)}")
+    print()
+
+    if SIGNATURE_TYPE == 0:
+        # Mode EOA direct : on approuve depuis la clé privée
+        approve_eoa(w3, acct)
+    else:
+        # Mode proxy : on ne peut pas approuver depuis l'EOA (elle ne détient
+        # rien). On audit les allowances du funder et on explique quoi faire.
+        if not FUNDER:
+            sys.exit("ERROR: SIGNATURE_TYPE!=0 mais POLYMARKET_FUNDER manquant dans .env")
+        owner = Web3.to_checksum_address(FUNDER)
+        print("Mode proxy détecté — vérification read-only des allowances du funder.")
+        print("(Les approvals d'un proxy se font via l'UI Polymarket, pas par ce script.)")
+        print()
+        check_only(w3, owner)
 
 
 if __name__ == "__main__":

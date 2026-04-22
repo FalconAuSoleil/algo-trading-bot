@@ -45,8 +45,13 @@ FLUSH_INTERVAL = 3.0  # seconds between batch writes
 #                                tables: markets/snapshots/trades/signals).
 #                                Default: 4000 (~4 GB).
 WS_RAW_ENABLED = os.environ.get("COLLECTOR_WS_RAW_ENABLED", "0") in ("1", "true", "True")
-DELTAS_SAMPLE_N = max(1, int(os.environ.get("COLLECTOR_DELTAS_SAMPLE_N", "10")))
-MAX_DB_MB = float(os.environ.get("COLLECTOR_MAX_DB_MB", "4000"))
+DELTAS_SAMPLE_N = max(1, int(os.environ.get("COLLECTOR_DELTAS_SAMPLE_N", "50")))
+MAX_DB_MB = float(os.environ.get("COLLECTOR_MAX_DB_MB", "2000"))
+# Throttle par marché pour orderbook_snapshots. À chaque event 'book' (WS ou
+# REST), on ne garde qu'un snapshot si >= N secondes depuis le précédent pour
+# ce marché. Avec 700 marchés actifs et 5s : ~140 snapshots/s => ~12M/jour.
+# Default 5s → 2.6M/3j ≈ 864k/jour soit ~260 MB/jour (était 1 GB/jour).
+SNAPSHOT_MIN_INTERVAL = float(os.environ.get("COLLECTOR_SNAPSHOT_MIN_INTERVAL", "5.0"))
 
 
 @dataclass
@@ -78,6 +83,8 @@ class CollectorRecorder:
 
     # Per-asset counter for delta sampling (1 in N keeps index % N == 0).
     _delta_counter: dict[str, int] = field(default_factory=dict)
+    # Per-market last snapshot timestamp (for SNAPSHOT_MIN_INTERVAL throttle).
+    _last_snapshot_ts: dict[str, float] = field(default_factory=dict)
     # Cached "DB too big, stop firehosing" flag — refreshed by the flush
     # loop (cheap) to avoid stat()ing the file on every hot-path call.
     _firehose_blocked: bool = False
@@ -175,6 +182,15 @@ class CollectorRecorder:
         'book' event (which fires on subscribe + after every trade)."""
         if not cid or ob is None:
             return
+        # Throttle per marché : on ne garde qu'un snapshot toutes les
+        # SNAPSHOT_MIN_INTERVAL secondes par market_id. Sinon WS 'book' peut
+        # tirer 10+ snapshots/s sur un marché actif -> disque explose.
+        if SNAPSHOT_MIN_INTERVAL > 0:
+            now_ts = ob.timestamp or time.time()
+            last = self._last_snapshot_ts.get(cid, 0.0)
+            if now_ts - last < SNAPSHOT_MIN_INTERVAL:
+                return
+            self._last_snapshot_ts[cid] = now_ts
         # tick_size/last_trade_price are per-side — use the up side as primary
         # (it always exists for valid Up/Down markets) and fall back to down.
         tick = getattr(ob, "tick_size_up", 0.01) or getattr(ob, "tick_size_down", 0.01)

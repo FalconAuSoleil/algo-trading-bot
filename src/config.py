@@ -140,6 +140,7 @@ class SignalConfig:
     hawkes_weak_size_mult: float = _envf("HAWKES_WEAK_SIZE_MULT", 0.7)
     depth_size_cap_ratio: float = _envf("DEPTH_SIZE_CAP_RATIO", 0.3)
     min_trade_size_usd: float = _envf("MIN_TRADE_SIZE_USD", 1.0)
+    min_bet_usd: float = _envf("MIN_BET_USD", 1.0)
     confidence_high_score: float = _envf("CONFIDENCE_HIGH_SCORE", 0.10)
     confidence_med_score: float = _envf("CONFIDENCE_MED_SCORE", 0.06)
 

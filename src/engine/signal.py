@@ -884,10 +884,8 @@ class _ChainlinkArbEngine:
         depth = state.depth_yes if side == "YES" else state.depth_no
         if depth > 0:
             size = min(size, depth * cfg.depth_size_cap_ratio)
-        if size < cfg.min_trade_size_usd:
-            sig.filter_reasons.append("tiny")
-            sig.micro = micro
-            return sig
+        if size < cfg.min_bet_usd:
+            size = cfg.min_bet_usd
 
         sig.size_usd = size
         sig.kelly_pct = frac
@@ -1052,8 +1050,8 @@ class _MomentumEngine:
             return None
         frac = clamp(kelly * 0.25, 0, max_frac)
         size = round(capital * frac, 2)
-        if size < cfg.min_trade_size_usd:
-            return None
+        if size < cfg.min_bet_usd:
+            size = cfg.min_bet_usd
 
         slug = state.slug or state.market_id[:20]
         sig = Signal(
@@ -1152,6 +1150,14 @@ class _MeanReversionEngine:
             cfg.meanrev_ptrue_floor + (abs_delta - thresh) * cfg.meanrev_ptrue_mult,
             cfg.meanrev_ptrue_floor, cfg.meanrev_ptrue_ceil,
         )
+
+        # Sanity check Brownien : si la probabilité réelle de reversion dans
+        # le temps restant est < 35%, la formule heuristique ci-dessus ment.
+        # Ex : delta=-0.661%, T=103s, sigma=2.89e-4 → p_brownien≈1.2% → on skip.
+        p_brownien = p_brownian(abs_delta, time_remaining, self.sigma_fallback)
+        if p_brownien < 0.35:
+            return None
+
         fee = calc_fee(entry, cfg.fee_rate)  # uses new linear model
         edge = p_true - entry - fee
 
@@ -1173,8 +1179,8 @@ class _MeanReversionEngine:
             return None
         frac = clamp(kelly * 0.20, 0, max_frac)
         size = round(capital * frac, 2)
-        if size < cfg.min_trade_size_usd:
-            return None
+        if size < cfg.min_bet_usd:
+            size = cfg.min_bet_usd
 
         slug = state.slug or state.market_id[:20]
         sig = Signal(
@@ -1433,8 +1439,8 @@ class _BTCStabilizationEngine:
         depth = state.depth_yes if side == "YES" else state.depth_no
         if depth > 0:
             size = min(size, depth * cfg.btc_stab_depth_cap_ratio)
-        if size < cfg.min_trade_size_usd:
-            return None
+        if size < cfg.min_bet_usd:
+            size = cfg.min_bet_usd
 
         slug = state.slug or state.market_id[:20]
         micro = MicrostructureState()

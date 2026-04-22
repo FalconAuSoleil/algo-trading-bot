@@ -694,8 +694,57 @@ class Orchestrator:
             if delta_now < 0:
                 p_true_now = 1.0 - p_true_now
 
+            # ── Récupère best_bid en amont (nécessaire pour Mode D) ────
+            ob = self._orderbooks.get(pos.market_id)
+            if not ob:
+                continue
+            if pos.side == "YES":
+                best_bid = ob.best_bid_yes if hasattr(ob, 'best_bid_yes') else (ob.best_bid_up if hasattr(ob, 'best_bid_up') else 0.0)
+            else:
+                best_bid = ob.best_bid_no if hasattr(ob, 'best_bid_no') else (ob.best_bid_down if hasattr(ob, 'best_bid_down') else 0.0)
+
             # ── Check exit modes ────────────────────────────────────────
             sell_reason = None
+
+            # Mode F (v5.3): FORCE SELL absolu en fin de marché. Si le token
+            # qu'on a (UP ou DOWN) cote sous 0.30 alors qu'il reste < 2 min,
+            # on vend immédiatement — peu importe la liquidité minimale, peu
+            # importe le loss_pct. À ce prix et ce timing, c'est perdu à 95%+.
+            # Mieux vaut récupérer 20-25¢ par share que 0¢ à l'expiration.
+            FORCE_SELL_PRICE = 0.30
+            FORCE_SELL_TREM = 120.0
+            if (
+                best_bid > 0
+                and best_bid < FORCE_SELL_PRICE
+                and t_rem < FORCE_SELL_TREM
+            ):
+                sell_reason = "force_sell_endgame"
+
+            # Mode E (v5.4): late-stage forced exit. Calibré via gridsearch
+            # replay sur 691 marchés réels (reports/replay_grid_*.json) :
+            #   - late_ratio=0.92 gagne la grille (Sharpe > 0.85 à ROI égal)
+            #   - late_trem=180s > 90s (+0.5% ROI moyen)
+            #   - elapsed_pct=0.70 cohérent avec entry_trem=180s optimal
+            # Sans ce mode, le backtest donne -3.2% ROI moyen (held_losses à 0¢).
+            if (
+                pos.entry_price > 0
+                and best_bid > 0
+                and best_bid < pos.entry_price * 0.92
+                and (t_rem < 180.0 or elapsed > pos.duration_seconds * 0.70)
+            ):
+                sell_reason = "late_stage_losing"
+
+            # Mode D: token price collapse — le prix du token a chuté de X%
+            # par rapport à notre prix d'entrée. Ex: acheté UP à 59¢, bid
+            # maintenant à 35¢ = -41%. Le marché dit qu'on va perdre.
+            # Déclenche dès 20% du temps écoulé pour couper tôt.
+            if (
+                pos.entry_price > 0
+                and best_bid > 0
+                and best_bid < pos.entry_price * 0.70   # token a perdu > 30%
+                and elapsed > pos.duration_seconds * 0.20
+            ):
+                sell_reason = "token_price_collapse"
 
             # Mode C (v5.2): delta FLIP — le signal s'est inverse par rapport
             # a notre bet. Si on est UP et que delta est devenu negatif (BTC
@@ -703,7 +752,7 @@ class Orchestrator:
             # a bouge contre nous. On vend tres vite (juste apres 20% ecoule).
             # Remplace le role pervers que staged-topup jouait : au lieu de
             # doubler quand l'ask plonge, on coupe.
-            if (
+            if sell_reason is None and (
                 pos.delta_at_entry != 0
                 and delta_now * pos.delta_at_entry < 0  # signe oppose
                 and elapsed > pos.duration_seconds * 0.15
@@ -743,27 +792,25 @@ class Orchestrator:
                 continue
 
             # ── Shared conditions: liquidity + position losing ──────────
-            ob = self._orderbooks.get(pos.market_id)
-            if not ob:
-                continue
+            # Mode F (force_sell_endgame) bypasse TOUT filtre : on vend même
+            # avec liquidité minable, même si on n'a "perdu que" 5%. Le
+            # principe : prix < 30¢ en fin de marché = jeu perdu.
+            if sell_reason != "force_sell_endgame":
+                if best_bid < config.signal.early_exit_min_bid:
+                    continue
 
-            if pos.side == "YES":
-                best_bid = ob.best_bid_yes if hasattr(ob, 'best_bid_yes') else (ob.best_bid_up if hasattr(ob, 'best_bid_up') else 0.0)
+                current_value = best_bid * pos.shares
+                if current_value >= pos.size_usd:
+                    continue  # position is profitable, don't sell
+
+                # Soft exit: ne pas vendre si on perd moins de 15% de la mise.
+                # Exception : Mode E (late_stage_losing) exit dès 8% de perte.
+                loss_pct = 1.0 - (current_value / pos.size_usd) if pos.size_usd > 0 else 0.0
+                min_loss_pct = 0.08 if sell_reason == "late_stage_losing" else 0.15
+                if loss_pct < min_loss_pct:
+                    continue
             else:
-                best_bid = ob.best_bid_no if hasattr(ob, 'best_bid_no') else (ob.best_bid_down if hasattr(ob, 'best_bid_down') else 0.0)
-
-            if best_bid < config.signal.early_exit_min_bid:
-                continue
-
-            current_value = best_bid * pos.shares
-            if current_value >= pos.size_usd:
-                continue  # position is profitable, don't sell
-
-            # Soft exit: if the position is worth a lot ($40+), we have plenty
-            # of room and the resolution is likely to pay out ~$2/share anyway.
-            # Let it ride instead of panic-selling at best_bid.
-            if current_value >= config.signal.early_exit_value_floor_usd:
-                continue
+                current_value = best_bid * pos.shares
 
             # ── Sell ────────────────────────────────────────────────────
             delta_entry_abs = abs(pos.delta_at_entry) * 100
